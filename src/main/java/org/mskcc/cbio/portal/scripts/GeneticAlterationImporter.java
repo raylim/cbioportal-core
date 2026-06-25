@@ -5,12 +5,16 @@ import org.mskcc.cbio.portal.dao.ClickHouseBulkLoader;
 import org.mskcc.cbio.portal.dao.DaoCancerStudy;
 import org.mskcc.cbio.portal.dao.DaoException;
 import org.mskcc.cbio.portal.dao.DaoGeneticAlteration;
+import org.mskcc.cbio.portal.dao.DaoGeneticEntity;
 import org.mskcc.cbio.portal.dao.DaoGeneticProfile;
 import org.mskcc.cbio.portal.dao.DaoGeneticProfileSamples;
+import org.mskcc.cbio.portal.dao.DaoPatient;
 import org.mskcc.cbio.portal.dao.DaoSample;
 import org.mskcc.cbio.portal.model.CanonicalGene;
 import org.mskcc.cbio.portal.model.CancerStudy;
 import org.mskcc.cbio.portal.model.GeneticProfile;
+import org.mskcc.cbio.portal.model.shared.GeneticEntity;
+import org.mskcc.cbio.portal.model.Patient;
 import org.mskcc.cbio.portal.model.Sample;
 import org.mskcc.cbio.portal.util.ProgressMonitor;
 import static java.lang.String.format;
@@ -38,6 +42,20 @@ public class GeneticAlterationImporter {
     private String[] sampleUniqueIds;
     private ClickHouseBulkLoader derivedLoader;
     private int pendingDerivedRows = 0;
+
+    // --- no-explode for generic assay (entity-based) -> generic_assay_data_derived (wider schema) ---
+    private static final String GA_DERIVED_TABLE = "generic_assay_data_derived";
+    private static final String[] GA_DERIVED_COLUMNS = {"sample_unique_id", "patient_unique_id",
+        "genetic_entity_id", "value", "generic_assay_type", "profile_stable_id", "entity_stable_id",
+        "datatype", "patient_level", "profile_type"};
+    private Boolean genericAssayProfile;     // null = not yet resolved
+    private String profileStableId;
+    private String genericAssayType;
+    private String datatype;
+    private String patientLevel;
+    private String[] patientUniqueIds;
+    private ClickHouseBulkLoader gaDerivedLoader;
+    private int pendingGaRows = 0;
 
     protected GeneticAlterationImporter() {}
     public GeneticAlterationImporter(
@@ -101,9 +119,14 @@ public class GeneticAlterationImporter {
     ) throws DaoException {
         ensureNumberOfValuesIsCorrect(values.length);
         if (importSetOfGeneticEntityIds.add(geneticEntityId)) {
-            // no-explode targets gene-based genetic_alteration_derived only; generic entities
-            // (e.g. generic assay) keep the packed path and their own derive step.
-            daoGeneticAlteration.addGeneticAlterationsForGeneticEntity(geneticProfileId, geneticEntityId, values);
+            // no-explode handles generic assay (-> generic_assay_data_derived). Other entity-based
+            // profiles (e.g. GSVA geneset scores, which have no derived table and are read from the
+            // packed table directly) always keep the packed path.
+            if (noExplode && isGenericAssayProfile()) {
+                writeGenericAssayExplodedRows(geneticEntityId, values);
+            } else {
+                daoGeneticAlteration.addGeneticAlterationsForGeneticEntity(geneticProfileId, geneticEntityId, values);
+            }
             return true;
         }
         ProgressMonitor.logWarning("Data for genetic entity with id " + geneticEntityId + " already imported from file. Record will be skipped.");
@@ -153,6 +176,65 @@ public class GeneticAlterationImporter {
         }
     }
 
+    /** True iff this profile is a generic assay profile; resolves and caches the GA context once. */
+    private boolean isGenericAssayProfile() throws DaoException {
+        if (genericAssayProfile == null) {
+            GeneticProfile geneticProfile = DaoGeneticProfile.getGeneticProfileById(geneticProfileId);
+            genericAssayProfile = geneticProfile.getGenericAssayType() != null;
+            if (genericAssayProfile) {
+                initGenericAssayContext(geneticProfile);
+            }
+        }
+        return genericAssayProfile;
+    }
+
+    /**
+     * Resolve the constants the generic_assay_data_derived row needs (study, profile fields, and the
+     * per-column sample_unique_id / patient_unique_id) once per profile — the same values the SQL
+     * derive recovers by joining genetic_profile / genetic_entity / sample_derived.
+     */
+    private void initGenericAssayContext(GeneticProfile geneticProfile) throws DaoException {
+        CancerStudy study = DaoCancerStudy.getCancerStudyByInternalId(geneticProfile.getCancerStudyId());
+        this.cancerStudyIdentifier = study.getCancerStudyStableId();
+        this.profileStableId = geneticProfile.getStableId();
+        String prefix = cancerStudyIdentifier + "_";
+        this.profileType = profileStableId.startsWith(prefix) ? profileStableId.substring(prefix.length()) : profileStableId;
+        this.genericAssayType = geneticProfile.getGenericAssayType();
+        this.datatype = geneticProfile.getDatatype();
+        this.patientLevel = geneticProfile.getPatientLevel() ? "1" : "0";
+        this.sampleUniqueIds = new String[orderedSampleList.size()];
+        this.patientUniqueIds = new String[orderedSampleList.size()];
+        for (int i = 0; i < orderedSampleList.size(); i++) {
+            Sample sample = DaoSample.getSampleById(orderedSampleList.get(i));
+            this.sampleUniqueIds[i] = cancerStudyIdentifier + "_" + sample.getStableId();
+            Patient patient = DaoPatient.getPatientById(sample.getInternalPatientId());
+            this.patientUniqueIds[i] = cancerStudyIdentifier + "_" + patient.getStableId();
+        }
+        this.gaDerivedLoader = ClickHouseBulkLoader.getClickHouseBulkLoader(GA_DERIVED_TABLE);
+        this.gaDerivedLoader.setFieldNames(GA_DERIVED_COLUMNS);
+    }
+
+    /**
+     * Emit one generic_assay_data_derived row per cell. Mirrors that derive, which (unlike the gene
+     * one) does NOT filter "NA": it maps '' -> NULL and keeps every other value, so no cell is dropped.
+     */
+    private void writeGenericAssayExplodedRows(int geneticEntityId, String[] values) throws DaoException {
+        GeneticEntity entity = DaoGeneticEntity.getGeneticEntityById(geneticEntityId);
+        String entityStableId = entity.getStableId();
+        String entityIdString = Integer.toString(geneticEntityId);
+        for (int i = 0; i < values.length; i++) {
+            String value = values[i];
+            gaDerivedLoader.insertRecord(sampleUniqueIds[i], patientUniqueIds[i], entityIdString,
+                value.isEmpty() ? "\\N" : value, genericAssayType, profileStableId, entityStableId,
+                datatype, patientLevel, profileType);
+            pendingGaRows++;
+        }
+        if (pendingGaRows >= DERIVED_FLUSH_THRESHOLD) {
+            gaDerivedLoader.flush();
+            pendingGaRows = 0;
+        }
+    }
+
     private void ensureNumberOfValuesIsCorrect(int valuesNumber) {
         if (valuesNumber != orderedSampleList.size()) {
             throw new IllegalArgumentException("There has to be " + orderedSampleList.size() + " values, but only " + valuesNumber+ " has passed.");
@@ -163,7 +245,9 @@ public class GeneticAlterationImporter {
     public void initialize() {
         try {
             storeOrderedSampleList();
-            if (noExplode) {
+            // Gene-based profiles set up the genetic_alteration_derived context now; generic assay
+            // sets up its own (generic_assay_data_derived) context lazily via isGenericAssayProfile().
+            if (noExplode && !isGenericAssayProfile()) {
                 initNoExplodeContext();
             }
         } catch (DaoException e) {
@@ -175,6 +259,10 @@ public class GeneticAlterationImporter {
         if (noExplode && derivedLoader != null) {
             derivedLoader.flush();
             pendingDerivedRows = 0;
+        }
+        if (noExplode && gaDerivedLoader != null) {
+            gaDerivedLoader.flush();
+            pendingGaRows = 0;
         }
     }
 }
