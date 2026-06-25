@@ -46,6 +46,10 @@ import org.mskcc.cbio.portal.dao.DaoGeneticProfile;
 import org.mskcc.cbio.portal.dao.DaoPatient;
 import org.mskcc.cbio.portal.dao.DaoSample;
 import org.mskcc.cbio.portal.dao.DaoSampleProfile;
+import org.mskcc.cbio.portal.dao.JdbcUtil;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import org.mskcc.cbio.portal.model.CancerStudy;
 import org.mskcc.cbio.portal.model.CanonicalGene;
 import org.mskcc.cbio.portal.model.CopyNumberStatus;
@@ -503,5 +507,74 @@ public class TestImportTabDelimData extends IntegrationTestBase {
             DaoSample.addSample(new Sample(sampleId, pId, study.getTypeOfCancerId()));
         }
         ClickHouseBulkLoader.flushAll();
+    }
+
+    /**
+     * In no-explode mode the real importer writes exploded rows straight into
+     * genetic_alteration_derived (no packed `values`, no ARRAY JOIN derive). Verify the
+     * derived rows match the input matrix and that the packed table stays empty.
+     */
+    @Test
+    public void testImportCnaDataNoExplode() throws Exception {
+        ClickHouseBulkLoader.bulkLoadOn();
+        ClickHouseBulkLoader.noExplodeOn();
+        try {
+            DaoGeneOptimized daoGene = DaoGeneOptimized.getInstance();
+            daoGene.addGene(new CanonicalGene(999999207, "TESTAKT1"));
+            daoGene.addGene(new CanonicalGene(999999208, "TESTAKT2"));
+            daoGene.addGene(new CanonicalGene(999910000, "TESTAKT3"));
+            daoGene.addGene(new CanonicalGene(999999369, "TESTARAF"));
+            daoGene.addGene(new CanonicalGene(999999472, "TESTATM"));
+            daoGene.addGene(new CanonicalGene(999999673, "TESTBRAF"));
+            daoGene.addGene(new CanonicalGene(999999672, "TESTBRCA1"));
+            daoGene.addGene(new CanonicalGene(999999675, "TESTBRCA2"));
+
+            ProgressMonitor.setConsoleMode(false);
+            File file = new File("src/test/resources/cna_test.txt");
+            ImportTabDelimData parser = new ImportTabDelimData(file, "Barry", geneticProfileId, null, false, DaoGeneOptimized.getInstance());
+            parser.importData();
+
+            // derived rows: sample_unique_id = <study>_<sample>, profile_type = stableId minus study prefix ("test")
+            String p = "study_tcga_pub_";
+            assertEquals("0",  derivedValue(p + "TCGA-A1-A0SB-01", "TESTAKT1", "test"));
+            assertEquals("-1", derivedValue(p + "TCGA-A1-A0SF-01", "TESTAKT1", "test"));
+            assertEquals("0",  derivedValue(p + "TCGA-A1-A0SD-01", "TESTAKT1", "test"));
+            assertEquals("2",  derivedValue(p + "TCGA-A1-A0SD-01", "TESTAKT3", "test"));
+            assertEquals("2",  derivedValue(p + "TCGA-A1-A0SE-01", "TESTAKT3", "test"));
+
+            // packed genetic_alteration must stay empty for this profile in no-explode mode
+            assertEquals(0, packedRowCount(geneticProfileId));
+        } finally {
+            ClickHouseBulkLoader.noExplodeOff();
+        }
+    }
+
+    private String derivedValue(String sampleUniqueId, String hugo, String profileType) throws Exception {
+        Connection con = null; PreparedStatement ps = null; ResultSet rs = null;
+        try {
+            con = JdbcUtil.getDbConnection(TestImportTabDelimData.class);
+            ps = con.prepareStatement("SELECT alteration_value FROM genetic_alteration_derived "
+                + "WHERE sample_unique_id = ? AND hugo_gene_symbol = ? AND profile_type = ?");
+            ps.setString(1, sampleUniqueId);
+            ps.setString(2, hugo);
+            ps.setString(3, profileType);
+            rs = ps.executeQuery();
+            return rs.next() ? rs.getString(1) : null;
+        } finally {
+            JdbcUtil.closeAll(TestImportTabDelimData.class, con, ps, rs);
+        }
+    }
+
+    private int packedRowCount(int geneticProfileId) throws Exception {
+        Connection con = null; PreparedStatement ps = null; ResultSet rs = null;
+        try {
+            con = JdbcUtil.getDbConnection(TestImportTabDelimData.class);
+            ps = con.prepareStatement("SELECT count() FROM genetic_alteration WHERE genetic_profile_id = ?");
+            ps.setInt(1, geneticProfileId);
+            rs = ps.executeQuery();
+            return rs.next() ? rs.getInt(1) : -1;
+        } finally {
+            JdbcUtil.closeAll(TestImportTabDelimData.class, con, ps, rs);
+        }
     }
 }
