@@ -68,7 +68,7 @@ function execute_sql_statement_via_clickhouse_client() {
         echo "Error : could not overwrite existing output file $output_filepath when executing clickhouse statement $statement" >&2
     fi
     (
-        clickhouse client --config-file="$configured_clickhouse_config_file_path" --format=TabSeparatedWithNames <<< "$statement" > "$output_filepath"
+        clickhouse client --config-file="$configured_clickhouse_config_file_path" --format=TabSeparatedWithNames --accept-invalid-certificate <<< "$statement" > "$output_filepath"
     )
 }
 
@@ -79,7 +79,7 @@ function execute_sql_statement_from_file_via_clickhouse_client() {
         echo "Error : could not overwrite existing output file $output_filepath when executing clickhouse statements from file $statement_filepath" >&2
     fi
     (
-        clickhouse client --config-file="$configured_clickhouse_config_file_path" --format=TabSeparatedWithNames --queries-file="$statement_filepath" > "$output_filepath"
+        clickhouse client --config-file="$configured_clickhouse_config_file_path" --format=TabSeparatedWithNames --queries-file="$statement_filepath" --accept-invalid-certificate > "$output_filepath"
     )
 }
 
