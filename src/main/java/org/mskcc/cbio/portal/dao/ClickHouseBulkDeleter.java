@@ -45,6 +45,8 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Bulk deleter that buffers IDs in memory, streams them into a ClickHouse staging
@@ -62,6 +64,8 @@ public class ClickHouseBulkDeleter {
     private final String idColumn;
     private final String stagingTable;
     private final Set<Long> pendingIds = new HashSet<>();
+
+    private static final Logger log = LoggerFactory.getLogger(ClickHouseBulkDeleter.class);
 
     private ClickHouseBulkDeleter(String targetTable, String idColumn) {
         this.targetTable = targetTable;
@@ -86,21 +90,16 @@ public class ClickHouseBulkDeleter {
 
     public static int flushAll() throws DaoException {
         int totalDeleted = 0;
-        Connection con = null;
         try {
-            con = JdbcUtil.getDbConnection(ClickHouseBulkDeleter.class);
-            dropAnyExistingStagingTables(con, false); // drop any leftover tables from previous crash/failure
-            createAllStagingTables(con);
-            populateAllStagingTables(con);
-            totalDeleted = deleteRecordsReferencedInStagingTables(con);
+            dropAnyExistingStagingTables(false); // drop any leftover tables from previous crash/failure
+            createAllStagingTables();
+            populateAllStagingTables();
+            totalDeleted = deleteRecordsReferencedInStagingTables();
         } catch (SQLException | IOException e) {
             throw new DaoException(e);
         } finally {
             try {
-                if (con != null) {
-                    dropAnyExistingStagingTables(con, true);
-                    JdbcUtil.closeAll(ClickHouseBulkDeleter.class, con, null, null);
-                }
+                dropAnyExistingStagingTables(true);
             } catch (SQLException se) {
                 // exceptions will be ignored during second call to dropAnyExistingStagingTables
             }
@@ -116,29 +115,35 @@ public class ClickHouseBulkDeleter {
         BULK_DELETERS.clear();
     }
 
-    private static void createAllStagingTables(Connection con) throws SQLException {
+    private static void createAllStagingTables() throws SQLException {
         for (ClickHouseBulkDeleter deleter : BULK_DELETERS.values()) {
+            Connection con = JdbcUtil.getDbConnection(ClickHouseBulkDeleter.class);
             String createTableStatementString = String.format(
                     "CREATE TABLE %s (id Int64) ENGINE = MergeTree() ORDER BY id",
                     deleter.stagingTable);
             try (PreparedStatement stmt = con.prepareStatement(createTableStatementString)) {
                 stmt.executeUpdate();
+            } finally {
+                JdbcUtil.closeAll(ClickHouseBulkDeleter.class, con, null, null);
             }
         }
         // wait for table existence to propagate to replicas (if they exist)
         for (ClickHouseBulkDeleter deleter : BULK_DELETERS.values()) {
+            Connection con = JdbcUtil.getDbConnection(ClickHouseBulkDeleter.class);
             String alterTableStatementString = String.format(
                     "ALTER TABLE %s MODIFY COMMENT 'Transient' SETTINGS mutations_sync = 3",
                     deleter.stagingTable);
             try (PreparedStatement stmt = con.prepareStatement(alterTableStatementString)) {
                 stmt.executeUpdate();
+            } finally {
+                JdbcUtil.closeAll(ClickHouseBulkDeleter.class, con, null, null);
             }
         }
     }
 
-    private static void populateAllStagingTables(Connection con) throws SQLException, DaoException, IOException {
+    private static void populateAllStagingTables() throws SQLException, DaoException, IOException {
         for (ClickHouseBulkDeleter deleter : BULK_DELETERS.values()) {
-            deleter.populateStagingTable(con);
+            deleter.populateStagingTable();
         }
         // wait for inserts to be recognized by all replicas
         // note: this is intentionally done in a second loop in the hope that while values are being inserted
@@ -146,13 +151,13 @@ public class ClickHouseBulkDeleter {
         //     inserted into the first table to be recognized / become visible in the other replica nodes
         //     running in a Clickhouse cluster (such as with clickhouse.cloud). This may avoid retry cycles.
         for (ClickHouseBulkDeleter deleter : BULK_DELETERS.values()) {
-            if (! deleter.allReplicasReachedRecordCount(con)) {
+            if (! deleter.allReplicasReachedRecordCount()) {
                 throw new DaoException("Failed to see all replicas reflect delete list inserted into table " + deleter.stagingTable);
             }
         }
     }
 
-    private void populateStagingTable(Connection con) throws SQLException, IOException {
+    private void populateStagingTable() throws SQLException, IOException {
         if (pendingIds.isEmpty()) {
             return;
         }
@@ -161,26 +166,32 @@ public class ClickHouseBulkDeleter {
         String insertStatementString = String.format(
                 "INSERT INTO %s (id) FORMAT TSVWithNames",
                 stagingTable);
+        Connection con = JdbcUtil.getDbConnection(ClickHouseBulkDeleter.class);
         try (PreparedStatement stmt = con.prepareStatement(insertStatementString)) {
             stmt.setBinaryStream(1, new ByteArrayInputStream(payload));
             stmt.executeUpdate();
+        } finally {
+            JdbcUtil.closeAll(ClickHouseBulkDeleter.class, con, null, null);
         }
     }
 
-    private boolean allReplicasReachedRecordCount(Connection con) throws SQLException {
+    private boolean allReplicasReachedRecordCount() throws SQLException {
         int WAIT_CYCLE_MAX_COUNT = 60;
         int WAIT_CYCLE_PERIOD_SECONDS = 10;
         int WAIT_CYCLE_TOLERATE_EXCEPTION_LIMIT = 6;
         int exceptions_ignored = 0;
+        log.warn(String.format("beginning on wait for table %s", stagingTable));
         for (int cycle = 0 ; cycle < WAIT_CYCLE_MAX_COUNT ; cycle = cycle + 1) {
             String getRecordCountsString = String.format(
-                    "SELECT COUNT() as record_count FROM clusterAllReplicas('default', current_database(), %s)",
+                    "SELECT hostname() as host, COUNT() as record_count FROM clusterAllReplicas('default', current_database(), %s) GROUP BY host",
                     stagingTable);
+            Connection con = JdbcUtil.getDbConnection(ClickHouseBulkDeleter.class);
             try (PreparedStatement pstmt = con.prepareStatement(getRecordCountsString);
                     ResultSet rs = pstmt.executeQuery()) {
                 boolean recordCountWasReached = true;
                 while (rs.next()) {
                     int recordCountOnReplica = rs.getInt("record_count");
+                    log.warn(String.format("waiting to reach record count : expected %d saw %d", recordCountOnReplica, pendingIds.size()));
                     if (recordCountOnReplica != pendingIds.size()) {
                         recordCountWasReached = false;
                         break;
@@ -197,41 +208,49 @@ public class ClickHouseBulkDeleter {
                 exceptions_ignored = exceptions_ignored + 1;
             } catch (InterruptedException ie) {
                 // ignore : ok to go on to next cycle immediately
+            } finally {
+                JdbcUtil.closeAll(ClickHouseBulkDeleter.class, con, null, null);
             }
         }
         return false;
     }
 
-    private static int deleteRecordsReferencedInStagingTables(Connection con) throws SQLException {
+    private static int deleteRecordsReferencedInStagingTables() throws SQLException {
         int totalDeleted = 0;
         for (ClickHouseBulkDeleter deleter : BULK_DELETERS.values()) {
-            totalDeleted += deleter.deleteRecordsReferencedInStagingTable(con);
+            totalDeleted += deleter.deleteRecordsReferencedInStagingTable();
         }
         return totalDeleted;
     }
 
-    private int deleteRecordsReferencedInStagingTable(Connection con) throws SQLException {
+    private int deleteRecordsReferencedInStagingTable() throws SQLException {
         int records_deleted;
         String statementString = String.format(
                 "DELETE FROM %s WHERE %s IN (SELECT id FROM %s)",
                 targetTable, idColumn, stagingTable);
+        Connection con = JdbcUtil.getDbConnection(ClickHouseBulkDeleter.class);
         try (PreparedStatement stmt = con.prepareStatement(statementString)) {
             records_deleted = stmt.executeUpdate();
+        } finally {
+            JdbcUtil.closeAll(ClickHouseBulkDeleter.class, con, null, null);
         }
         return records_deleted;
     }
 
-    private static void dropAnyExistingStagingTables(Connection con, boolean ignoreExceptions) throws SQLException {
+    private static void dropAnyExistingStagingTables(boolean ignoreExceptions) throws SQLException {
         for (ClickHouseBulkDeleter deleter : BULK_DELETERS.values()) {
             String dropStatementString = String.format(
                 "DROP TABLE IF EXISTS %s",
                 deleter.stagingTable);
+            Connection con = JdbcUtil.getDbConnection(ClickHouseBulkDeleter.class);
             try (PreparedStatement stmt = con.prepareStatement(dropStatementString)) {
                 stmt.executeUpdate();
             } catch (SQLException e) {
                 if (! ignoreExceptions) {
                     throw e;
                 }
+            } finally {
+                JdbcUtil.closeAll(ClickHouseBulkDeleter.class, con, null, null);
             }
         }
     }
