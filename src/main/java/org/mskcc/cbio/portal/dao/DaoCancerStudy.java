@@ -509,17 +509,17 @@ public final class DaoCancerStudy {
             DaoGenericAssay.checkAndDeleteGenericAssayMetaInStudy(internalCancerStudyId);
             
             String geneticProfileIdQuery = "SELECT genetic_profile_id FROM genetic_profile WHERE cancer_study_id=?";
-            List<Integer> geneticProfileIds = collectIds(geneticProfileIdQuery, internalCancerStudyId);
+            List<Long> geneticProfileIds = collectIds(geneticProfileIdQuery, internalCancerStudyId);
             String patientIdQuery = "SELECT internal_id FROM patient WHERE cancer_study_id=?";
-            List<Integer> patientIds = collectIds(patientIdQuery, internalCancerStudyId);
+            List<Long> patientIds = collectIds(patientIdQuery, internalCancerStudyId);
             String sampleIdQuery = "SELECT internal_id FROM sample WHERE patient_id IN (SELECT internal_id FROM patient WHERE cancer_study_id=?)";
-            List<Integer> sampleIds = collectIds(sampleIdQuery, internalCancerStudyId);
+            List<Long> sampleIds = collectIds(sampleIdQuery, internalCancerStudyId);
             String sampleListIdQuery = "SELECT list_id FROM sample_list WHERE cancer_study_id=?";
-            List<Integer> sampleListIds = collectIds(sampleListIdQuery, internalCancerStudyId);
+            List<Long> sampleListIds = collectIds(sampleListIdQuery, internalCancerStudyId);
             String clinicalEventIdQuery = "SELECT clinical_event_id FROM clinical_event WHERE patient_id IN (SELECT internal_id FROM patient WHERE cancer_study_id=?)";
-            List<Integer> clinicalEventIds = collectIds(clinicalEventIdQuery, internalCancerStudyId);
+            List<Long> clinicalEventIds = collectIds(clinicalEventIdQuery, internalCancerStudyId);
             String gisticIdQuery = "SELECT gistic_roi_id FROM gistic WHERE cancer_study_id=?";
-            List<Integer> gisticIds = collectIds(gisticIdQuery, internalCancerStudyId);
+            List<Long> gisticIds = collectIds(gisticIdQuery, internalCancerStudyId);
 
             ClickHouseBulkDeleter.getBulkDeleter("sample_cna_event", "genetic_profile_id").addIds(geneticProfileIds);
             ClickHouseBulkDeleter.getBulkDeleter("genetic_alteration", "genetic_profile_id").addIds(geneticProfileIds);
@@ -597,8 +597,8 @@ public final class DaoCancerStudy {
         }
     }
 
-    private static List<Integer> collectIds(String sql, int cancerStudyId) throws SQLException {
-        List<Integer> ids = new ArrayList<>();
+    private static List<Long> collectIds(String sql, int cancerStudyId) throws SQLException {
+        List<Long> ids = new ArrayList<>();
         Connection con = null;
         try {
             con = JdbcUtil.getDbConnection(DaoCancerStudy.class);
@@ -606,7 +606,7 @@ public final class DaoCancerStudy {
                 pstmt.setInt(1, cancerStudyId);
                 try (ResultSet rs = pstmt.executeQuery()) {
                     while (rs.next()) {
-                        ids.add(rs.getInt(1));
+                        ids.add(rs.getLong(1));
                     }
                 }
             }
