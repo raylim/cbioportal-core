@@ -1,5 +1,5 @@
-# When cbioportal-core's containerized branch is pushed, notify cmo-pipelines
-# so its workflows can rebuild the importer / core images.
+# When cbioportal-core's main branch is pushed, notify cmo-pipelines so its
+# workflows can rebuild the importer / core images.
 #
 # cmo-pipelines subscribes to repository_dispatch events of type
 # cbioportal-core-push in:
@@ -14,6 +14,7 @@ name: Notify cmo-pipelines
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   dispatch:
