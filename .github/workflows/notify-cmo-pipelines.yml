@@ -13,7 +13,7 @@ name: Notify cmo-pipelines
 
 on:
   push:
-    branches: [containerized]
+    branches: [main]
 
 jobs:
   dispatch:
