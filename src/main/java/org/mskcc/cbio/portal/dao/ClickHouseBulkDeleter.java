@@ -70,6 +70,16 @@ public class ClickHouseBulkDeleter {
     private final Set<Long> pendingIds = new HashSet<>();
     private boolean flushed; // once flushed, any particular deleter instance cannot not be flushed again
 
+    public enum AllReplicaTestType {
+        CONSISTENT,
+        EXPECTED_VALUE
+    }
+
+    public enum AllReplicaCriterionType {
+        LONG,
+        STRING
+    }
+
 // --- Interface ---
 
     public static ClickHouseBulkDeleter getBulkDeleter(String targetTable, String idColumn) {
@@ -129,7 +139,7 @@ public class ClickHouseBulkDeleter {
     private static boolean anyDeleterWasAlreadyFlushed(List<ClickHouseBulkDeleter> deleters) {
         return deleters.stream().anyMatch(d -> d.wasFlushed());
     }
- 
+
     // returns only the deleters which might delete anything (duplicates discarded)
     private static List<ClickHouseBulkDeleter> deletersWithPendingDeletes(List<ClickHouseBulkDeleter> deleters) {
         List<ClickHouseBulkDeleter> effectiveDeleters = new ArrayList<>();
@@ -383,35 +393,31 @@ public class ClickHouseBulkDeleter {
         String getTableExistsString = String.format(
                 "SELECT hostname() as host, count() as table_exists FROM clusterAllReplicas('default', 'system', 'tables') where database = current_database() and name = '%s' GROUP BY host",
                 stagingTable);
-        return allReplicasReportExpectedResult(getTableExistsString, "table_exists", 1);
+        return allReplicasReportExpectedResult(getTableExistsString, "table_exists", AllReplicaTestType.EXPECTED_VALUE, AllReplicaCriterionType.LONG, 1L);
     }
 
-// TODO : change this to simply look for the record count in system.tables (faster/more consistent)
     private boolean allReplicasReportExpectedStagingTableRecordCount() throws SQLException, DaoException {
         String getRecordCountsString = String.format(
-                "SELECT hostname() as host, count() as record_count FROM clusterAllReplicas('default', current_database(), %s) GROUP BY host",
+                "SELECT hostname() as host, total_rows as total_rows FROM clusterAllReplicas('default', 'system', 'tables') where database = current_database() and name = '%s'",
                 stagingTable);
-        return allReplicasReportExpectedResult(getRecordCountsString, "record_count", pendingIds.size());
+        return allReplicasReportExpectedResult(getRecordCountsString, "total_rows", AllReplicaTestType.EXPECTED_VALUE, AllReplicaCriterionType.LONG, new Long(pendingIds.size()));
     }
 
     private boolean deletionIsComplete() throws SQLException, DaoException {
         String getUndeletedRecordCountsString = String.format(
                 "SELECT count() as record_count FROM %s WHERE %s IN (SELECT id from %s)",
                 targetTable, idColumn, stagingTable);
-        return queryProducedExpectedResult(getUndeletedRecordCountsString, "record_count", 0);
+        return queryProducedExpectedResult(getUndeletedRecordCountsString, "record_count", 0L);
     }
 
     private boolean allReplicasReportSameMetadataForTargetTable() throws SQLException, DaoException {
         String selectClause = "SELECT hostname() as host, metadata_modification_time as field_value";
-        String fromClause = "FROM clusterAllReplicas('default', system, tables)";
+        String fromClause = "FROM clusterAllReplicas('default', 'system', 'tables')";
         String whereClause = "WHERE database = current_database() AND name = ";
         String getMetadataString = String.format(
                 "%s %s %s '%s'",
-                selectClause,
-                fromClause,
-                whereClause,
-                targetTable);
-        return allReplicasReportSameValue(getMetadataString, "field_value");
+                selectClause, fromClause, whereClause, targetTable);
+        return allReplicasReportExpectedResult(getMetadataString, "field_value", AllReplicaTestType.CONSISTENT, AllReplicaCriterionType.STRING, null);
     }
 
 // reusable logic to perform test/retry loops for database queries with criteria
@@ -481,98 +487,78 @@ public class ClickHouseBulkDeleter {
         return true;
     }
 
-//ROB : todo : consolidate the next two methods
     // queryString must be a SQL query which returns results which includes a field "host" with the hostname() of the replica responding. "SELECT hostname() as host..."
-    private boolean allReplicasReportExpectedResult(String queryString, String outputField, long expectedResult) throws SQLException, DaoException {
-        boolean allReplicasAreAsExpected = false;
+    // with testType AllReplicaTestType.CONSISTENT, the expectedValue argument is ignored (pass null)
+    private boolean allReplicasReportExpectedResult(String queryString, String outputField, AllReplicaTestType testType, AllReplicaCriterionType criterionType, Object expectedValue) throws SQLException, DaoException {
         Set<String> allReplicaHostNames = getReplicaHostnames();
-        Connection con = JdbcUtil.getDbConnection(ClickHouseBulkDeleter.class);
-        try (PreparedStatement pstmt = con.prepareStatement(queryString);
-                ResultSet rs = pstmt.executeQuery()) {
-            boolean anUnexpectedResultWasSeen = false;
-            Set<String> reportedReplicaHostNames = new HashSet<>();
-            while (rs.next()) {
-                String replicaHostname = rs.getString("host");
-                reportedReplicaHostNames.add(replicaHostname);
-                long resultOnReplica = rs.getLong(outputField);
-                if (resultOnReplica != expectedResult) {
-                    log.warn(String.format(
-                            "waiting to reach expected result for query '%s' : expected %d saw %d on replica %s",
-                            queryString,
-                            expectedResult,
-                            resultOnReplica,
-                            replicaHostname));
-                    anUnexpectedResultWasSeen = true;
-                    break;
-                }
-            }
-            if (!reportedReplicaHostNames.containsAll(allReplicaHostNames)) {
-                // .containsAll() was used instead of .equals() because if additional replicas became active while the query was running,
-                // that is still acceptable so long as the new replicas all report the expected result. we might worry about additional non-responding replicas...
-                log.warn(String.format(
-                        "while querying all replicas using query '%s' : either the replica set was reduced during the query execution or one or more replicas failed to be evaluated. waiting will continue. All replicas : %s ; Reported replicas : %s",
-                        queryString,
-                        String.join(", ", allReplicaHostNames),
-                        String.join(", ", reportedReplicaHostNames)));
-            } else {
-                if (!anUnexpectedResultWasSeen) {
-                    allReplicasAreAsExpected = true;
-                }
-            }
-        } finally {
-            JdbcUtil.closeAll(ClickHouseBulkDeleter.class, con, null, null);
+        Map<String, Object> replicaValueMap = getReportedResultFromAllReplicas(queryString, criterionType, outputField);
+        if (replicaValueMap.isEmpty()) {
+            return false; // for this purpose, at least one replica must report a match
         }
-        return allReplicasAreAsExpected;
+        Collection<Object> values = replicaValueMap.values();
+        switch (testType) {
+            case AllReplicaTestType.CONSISTENT:
+                Object firstValue = values.iterator().next();
+                if (!values.stream().allMatch(value -> firstValue.equals(value))) {
+                    log.warn(String.format(
+                            "waiting to reach expected result for query '%s' : expected consistent values but saw: %s",
+                            queryString,
+                            replicaValueMap.toString()));
+                    return false;
+                }
+                break;
+            case AllReplicaTestType.EXPECTED_VALUE:
+                if (!values.stream().allMatch(value -> expectedValue.equals(value))) {
+                    log.warn(String.format(
+                            "waiting to reach expected result for query '%s' : expected %d as value but saw: %s",
+                            queryString,
+                            expectedValue,
+                            replicaValueMap.toString()));
+                    return false;
+                }
+                break;
+            default:
+                throw new DaoException("Unknown testType argument passed to allReplicasReportExpectedResult()");
+        }
+        if (!replicaValueMap.keySet().containsAll(allReplicaHostNames)) {
+            // .containsAll() was used instead of .equals() because if additional replicas became active while the query was running,
+            // that is still acceptable so long as the new replicas all report the expected result. we might worry about additional non-responding replicas...
+            log.warn(String.format(
+                    "while querying all replicas using query '%s' : either the replica set was reduced during the query execution or one or more replicas failed to be evaluated. waiting will continue. All replicas : %s ; Reported replicas : %s",
+                    queryString,
+                    String.join(", ", allReplicaHostNames),
+                    String.join(", ", replicaValueMap.keySet())));
+            return false;
+        }
+        return true;
     }
 
-    // queryString must be a SQL query which returns results which includes a field "host" with the hostname() of the replica responding, and field outputField
-    private boolean allReplicasReportSameValue(String queryString, String outputField) throws SQLException, DaoException {
-        boolean allReplicasAreAsExpected = false;
-        Set<String> allReplicaHostNames = getReplicaHostnames();
+    private Map<String, Object> getReportedResultFromAllReplicas(String queryString, AllReplicaCriterionType outputType, String outputField) throws SQLException, DaoException {
+        Map<String, Object> replicaValueMap = new LinkedHashMap<>();
         Connection con = JdbcUtil.getDbConnection(ClickHouseBulkDeleter.class);
         try (PreparedStatement pstmt = con.prepareStatement(queryString);
                 ResultSet rs = pstmt.executeQuery()) {
-            boolean anUnexpectedResultWasSeen = false;
-            Set<String> reportedReplicaHostNames = new HashSet<>();
-            String valueToBeMatched = null;
             while (rs.next()) {
                 String replicaHostname = rs.getString("host");
-                reportedReplicaHostNames.add(replicaHostname);
-                String resultOnReplica = rs.getString(outputField);
-                if (valueToBeMatched == null) {
-                    valueToBeMatched = resultOnReplica;
-                }
-                if (!valueToBeMatched.equals(resultOnReplica)) {
-                    log.warn(String.format(
-                            "waiting to reach consistent result for query '%s' : saw differing results '%s' and '%s'",
-                            queryString,
-                            valueToBeMatched,
-                            resultOnReplica));
-                    anUnexpectedResultWasSeen = true;
-                    break;
-                }
-            }
-            if (!reportedReplicaHostNames.containsAll(allReplicaHostNames)) {
-                // .containsAll() was used instead of .equals() because if additional replicas became active while the query was running,
-                // that is still acceptable so long as the new replicas all report the expected result. we might worry about additional non-responding replicas...
-                log.warn(String.format(
-                        "while querying all replicas using query '%s' : either the replica set was reduced during the query execution or one or more replicas failed to be evaluated. waiting will continue. All replicas : %s ; Reported replicas : %s",
-                        queryString,
-                        String.join(", ", allReplicaHostNames),
-                        String.join(", ", reportedReplicaHostNames)));
-            } else {
-                if (!anUnexpectedResultWasSeen) {
-                    allReplicasAreAsExpected = true;
+                switch (outputType) {
+                    case LONG:
+                        replicaValueMap.put(replicaHostname, rs.getLong(outputField));
+                        break;
+                    case STRING:
+                        replicaValueMap.put(replicaHostname, rs.getString(outputField));
+                        break;
+                    default:
+                        throw new DaoException("Unknown outputType argument passed to getReportedResultFromAllReplicas()");
                 }
             }
         } finally {
             JdbcUtil.closeAll(ClickHouseBulkDeleter.class, con, null, null);
         }
-        return allReplicasAreAsExpected;
+        return replicaValueMap;
     }
 
 // helper functions which query the database directly
-//
+
     private Set<String> getReplicaHostnames() throws SQLException {
         Set<String> hostnameSet = new HashSet<>();
         Connection con = JdbcUtil.getDbConnection(ClickHouseBulkDeleter.class);
