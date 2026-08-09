@@ -48,6 +48,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import org.mskcc.cbio.portal.util.GlobalProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -61,14 +62,48 @@ import org.slf4j.LoggerFactory;
  */
 public class ClickHouseBulkDeleter {
 
-    private static final Map<String, ClickHouseBulkDeleter> BULK_DELETERS = new LinkedHashMap<>();
-    private static final Logger log = LoggerFactory.getLogger(ClickHouseBulkDeleter.class);
-
-    private final String targetTable;
+    private boolean flushed; // once flushed, any particular deleter instance cannot not be flushed again
+    private final Set<Long> pendingIds = new HashSet<>();
     private final String idColumn;
     private final String stagingTable;
-    private final Set<Long> pendingIds = new HashSet<>();
-    private boolean flushed; // once flushed, any particular deleter instance cannot not be flushed again
+    private final String targetTable;
+
+    private static final Logger log = LoggerFactory.getLogger(ClickHouseBulkDeleter.class);
+    private static final Map<String, ClickHouseBulkDeleter> BULK_DELETERS = new LinkedHashMap<>();
+
+    private static final Integer DEFAULT_CREATE_STAGING_TABLE_MAX_RETRY_SECONDS = 2 * 60;
+    private static final Integer DEFAULT_POPULATE_STAGING_TABLE_MAX_RETRY_SECONDS = 3 * 60;
+    private static final Integer DEFAULT_CONFIRM_DELETE_DATA_MAX_RETRY_SECONDS = 7 * 60;
+    private static final Integer DEFAULT_CONFIRM_DELETE_METADATA_MAX_RETRY_SECONDS = 2 * 60;
+    private static final Integer DEFAULT_RETRY_CYCLE_PERIOD_SECONDS = 10;
+    private static final Integer DEFAULT_RETRY_CYCLE_MAX_EXCEPTION_COUNT = 6;
+    private static final Integer CREATE_STAGING_TABLE_MAX_RETRY_SECONDS;
+    private static final Integer POPULATE_STAGING_TABLE_MAX_RETRY_SECONDS;
+    private static final Integer CONFIRM_DELETE_DATA_MAX_RETRY_SECONDS;
+    private static final Integer CONFIRM_DELETE_METADATA_MAX_RETRY_SECONDS;
+    private static final Integer RETRY_CYCLE_PERIOD_SECONDS;
+    private static final Integer RETRY_CYCLE_MAX_EXCEPTION_COUNT;
+
+    static {
+        CREATE_STAGING_TABLE_MAX_RETRY_SECONDS = GlobalProperties.parseIntegerProperty(
+                "bulkdeleter.create_staging_table.max_retry_seconds",
+                DEFAULT_CREATE_STAGING_TABLE_MAX_RETRY_SECONDS);
+        POPULATE_STAGING_TABLE_MAX_RETRY_SECONDS = GlobalProperties.parseIntegerProperty(
+                "bulkdeleter.populate_staging_table.max_retry_seconds",
+                DEFAULT_POPULATE_STAGING_TABLE_MAX_RETRY_SECONDS);
+        CONFIRM_DELETE_DATA_MAX_RETRY_SECONDS = GlobalProperties.parseIntegerProperty(
+                "bulkdeleter.confirm_delete_data.max_retry_seconds",
+                DEFAULT_CONFIRM_DELETE_DATA_MAX_RETRY_SECONDS);
+        CONFIRM_DELETE_METADATA_MAX_RETRY_SECONDS = GlobalProperties.parseIntegerProperty(
+                "bulkdeleter.confirm_delete_metadata.max_retry_seconds",
+                DEFAULT_CONFIRM_DELETE_METADATA_MAX_RETRY_SECONDS);
+        RETRY_CYCLE_PERIOD_SECONDS = GlobalProperties.parseIntegerProperty(
+                "bulkdeleter.retry_cycle_period_seconds",
+                DEFAULT_RETRY_CYCLE_PERIOD_SECONDS);
+        RETRY_CYCLE_MAX_EXCEPTION_COUNT = GlobalProperties.parseIntegerProperty(
+                "bulkdeleter.retry_cycle_max_exception_count",
+                DEFAULT_RETRY_CYCLE_MAX_EXCEPTION_COUNT);
+    }
 
     public enum AllReplicaTestType {
         CONSISTENT,
@@ -339,8 +374,7 @@ public class ClickHouseBulkDeleter {
 // methods which are complete confirmations of database alterations (on failure these throw DaoExcpetion)
 
     private void confirmCreationOfStagingTable() throws DaoException {
-        final int MAX_RETRY_SECONDS = 600;
-        if (! this.conditionIsTrueAfterQueryWithRetry(this::allReplicasReportStagingTableExists, MAX_RETRY_SECONDS)) {
+        if (! this.conditionIsTrueAfterQueryWithRetry(this::allReplicasReportStagingTableExists, CREATE_STAGING_TABLE_MAX_RETRY_SECONDS)) {
             String exceptionMsgString = String.format(
                     "Failed to see all replicas report existence of staging table %s after creation",
                     this.stagingTable);
@@ -349,8 +383,7 @@ public class ClickHouseBulkDeleter {
     }
 
     private void confirmPopulationOfStagingTable() throws DaoException {
-        final int MAX_RETRY_SECONDS = 600;
-        if (! this.conditionIsTrueAfterQueryWithRetry(this::allReplicasReportExpectedStagingTableRecordCount, MAX_RETRY_SECONDS)) {
+        if (! this.conditionIsTrueAfterQueryWithRetry(this::allReplicasReportExpectedStagingTableRecordCount, POPULATE_STAGING_TABLE_MAX_RETRY_SECONDS)) {
             String exceptionMsgString = String.format(
                     "Failed to see all replicas reflect delete list inserted into table %s",
                     this.stagingTable);
@@ -364,25 +397,23 @@ public class ClickHouseBulkDeleter {
     }
 
     private void confirmDeletionIsCompleteInData() throws DaoException {
-        final int MAX_RETRY_SECONDS = 600;
-        if (!this.conditionIsTrueAfterQueryWithRetry(this::deletionIsComplete, MAX_RETRY_SECONDS)) {
+        if (!this.conditionIsTrueAfterQueryWithRetry(this::deletionIsComplete, DEFAULT_CONFIRM_DELETE_DATA_MAX_RETRY_SECONDS)) {
             String exceptionMessageString = String.format(
                     "Failed to complete the delete operation on all replicas for table %s after retrying for %d seconds",
                     this.targetTable,
-                    MAX_RETRY_SECONDS);
+                    DEFAULT_CONFIRM_DELETE_DATA_MAX_RETRY_SECONDS);
             throw new DaoException(exceptionMessageString);
         }
         // TODO: if condition fails a few times, we might start checking whether any
-        // mutations are still in progress -- if not, stop waiting and fail before MAX_RETRY_SECONDS
+        // mutations are still in progress -- if not, stop waiting and fail early
     }
 
     private void confirmDeletionIsCompleteInMetadata() throws DaoException {
-        final int MAX_RETRY_SECONDS = 65;
-        if (!this.conditionIsTrueAfterQueryWithRetry(this::allReplicasReportSameMetadataForTargetTable, MAX_RETRY_SECONDS)) {
+        if (!this.conditionIsTrueAfterQueryWithRetry(this::allReplicasReportSameMetadataForTargetTable, CONFIRM_DELETE_METADATA_MAX_RETRY_SECONDS)) {
             String exceptionMessageString = String.format(
                     "Metadata for table %s could not be confirmed to have propagated across all cluster replica nodes after retrying for %d seconds",
                     this.targetTable,
-                    MAX_RETRY_SECONDS);
+                    CONFIRM_DELETE_METADATA_MAX_RETRY_SECONDS);
             throw new DaoException(exceptionMessageString);
         }
     }
@@ -391,33 +422,44 @@ public class ClickHouseBulkDeleter {
 
     private boolean allReplicasReportStagingTableExists() throws SQLException, DaoException {
         String getTableExistsString = String.format(
-                "SELECT hostname() as host, count() as table_exists FROM clusterAllReplicas('default', 'system', 'tables') where database = current_database() and name = '%s' GROUP BY host",
+                "SELECT hostname() AS host, count() AS table_exists FROM clusterAllReplicas('default', 'system', 'tables') WHERE database = current_database() AND name = '%s' GROUP BY host",
                 stagingTable);
         return allReplicasReportExpectedResult(getTableExistsString, "table_exists", AllReplicaTestType.EXPECTED_VALUE, AllReplicaCriterionType.LONG, 1L);
     }
 
     private boolean allReplicasReportExpectedStagingTableRecordCount() throws SQLException, DaoException {
+        String queryPart1 = "SELECT host, sum(record_count) AS total_rows FROM ((";
+        String queryPart2 = "SELECT hostname() AS host, rows AS record_count FROM clusterAllReplicas('default', 'system', 'parts')";
+        String queryPart3 = "WHERE database = current_database() AND table = ";
+        String queryPart4 = ") union all (";
+        // This union insures that at least one part with one record is included in the query result before aggregation. In this way, every host will be present in the results
+        String queryPart5 = "SELECT hostname() AS host, 0 AS record_count FROM clusterAllReplicas('default', 'system', 'one')";
+        String queryPart6 = ")) GROUP BY host";
         String getRecordCountsString = String.format(
-                "SELECT hostname() as host, total_rows as total_rows FROM clusterAllReplicas('default', 'system', 'tables') where database = current_database() and name = '%s'",
-                stagingTable);
+                "%s%s %s '%s'%s%s%s",
+                queryPart1, queryPart2, queryPart3, stagingTable, queryPart4, queryPart5, queryPart6);
         return allReplicasReportExpectedResult(getRecordCountsString, "total_rows", AllReplicaTestType.EXPECTED_VALUE, AllReplicaCriterionType.LONG, new Long(pendingIds.size()));
     }
 
     private boolean deletionIsComplete() throws SQLException, DaoException {
         String getUndeletedRecordCountsString = String.format(
-                "SELECT count() as record_count FROM %s WHERE %s IN (SELECT id from %s)",
+                "SELECT count() AS record_count FROM %s WHERE %s IN (SELECT id FROM %s)",
                 targetTable, idColumn, stagingTable);
         return queryProducedExpectedResult(getUndeletedRecordCountsString, "record_count", 0L);
     }
 
     private boolean allReplicasReportSameMetadataForTargetTable() throws SQLException, DaoException {
-        String selectClause = "SELECT hostname() as host, metadata_modification_time as field_value";
-        String fromClause = "FROM clusterAllReplicas('default', 'system', 'tables')";
-        String whereClause = "WHERE database = current_database() AND name = ";
+        String queryPart1 = "SELECT host, sum(record_count) AS total_rows FROM ((";
+        String queryPart2 = "SELECT hostname() AS host, rows AS record_count FROM clusterAllReplicas('default', 'system', 'parts')";
+        String queryPart3 = "WHERE database = current_database() AND table = ";
+        String queryPart4 = ") union all (";
+        // This union insures that at least one part with one record is included in the query result before aggregation. In this way, every host will be present in the results
+        String queryPart5 = "SELECT hostname() AS host, 0 AS record_count FROM clusterAllReplicas('default', 'system', 'one')";
+        String queryPart6 = ")) GROUP BY host";
         String getMetadataString = String.format(
-                "%s %s %s '%s'",
-                selectClause, fromClause, whereClause, targetTable);
-        return allReplicasReportExpectedResult(getMetadataString, "field_value", AllReplicaTestType.CONSISTENT, AllReplicaCriterionType.STRING, null);
+                "%s%s %s '%s'%s%s%s",
+                queryPart1, queryPart2, queryPart3, targetTable, queryPart4, queryPart5, queryPart6);
+        return allReplicasReportExpectedResult(getMetadataString, "total_rows", AllReplicaTestType.CONSISTENT, AllReplicaCriterionType.LONG, null);
     }
 
 // reusable logic to perform test/retry loops for database queries with criteria
@@ -428,12 +470,10 @@ public class ClickHouseBulkDeleter {
     }
 
     private boolean conditionIsTrueAfterQueryWithRetry(ConditionPredicate conPred, int maxTestingSeconds) throws DaoException {
-        int WAIT_CYCLE_PERIOD_SECONDS = 10;
-        int WAIT_CYCLE_MAX_COUNT = maxTestingSeconds / WAIT_CYCLE_PERIOD_SECONDS;
-        int WAIT_CYCLE_TOLERATE_EXCEPTION_LIMIT = 6;
+        int totalCycleCount = maxTestingSeconds / RETRY_CYCLE_PERIOD_SECONDS;
         int exceptionsEncountered = 0;
         boolean returnValue = false;
-        for (int cycle = 0 ; cycle < WAIT_CYCLE_MAX_COUNT ; cycle = cycle + 1) {
+        for (int cycle = 0 ; cycle < totalCycleCount ; cycle = cycle + 1) {
             try {
                 if (conPred.conditionIsSatisfied()) {
                     returnValue = true;
@@ -441,18 +481,23 @@ public class ClickHouseBulkDeleter {
                 }
             } catch (SQLException e) {
                 exceptionsEncountered = exceptionsEncountered + 1;
-                if (exceptionsEncountered > WAIT_CYCLE_TOLERATE_EXCEPTION_LIMIT) {
+                String msg = String.format(
+                        "SQL Exception encountered during try/retry loop on cycle number %d : %s",
+                        cycle, e.getMessage());
+                log.warn(msg);
+                if (exceptionsEncountered > DEFAULT_RETRY_CYCLE_MAX_EXCEPTION_COUNT) {
                     throw new DaoException(e);
                 }
             } finally {
-                if (returnValue == false && cycle < WAIT_CYCLE_MAX_COUNT - 1 && exceptionsEncountered <= WAIT_CYCLE_TOLERATE_EXCEPTION_LIMIT) {
+                if (returnValue == false && cycle < totalCycleCount - 1 && exceptionsEncountered <= DEFAULT_RETRY_CYCLE_MAX_EXCEPTION_COUNT) {
                     // sleep if we will be trying another iteration
                     try {
-                        Thread.sleep(1000 * WAIT_CYCLE_PERIOD_SECONDS);
+                        Thread.sleep(1000 * RETRY_CYCLE_PERIOD_SECONDS);
                     } catch (InterruptedException ie) {
                         // allow sleep interruption, and go on to next cycle immediately
                         Thread.currentThread().interrupt(); // set interrupted status, in case we want to adjust for interrupted sleep
                     }
+                } else {
                 }
             }
         }
@@ -487,7 +532,7 @@ public class ClickHouseBulkDeleter {
         return true;
     }
 
-    // queryString must be a SQL query which returns results which includes a field "host" with the hostname() of the replica responding. "SELECT hostname() as host..."
+    // queryString must be a SQL query which returns results which includes a field "host" with the hostname() of the replica responding. "SELECT hostname() AS host..."
     // with testType AllReplicaTestType.CONSISTENT, the expectedValue argument is ignored (pass null)
     private boolean allReplicasReportExpectedResult(String queryString, String outputField, AllReplicaTestType testType, AllReplicaCriterionType criterionType, Object expectedValue) throws SQLException, DaoException {
         Set<String> allReplicaHostNames = getReplicaHostnames();
@@ -562,7 +607,7 @@ public class ClickHouseBulkDeleter {
     private Set<String> getReplicaHostnames() throws SQLException {
         Set<String> hostnameSet = new HashSet<>();
         Connection con = JdbcUtil.getDbConnection(ClickHouseBulkDeleter.class);
-        String getHostNamesQueryString = "SELECT hostname() as host from clusterAllReplicas('default', 'system', 'one') GROUP BY host";
+        String getHostNamesQueryString = "SELECT hostname() AS host FROM clusterAllReplicas('default', 'system', 'one') GROUP BY host";
         try (PreparedStatement pstmt = con.prepareStatement(getHostNamesQueryString);
                 ResultSet rs = pstmt.executeQuery()) {
             while (rs.next()) {
@@ -592,4 +637,5 @@ public class ClickHouseBulkDeleter {
             throw new DaoException(e);
         }
     }
+
 }
