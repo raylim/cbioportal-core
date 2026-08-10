@@ -508,21 +508,18 @@ public final class DaoCancerStudy {
             // check whether should delete generic assay meta profile by profile
             DaoGenericAssay.checkAndDeleteGenericAssayMetaInStudy(internalCancerStudyId);
             
-            con = JdbcUtil.getDbConnection(DaoCancerStudy.class);
-            List<Integer> geneticProfileIds = collectIds(con,
-                "SELECT genetic_profile_id FROM genetic_profile WHERE cancer_study_id=?", internalCancerStudyId);
-            List<Integer> patientIds = collectIds(con,
-                "SELECT internal_id FROM patient WHERE cancer_study_id=?", internalCancerStudyId);
-            List<Integer> sampleIds = collectIds(con,
-                "SELECT internal_id FROM sample WHERE patient_id IN (SELECT internal_id FROM patient WHERE cancer_study_id=?)",
-                internalCancerStudyId);
-            List<Integer> sampleListIds = collectIds(con,
-                "SELECT list_id FROM sample_list WHERE cancer_study_id=?", internalCancerStudyId);
-            List<Integer> clinicalEventIds = collectIds(con,
-                "SELECT clinical_event_id FROM clinical_event WHERE patient_id IN (SELECT internal_id FROM patient WHERE cancer_study_id=?)",
-                internalCancerStudyId);
-            List<Integer> gisticIds = collectIds(con,
-                "SELECT gistic_roi_id FROM gistic WHERE cancer_study_id=?", internalCancerStudyId);
+            String geneticProfileIdQuery = "SELECT genetic_profile_id FROM genetic_profile WHERE cancer_study_id=?";
+            List<Long> geneticProfileIds = collectIds(geneticProfileIdQuery, internalCancerStudyId);
+            String patientIdQuery = "SELECT internal_id FROM patient WHERE cancer_study_id=?";
+            List<Long> patientIds = collectIds(patientIdQuery, internalCancerStudyId);
+            String sampleIdQuery = "SELECT internal_id FROM sample WHERE patient_id IN (SELECT internal_id FROM patient WHERE cancer_study_id=?)";
+            List<Long> sampleIds = collectIds(sampleIdQuery, internalCancerStudyId);
+            String sampleListIdQuery = "SELECT list_id FROM sample_list WHERE cancer_study_id=?";
+            List<Long> sampleListIds = collectIds(sampleListIdQuery, internalCancerStudyId);
+            String clinicalEventIdQuery = "SELECT clinical_event_id FROM clinical_event WHERE patient_id IN (SELECT internal_id FROM patient WHERE cancer_study_id=?)";
+            List<Long> clinicalEventIds = collectIds(clinicalEventIdQuery, internalCancerStudyId);
+            String gisticIdQuery = "SELECT gistic_roi_id FROM gistic WHERE cancer_study_id=?";
+            List<Long> gisticIds = collectIds(gisticIdQuery, internalCancerStudyId);
 
             ClickHouseBulkDeleter.getBulkDeleter("sample_cna_event", "genetic_profile_id").addIds(geneticProfileIds);
             ClickHouseBulkDeleter.getBulkDeleter("genetic_alteration", "genetic_profile_id").addIds(geneticProfileIds);
@@ -550,26 +547,24 @@ public final class DaoCancerStudy {
 
             ClickHouseBulkDeleter.flushAll();
 
-            deleteByStudyId(con, "DELETE FROM clinical_attribute_meta WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId(con, "DELETE FROM resource_definition WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId(con, "DELETE FROM resource_study WHERE internal_id=?", internalCancerStudyId);
-            deleteByStudyId(con, "DELETE FROM cancer_study_tags WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId(con, "DELETE FROM copy_number_seg WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId(con, "DELETE FROM copy_number_seg_file WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId(con, "DELETE FROM patient WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId(con, "DELETE FROM sample_list WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId(con, "DELETE FROM genetic_profile WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId(con, "DELETE FROM gistic WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId(con, "DELETE FROM mut_sig WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId(con, "DELETE FROM cancer_study WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM clinical_attribute_meta WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM resource_definition WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM resource_study WHERE internal_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM cancer_study_tags WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM copy_number_seg WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM copy_number_seg_file WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM patient WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM sample_list WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM genetic_profile WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM gistic WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM mut_sig WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM cancer_study WHERE cancer_study_id=?", internalCancerStudyId);
 
             removeCancerStudyFromCache(internalCancerStudyId);
         } catch (DaoException e) {
             throw e;
         } catch (SQLException e) {
             throw new DaoException(e);
-        } finally {
-            JdbcUtil.closeAll(DaoCancerStudy.class, con, pstmt, rs);
         }
         purgeUnreferencedRecordsAfterDeletionOfStudy();
         reCacheAll();
@@ -602,27 +597,35 @@ public final class DaoCancerStudy {
         }
     }
 
-    private static List<Integer> collectIds(Connection con, String sql, int cancerStudyId) throws SQLException {
-        PreparedStatement pstmt = null;
-        ResultSet rs = null;
-        List<Integer> ids = new ArrayList<>();
+    private static List<Long> collectIds(String sql, int cancerStudyId) throws SQLException {
+        List<Long> ids = new ArrayList<>();
+        Connection con = null;
         try {
-            pstmt = con.prepareStatement(sql);
-            pstmt.setInt(1, cancerStudyId);
-            rs = pstmt.executeQuery();
-            while (rs.next()) {
-                ids.add(rs.getInt(1));
+            con = JdbcUtil.getDbConnection(DaoCancerStudy.class);
+            try (PreparedStatement pstmt = con.prepareStatement(sql)) {
+                pstmt.setInt(1, cancerStudyId);
+                try (ResultSet rs = pstmt.executeQuery()) {
+                    while (rs.next()) {
+                        ids.add(rs.getLong(1));
+                    }
+                }
             }
         } finally {
-            JdbcUtil.closeAll(DaoCancerStudy.class, null, pstmt, rs);
+            JdbcUtil.closeAll(DaoCancerStudy.class, con, null, null);
         }
         return ids;
     }
 
-    private static void deleteByStudyId(Connection con, String sql, int cancerStudyId) throws SQLException {
-        try (PreparedStatement pstmt = con.prepareStatement(sql)) {
-            pstmt.setInt(1, cancerStudyId);
-            pstmt.executeUpdate();
+    private static void deleteByStudyId(String sql, int cancerStudyId) throws SQLException {
+        Connection con = null;
+        try {
+            con = JdbcUtil.getDbConnection(DaoCancerStudy.class);
+            try (PreparedStatement pstmt = con.prepareStatement(sql)) {
+                pstmt.setInt(1, cancerStudyId);
+                pstmt.executeUpdate();
+            }
+        } finally {
+            JdbcUtil.closeAll(DaoCancerStudy.class, con, null, null);
         }
     }
 

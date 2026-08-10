@@ -253,7 +253,7 @@ public class DaoPatient {
         Connection con = null;
         try {
             con = JdbcUtil.getDbConnection(DaoPatient.class);
-            List<Integer> clinicalEventIds = collectIds(con,
+            List<Long> clinicalEventIds = collectIds(con,
                     "SELECT clinical_event_id FROM clinical_event WHERE patient_id IN ", internalPatientIds);
             ClickHouseBulkDeleter.getBulkDeleter("clinical_event_data", "clinical_event_id").addIds(clinicalEventIds);
             ClickHouseBulkDeleter.getBulkDeleter("clinical_event", "clinical_event_id").addIds(clinicalEventIds);
@@ -287,16 +287,16 @@ public class DaoPatient {
         return internalPatientIds;
     }
 
-    private static List<Integer> collectIds(Connection con, String sqlPrefix, Collection<Integer> ids) throws DaoException, SQLException {
+    private static List<Long> collectIds(Connection con, String sqlPrefix, Collection<Integer> ids) throws DaoException, SQLException {
         if (ids == null || ids.isEmpty()) {
             return Collections.emptyList();
         }
         return ClickHouseBulkUploader.upload(ids, stagingTable -> {
-            List<Integer> collected = new ArrayList<>();
+            List<Long> collected = new ArrayList<>();
             try (PreparedStatement pstmt = con.prepareStatement(sqlPrefix + "(SELECT id FROM " + stagingTable + ")");
                  ResultSet rs = pstmt.executeQuery()) {
                 while (rs.next()) {
-                    collected.add(rs.getInt(1));
+                    collected.add(rs.getLong(1));
                 }
             }
             return collected;
