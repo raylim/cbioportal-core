@@ -1,15 +1,15 @@
 /*
- * Copyright (c) 2015 - 2018 Memorial Sloan-Kettering Cancer Center.
+ * Copyright (c) 2015 - 2026 Memorial Sloan Kettering Cancer Center.
  *
  * This library is distributed in the hope that it will be useful, but WITHOUT
  * ANY WARRANTY, WITHOUT EVEN THE IMPLIED WARRANTY OF MERCHANTABILITY OR FITNESS
  * FOR A PARTICULAR PURPOSE. The software and documentation provided hereunder
- * is on an "as is" basis, and Memorial Sloan-Kettering Cancer Center has no
+ * is on an "as is" basis, and Memorial Sloan Kettering Cancer Center has no
  * obligations to provide maintenance, support, updates, enhancements or
- * modifications. In no event shall Memorial Sloan-Kettering Cancer Center be
+ * modifications. In no event shall Memorial Sloan Kettering Cancer Center be
  * liable to any party for direct, indirect, special, incidental or
  * consequential damages, including lost profits, arising out of the use of this
- * software and its documentation, even if Memorial Sloan-Kettering Cancer
+ * software and its documentation, even if Memorial Sloan Kettering Cancer
  * Center has been advised of the possibility of such damage.
  */
 
@@ -32,9 +32,13 @@
 
 package org.mskcc.cbio.portal.util;
 
-import java.io.*;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.InputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.Properties;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
@@ -44,20 +48,16 @@ import org.slf4j.LoggerFactory;
  * Utility class for getting / setting global properties.
  */
 public class GlobalProperties {
-
     public static final String HOME_DIR = "PORTAL_HOME";
     private static final String PORTAL_PROPERTIES_FILE_NAME = "application.properties";
     private static final String POM_RESOURCE_PATH = "META-INF/maven/org.mskcc.cbio/core/pom.xml";
     private static final String DEFAULT_DB_VERSION = "0";
-    private static final Pattern DB_VERSION_PATTERN =
-        Pattern.compile("<db\\.version>\\s*([^<]+)\\s*</db\\.version>");
-
+    private static final Pattern DB_VERSION_PATTERN = Pattern.compile("<db\\.version>\\s*([^<]+)\\s*</db\\.version>");
     public static final String DB_VERSION = "db.version";
     public static final String SPECIES = "species";
     public static final String DEFAULT_SPECIES = "human";
     public static final String UCSC_BUILD = "ucsc.build";
     public static final String DEFAULT_UCSC_BUILD = "hg19";
-
     private static Logger LOG = LoggerFactory.getLogger(GlobalProperties.class);
     private static ConfigPropertyResolver portalProperties = new ConfigPropertyResolver();
     private static volatile String cachedDbVersion;
@@ -102,21 +102,17 @@ public class GlobalProperties {
         }
     }
 
-    private static Properties initializeProperties(String propertiesFileName)
-    {
+    private static Properties initializeProperties(String propertiesFileName) {
         return loadProperties(getResourceStream(propertiesFileName));
     }
 
-    private static InputStream getResourceStream(String propertiesFileName)
-    {
+    private static InputStream getResourceStream(String propertiesFileName) {
         String resourceFilename = null;
         InputStream resourceFIS = null;
-
         try {
             String home = System.getenv(HOME_DIR);
             if (home != null) {
-                 resourceFilename =
-                    home + File.separator + propertiesFileName;
+                 resourceFilename = home + File.separator + propertiesFileName;
                 if (LOG.isInfoEnabled()) {
                     LOG.info("Attempting to read properties file: " + resourceFilename);
                 }
@@ -125,101 +121,83 @@ public class GlobalProperties {
                     LOG.info("Successfully read properties file");
                 }
             }
-        }
-        catch (FileNotFoundException e) {
+        } catch (FileNotFoundException e) {
             if (LOG.isInfoEnabled()) {
                 LOG.info("Failed to read properties file: " + resourceFilename);
             }
         }
-
         if (resourceFIS == null) {
             if (LOG.isInfoEnabled()) {
                 LOG.info("Attempting to read properties file from classpath");
             }
-            resourceFIS = GlobalProperties.class.getClassLoader().
-                getResourceAsStream(propertiesFileName);
+            resourceFIS = GlobalProperties.class.getClassLoader().getResourceAsStream(propertiesFileName);
             if (LOG.isInfoEnabled()) {
                 LOG.info("Successfully read properties file");
             }
         }
-         
         return resourceFIS;
     }
 
-    private static Properties loadProperties(InputStream resourceInputStream)
-    {
+    private static Properties loadProperties(InputStream resourceInputStream) {
         Properties properties = new Properties();
-
         try {
             properties.load(resourceInputStream);
             resourceInputStream.close();
-        }
-        catch (IOException e) {
+        } catch (IOException e) {
             if (LOG.isErrorEnabled()) {
                 LOG.error("Error loading properties file: " + e.getMessage());
             }
         }
-
         return properties;
     }
 
-    private static InputStream getPomResourceStream()
-    {
-        InputStream pomStream =
-            GlobalProperties.class.getClassLoader().getResourceAsStream(POM_RESOURCE_PATH);
+    private static InputStream getPomResourceStream() {
+        InputStream pomStream = GlobalProperties.class.getClassLoader().getResourceAsStream(POM_RESOURCE_PATH);
         if (pomStream != null) {
             return pomStream;
         }
-
         return null;
     }
 
-    private static String readDbVersionFromPom()
-    {
+    private static String readDbVersionFromPom() {
         try (InputStream pomStream = getPomResourceStream()) {
             if (pomStream == null) {
                 if (LOG.isWarnEnabled()) {
                     LOG.warn("Unable to locate pom.xml for db.version lookup. " +
-                        "Checked classpath resource " + POM_RESOURCE_PATH);
+                            "Checked classpath resource " + POM_RESOURCE_PATH);
                 }
                 return null;
             }
-
             String pomContents = new String(pomStream.readAllBytes(), StandardCharsets.UTF_8);
             Matcher matcher = DB_VERSION_PATTERN.matcher(pomContents);
             if (matcher.find()) {
                 return matcher.group(1).trim();
             }
-
             if (LOG.isWarnEnabled()) {
                 LOG.warn("db.version was not found in pom.xml.");
             }
-        }
-        catch (IOException e) {
+        } catch (IOException e) {
             if (LOG.isErrorEnabled()) {
                 LOG.error("Error reading pom.xml for db.version: " + e.getMessage());
             }
         }
-
         return null;
     }
 
-	public static String getProperty(String property)
-	{
-		return (portalProperties.containsKey(property)) ? portalProperties.getProperty(property) : null;
-	}
+    public static String getProperty(String property) {
+        return (portalProperties.containsKey(property)) ? portalProperties.getProperty(property) : null;
+    }
 
-    public static String getSpecies(){
-    	String species = portalProperties.getProperty(SPECIES);
-    	return species == null ? DEFAULT_SPECIES : species;
-    	}
+    public static String getSpecies() {
+        String species = portalProperties.getProperty(SPECIES);
+        return species == null ? DEFAULT_SPECIES : species;
+    }
 
     public static String getDbVersion() {
         String override = System.getProperty(DB_VERSION);
         if (override != null) {
             return override;
         }
-
         if (cachedDbVersion == null) {
             synchronized (GlobalProperties.class) {
                 if (cachedDbVersion == null) {
@@ -228,12 +206,27 @@ public class GlobalProperties {
                 }
             }
         }
-
         return cachedDbVersion;
     }
 
     public static String getReferenceGenomeName() {
         return portalProperties.getProperty(UCSC_BUILD, DEFAULT_UCSC_BUILD);
+    }
+
+    public static Integer parseIntegerProperty(String key, Integer defaultValue) {
+        String valueString = getProperty(key);
+        if (valueString == null) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(valueString);
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
+
+    public static Integer parseIntegerProperty(String key) {
+        return parseIntegerProperty(key, null);
     }
 
 }
