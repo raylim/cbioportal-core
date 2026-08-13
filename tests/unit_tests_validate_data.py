@@ -3236,5 +3236,13 @@ class CNADiscretePDAAnnotationsValidatorTestCase(PostClinicalDataFileTestCase):
         self.assertEqual('Validation complete', record_list[-1].getMessage())
 
 
+class WsiValidatorTestCase(PostClinicalDataFileTestCase):
+
+    def test_valid_unmatched_slide(self):
+        self.logger.setLevel(logging.ERROR)
+        record_list = self.validate('data_wsi_valid.txt', validateData.WsiValidator)
+        self.assertEqual([], [record for record in record_list if record.levelno >= logging.ERROR])
+
+
 if __name__ == '__main__':
     unittest.main(buffer=True)
