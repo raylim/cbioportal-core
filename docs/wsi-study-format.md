@@ -5,6 +5,25 @@ studies. The Databricks/export pipeline produces a normal study directory with
 `meta_wsi.txt` and `data_wsi.txt`; the tile server only serves the source and
 thumbnail artifacts returned by cBioPortal.
 
+## Upstream artifact publication
+
+Before the study files are exported, a separate scheduled thumbnail process
+must read eligible slide inventory/source rows, generate master thumbnails,
+write them to the S3/Dell ECS-compatible object store, and populate
+`cdsi_prod.pathology_data_mining.slide_thumbnail_registry`. Each successful
+registry row carries `artifact_uri`, `tile_metadata_json`, `width`, `height`,
+and `content_type`. The Databricks canonical-association query joins the latest
+successful registry row, computes `can_serve_tiles`, and exports the artifact
+fields below into `data_wsi.txt`.
+
+The scheduled thumbnail process is outside cBioPortal core and outside the
+frontend. The frontend is a read-only consumer. The tile-server
+`app/thumbnail_worker.py` on-demand CLI may write an object-store JPEG for
+development or controlled remediation, but it does not update the registry and
+must not be used as the production publication mechanism. A canonical refresh
+must wait for the thumbnail batch completion watermark, and successful legacy
+rows missing `tile_metadata_json` must be regenerated before export.
+
 ## Metadata
 
 ```text
@@ -35,6 +54,10 @@ row's patient. `TILE_METADATA_JSON` must be a JSON object when present. URLs
 must be absolute. When `CAN_SERVE_TILES=TRUE`, source URL, tile metadata,
 thumbnail URL, positive dimensions, and thumbnail content type are mandatory.
 Non-servable rows have those artifact columns stored as null.
+
+The importer assumes these values were already materialized by the upstream
+Databricks/export pipeline. It does not discover source slides, generate
+thumbnails, read `slide_thumbnail_registry`, or write the object store.
 
 ## Import commands
 
