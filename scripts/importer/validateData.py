@@ -4370,6 +4370,53 @@ class MultipleDataFileValidator(FeaturewiseFileValidator, metaclass=ABCMeta):
 
         return num_errors
 
+    def parseFeatureColumns(self, nonsample_col_vals):
+
+        """Check the feature id column."""
+
+        feature_id = nonsample_col_vals[0].strip()
+
+        # Check if genetic entity is present
+        if feature_id == '':
+            # Validator already gives warning for this in checkLine method
+            pass
+        elif re.search(INVALID_ID_CHARACTERS, feature_id) is not None:
+            self.logger.error('Feature id contains one or more illegal characters',
+                                extra={'line_number': self.line_number,
+                                        'cause': 'id was`'+feature_id+'` and only alpha-numeric, _, . and - are allowed.'})
+        else:
+            # Check if this is the second data file
+            if self.get_prior_validated_feature_ids() is not None:
+                # Check if genetic entity is in the first data file
+                if feature_id not in self.get_prior_validated_feature_ids():
+                    self.logger.error('Feature id cannot be found in other data file',
+                                      extra={'line_number': self.line_number,
+                                             'cause': feature_id})
+            # Add genetic entity to list of entities of current data file
+            self.feature_ids.append(feature_id)
+        return feature_id
+
+    def onComplete(self):
+
+        def checkConsistencyFeatures(self):
+            """This function validates whether the features in the data files are the same"""
+
+            # If the prior_validated_features_ids is not filled yet, fill it with the first file.
+            if self.get_prior_validated_feature_ids() is None:
+                ids = self.feature_ids
+                self.set_prior_validated_feature_ids(ids)
+            else:
+                # Check if feature ids are the same
+                if not self.get_prior_validated_feature_ids() == self.feature_ids:
+                    self.logger.error( self.get_message_features_do_not_match() )
+
+        checkConsistencyFeatures(self)
+
+        super(MultipleDataFileValidator, self).onComplete()
+
+    def checkId(self):
+        return self.checkIdInSamples()
+
 
 class WsiValidator(Validator):
     """Validate the canonical whole-slide-image study file."""
@@ -4389,6 +4436,39 @@ class WsiValidator(Validator):
         'PATIENT_ID', 'IMAGE_ID', 'PART_KEY', 'BLOCK_KEY', 'MATCH_LEVEL',
         'SPECIMEN_KEY', 'IS_HNE', 'IS_IHC', 'CAN_SERVE_TILES',
     }
+
+    @staticmethod
+    def _is_valid_tile_metadata(metadata):
+        """Return whether metadata contains the browser tile contract."""
+        if not isinstance(metadata, dict):
+            return False
+
+        dimensions = metadata.get('dimensions')
+        if not isinstance(dimensions, dict):
+            return False
+        if not all(type(dimensions.get(name)) is int and dimensions[name] > 0
+                   for name in ('width', 'height')):
+            return False
+
+        levels = metadata.get('levels')
+        level_dimensions = metadata.get('level_dimensions')
+        if type(levels) is not int or levels <= 0:
+            return False
+        if not isinstance(level_dimensions, list) or len(level_dimensions) != levels:
+            return False
+        for level in level_dimensions:
+            if not isinstance(level, dict):
+                return False
+            if not all(type(level.get(name)) is int and level[name] > 0
+                       for name in ('width', 'height')):
+                return False
+
+        max_zoom = metadata.get('max_zoom')
+        tile_size = metadata.get('tile_size')
+        return (
+            type(max_zoom) is int and max_zoom >= 0
+            and type(tile_size) is int and tile_size > 0
+        )
 
     def _error(self, message, line_number, column=None, cause=None):
         extra = {'line_number': line_number}
@@ -4526,10 +4606,13 @@ class WsiValidator(Validator):
                 if row[name] and not self._is_absolute_url(row[name]):
                     self._error('WSI URL must be absolute', line_number,
                                 self.EXPECTED_HEADERS.index(name), row[name])
+            metadata_valid = False
             if row['TILE_METADATA_JSON']:
                 try:
-                    if not isinstance(json.loads(row['TILE_METADATA_JSON']), dict):
+                    metadata = json.loads(row['TILE_METADATA_JSON'])
+                    if not isinstance(metadata, dict):
                         raise ValueError
+                    metadata_valid = self._is_valid_tile_metadata(metadata)
                 except (ValueError, json.JSONDecodeError):
                     self._error('TILE_METADATA_JSON must be a JSON object', line_number,
                                 self.EXPECTED_HEADERS.index('TILE_METADATA_JSON'))
@@ -4541,66 +4624,22 @@ class WsiValidator(Validator):
                     if not row[name]:
                         self._error('Servable WSI rows require complete pixel artifacts', line_number,
                                     self.EXPECTED_HEADERS.index(name), name)
+                if not metadata_valid:
+                    self._error('Servable WSI rows require valid tile metadata', line_number,
+                                self.EXPECTED_HEADERS.index('TILE_METADATA_JSON'))
                 for name in ('THUMBNAIL_WIDTH', 'THUMBNAIL_HEIGHT'):
                     if row[name]:
                         try:
-                            if int(row[name]) <= 0:
+                            if not (1 <= int(row[name]) <= 8192):
                                 raise ValueError
                         except ValueError:
-                            self._error('Servable WSI thumbnail dimensions must be positive', line_number,
+                            self._error('Servable WSI thumbnail dimensions must be between 1 and 8192', line_number,
                                         self.EXPECTED_HEADERS.index(name), row[name])
 
         if rows == 0:
             self.logger.error('WSI data file contains no slide rows')
         self.fileCouldBeParsed = True
         self.logger.info('Validation of WSI file complete')
-
-    def parseFeatureColumns(self, nonsample_col_vals):
-
-        """Check the feature id column."""
-
-        feature_id = nonsample_col_vals[0].strip()
-
-        # Check if genetic entity is present
-        if feature_id == '':
-            # Validator already gives warning for this in checkLine method
-            pass
-        elif re.search(INVALID_ID_CHARACTERS, feature_id) is not None:
-            self.logger.error('Feature id contains one or more illegal characters',
-                                extra={'line_number': self.line_number,
-                                        'cause': 'id was`'+feature_id+'` and only alpha-numeric, _, . and - are allowed.'})
-        else:
-            # Check if this is the second data file
-            if self.get_prior_validated_feature_ids() is not None:
-                # Check if genetic entity is in the first data file
-                if feature_id not in self.get_prior_validated_feature_ids():
-                    self.logger.error('Feature id cannot be found in other data file',
-                                      extra={'line_number': self.line_number,
-                                             'cause': feature_id})
-            # Add genetic entity to list of entities of current data file
-            self.feature_ids.append(feature_id)
-        return feature_id
-
-    def onComplete(self):
-
-        def checkConsistencyFeatures(self):
-            """This function validates whether the features in the data files are the same"""
-
-            # If the prior_validated_features_ids is not filled yet, fill it with the first file.
-            if self.get_prior_validated_feature_ids() is None:
-                ids = self.feature_ids
-                self.set_prior_validated_feature_ids(ids)
-            else:
-                # Check if feature ids are the same
-                if not self.get_prior_validated_feature_ids() == self.feature_ids:
-                    self.logger.error( self.get_message_features_do_not_match() )
-
-        checkConsistencyFeatures(self)
-
-        super(MultipleDataFileValidator, self).onComplete()
-
-    def checkId(self):
-        return self.checkIdInSamples()
 
 class GsvaWiseFileValidator(MultipleDataFileValidator, metaclass=ABCMeta):
     """Groups multiple gene set data files from a study to ensure consistency.

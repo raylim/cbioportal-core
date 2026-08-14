@@ -3243,6 +3243,23 @@ class WsiValidatorTestCase(PostClinicalDataFileTestCase):
         record_list = self.validate('data_wsi_valid.txt', validateData.WsiValidator)
         self.assertEqual([], [record for record in record_list if record.levelno >= logging.ERROR])
 
+    def test_tile_metadata_requires_browser_contract(self):
+        self.assertFalse(validateData.WsiValidator._is_valid_tile_metadata({}))
+        self.assertFalse(validateData.WsiValidator._is_valid_tile_metadata({
+            'dimensions': {'width': 256, 'height': 256},
+            'levels': 1,
+            'level_dimensions': [],
+            'max_zoom': 0,
+            'tile_size': 256,
+        }))
+        self.assertTrue(validateData.WsiValidator._is_valid_tile_metadata({
+            'dimensions': {'width': 256, 'height': 256},
+            'levels': 1,
+            'level_dimensions': [{'width': 256, 'height': 256}],
+            'max_zoom': 0,
+            'tile_size': 256,
+        }))
+
 
 if __name__ == '__main__':
     unittest.main(buffer=True)

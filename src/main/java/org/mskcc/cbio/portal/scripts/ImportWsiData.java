@@ -154,6 +154,40 @@ public class ImportWsiData extends ConsoleRunnable {
         }
     }
 
+    private static boolean positiveInteger(JsonNode node) {
+        return node != null && node.isIntegralNumber() && node.asLong() > 0;
+    }
+
+    private static boolean validTileMetadata(JsonNode node) {
+        if (node == null || !node.isObject()) {
+            return false;
+        }
+        JsonNode dimensions = node.get("dimensions");
+        if (dimensions == null
+            || !positiveInteger(dimensions.get("width"))
+            || !positiveInteger(dimensions.get("height"))) {
+            return false;
+        }
+        JsonNode levels = node.get("levels");
+        JsonNode levelDimensions = node.get("level_dimensions");
+        if (levels == null || !levels.isIntegralNumber() || levels.asLong() <= 0
+            || levelDimensions == null || !levelDimensions.isArray()
+            || levels.asLong() != levelDimensions.size()) {
+            return false;
+        }
+        for (JsonNode level : levelDimensions) {
+            if (level == null || !level.isObject()
+                || !positiveInteger(level.get("width"))
+                || !positiveInteger(level.get("height"))) {
+                return false;
+            }
+        }
+        JsonNode maxZoom = node.get("max_zoom");
+        JsonNode tileSize = node.get("tile_size");
+        return maxZoom != null && maxZoom.isIntegralNumber() && maxZoom.asLong() >= 0
+            && positiveInteger(tileSize);
+    }
+
     private static void requireJsonObject(String value, int line) {
         if (value == null || value.isBlank()) {
             return;
@@ -165,6 +199,17 @@ public class ImportWsiData extends ConsoleRunnable {
             }
         } catch (IOException | IllegalArgumentException exception) {
             throw new IllegalArgumentException("Line " + line + ": TILE_METADATA_JSON must be a JSON object");
+        }
+    }
+
+    private static void requireValidTileMetadata(String value, int line) {
+        try {
+            if (!validTileMetadata(JSON.readTree(value))) {
+                throw new IllegalArgumentException();
+            }
+        } catch (IOException | IllegalArgumentException exception) {
+            throw new IllegalArgumentException("Line " + line
+                + ": TILE_METADATA_JSON must contain a valid tile contract");
         }
     }
 
@@ -375,10 +420,13 @@ public class ImportWsiData extends ConsoleRunnable {
             if (canServe) {
                 require(sourceUrl, "SOURCE_URL", line);
                 require(tileMetadata, "TILE_METADATA_JSON", line);
+                requireValidTileMetadata(tileMetadata, line);
                 require(thumbnailUrl, "THUMBNAIL_URL", line);
                 require(value(fields, 32), "THUMBNAIL_CONTENT_TYPE", line);
-                if (thumbnailWidth == null || thumbnailWidth <= 0 || thumbnailHeight == null || thumbnailHeight <= 0) {
-                    throw new IllegalArgumentException("Line " + line + ": servable thumbnails require positive dimensions");
+                if (thumbnailWidth == null || thumbnailWidth < 1 || thumbnailWidth > 8192
+                    || thumbnailHeight == null || thumbnailHeight < 1 || thumbnailHeight > 8192) {
+                    throw new IllegalArgumentException(
+                        "Line " + line + ": servable thumbnail dimensions must be between 1 and 8192");
                 }
             } else {
                 sourceUrl = null;
