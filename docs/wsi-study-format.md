@@ -101,5 +101,12 @@ The six tables are provisioned by the cBioPortal backend schema. Core does not
 create or migrate production tables. Study deletion removes the release
 manifest and all child rows.
 
+The backend schema also provisions the additive `wsi_slide_by_access`
+ClickHouse projection. It is ordered by `(cancer_study_id, release_id,
+image_id)` for the authenticated slide-access lookup, which does not have a
+patient ID. A production rebuild must materialize the projection before the
+new database is promoted; the importer itself does not perform live schema
+changes.
+
 The former tile-server ClickHouse loader is not supported; all WSI loads must
 use the standard cBioPortal importer.
