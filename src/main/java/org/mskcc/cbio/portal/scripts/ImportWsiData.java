@@ -10,80 +10,114 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import joptsimple.OptionSet;
 import org.mskcc.cbio.portal.dao.ClickHouseBulkLoader;
+import org.mskcc.cbio.portal.dao.DaoClinicalAttributeMeta;
 import org.mskcc.cbio.portal.dao.DaoException;
 import org.mskcc.cbio.portal.dao.JdbcUtil;
+import org.mskcc.cbio.portal.model.ClinicalAttribute;
 import org.mskcc.cbio.portal.util.ConsoleUtil;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Timestamp;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
-import java.util.UUID;
+import java.util.regex.Pattern;
 
 /**
  * Imports the canonical PATHOLOGY_SLIDES/WSI study files into ClickHouse.
  *
  * The complete input is parsed and resolved before any rows are written. Child
- * rows are then bulk-loaded and the release manifest is inserted last; the
- * manifest is therefore the visibility boundary for a replacement snapshot.
+ * rows are then bulk-loaded into the inactive blue/green database. WSI imports
+ * are intentionally insert-only and must start from a fresh database build.
  */
 public class ImportWsiData extends ConsoleRunnable {
 
-    private static final int COLUMN_COUNT = 33;
+    private static final int COLUMN_COUNT = 31;
     private static final String[] COLUMNS = {
         "PATIENT_ID", "REFERENCE_SAMPLE_ID", "SAMPLE_ID", "IMAGE_ID",
         "PART_KEY", "PART_NUMBER", "PART_DESIGNATOR", "PART_TYPE",
         "PART_DESCRIPTION", "SUBSPECIALTY", "PATH_DX_TITLE", "BLOCK_KEY",
         "BLOCK_NUMBER", "BLOCK_LABEL", "MATCH_LEVEL", "SPECIMEN_KEY",
         "STAIN_NAME", "STAIN_GROUP", "IS_HNE", "IS_IHC", "MAGNIFICATION",
-        "FILE_SIZE_BYTES", "BARCODE", "SLIDE_TYPE", "PROCEDURE_DATE_DAYS",
-        "TIMEPOINT_SOURCE", "CAN_SERVE_TILES", "SOURCE_URL",
+        "FILE_SIZE_BYTES", "BARCODE", "SLIDE_TYPE", "CAN_SERVE_TILES", "SOURCE_URL",
         "TILE_METADATA_JSON", "THUMBNAIL_URL", "THUMBNAIL_WIDTH",
         "THUMBNAIL_HEIGHT", "THUMBNAIL_CONTENT_TYPE"
     };
 
-    private static final String[] RELEASE_PATIENT_FIELDS = {
-        "cancer_study_id", "release_id", "patient_id", "reference_sample_id"
+    private static final String[] PATIENT_FIELDS = {
+        "cancer_study_id", "patient_id", "reference_sample_id"
     };
     private static final String[] PART_FIELDS = {
-        "cancer_study_id", "release_id", "patient_id", "part_key",
+        "cancer_study_id", "patient_id", "part_key",
         "part_number", "part_designator", "part_type", "part_description",
         "subspecialty", "path_dx_title"
     };
     private static final String[] BLOCK_FIELDS = {
-        "cancer_study_id", "release_id", "patient_id", "part_key", "block_key",
+        "cancer_study_id", "patient_id", "part_key", "block_key",
         "block_number", "block_label"
     };
     private static final String[] SLIDE_FIELDS = {
-        "cancer_study_id", "release_id", "patient_id", "image_id", "stain_name",
+        "cancer_study_id", "patient_id", "image_id", "stain_name",
         "stain_group", "is_hne", "is_ihc", "magnification", "file_size_bytes",
         "can_serve_tiles", "barcode", "slide_type", "source_url",
         "tile_metadata_json", "thumbnail_url", "thumbnail_width",
         "thumbnail_height", "thumbnail_content_type"
     };
     private static final String[] PLACEMENT_FIELDS = {
-        "cancer_study_id", "release_id", "patient_id", "image_id", "part_key",
-        "block_key", "sample_id", "match_level", "specimen_key",
-        "procedure_date_days", "timepoint_source"
+        "cancer_study_id", "patient_id", "image_id", "part_key",
+        "block_key", "sample_id", "match_level", "specimen_key"
     };
+    private static final String[] CLINICAL_SAMPLE_FIELDS = {
+        "internal_id", "attr_id", "attr_value"
+    };
+    private static final String[] CLINICAL_PATIENT_FIELDS = {
+        "internal_id", "attr_id", "attr_value"
+    };
+    private static final String WSI_SAMPLE_SLIDE_COUNT = "WSI_SAMPLE_SLIDE_COUNT";
+    private static final String WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT =
+        "WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT";
+    private static final String WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT =
+        "WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT";
+    private static final String WSI_PATIENT_SLIDE_COUNT = "WSI_PATIENT_SLIDE_COUNT";
+    private static final String WSI_PATIENT_PART_MATCHED_SLIDE_COUNT =
+        "WSI_PATIENT_PART_MATCHED_SLIDE_COUNT";
+    private static final String WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT =
+        "WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT";
 
     private static final ObjectMapper JSON = new ObjectMapper();
+    private static final Pattern ABSOLUTE_DATE = Pattern.compile(
+        "(?<!\\d)(?:19|20)\\d{2}[-_/](?:0?[1-9]|1[0-2])[-_/](?:0?[1-9]|[12]\\d|3[01])(?!\\d)");
+    private static final Pattern COMPACT_DATE = Pattern.compile(
+        "(?<!\\d)(?:19|20)\\d{6}(?!\\d)");
+    private static final Pattern LABELLED_MRN = Pattern.compile(
+        "(?i)\\b(?:mrn|medical[ _-]?record(?:[ _-]?number)?)\\b\\s*[:=#-]?\\s*\\d{4,}");
+    private static final Set<String> SOURCE_EXTENSIONS = Set.of("svs", "tif", "tiff", "ndpi", "mrxs", "scn");
+    private static final Set<String> THUMBNAIL_EXTENSIONS = Set.of("jpg", "jpeg", "png");
+    private static final Set<String> ALLOWED_METADATA_KEYS = Set.of(
+        "dimensions", "levels", "level_dimensions", "level_downsamples", "max_zoom",
+        "tile_size", "mpp", "objective_power", "vendor", "identity_version", "safe_min_level",
+        "tile_metadata_schema_version", "decode_policy_version", "max_decode_pixels",
+        "thumbnail_max_decode_pixels", "source_fingerprint");
+    private static final Set<Integer> NON_TEXT_WSI_COLUMNS = Set.of(18, 19, 21, 24, 26, 28, 29);
+    private static final Map<String, String> THUMBNAIL_CONTENT_TYPES = Map.of(
+        "jpg", "image/jpeg", "jpeg", "image/jpeg", "png", "image/png");
 
     private record SampleRef(long internalId, long patientId) {}
     private record StudyRefs(long studyId, Map<String, Long> patients,
@@ -162,6 +196,12 @@ public class ImportWsiData extends ConsoleRunnable {
         if (node == null || !node.isObject()) {
             return false;
         }
+        var fieldNames = node.fieldNames();
+        while (fieldNames.hasNext()) {
+            if (!ALLOWED_METADATA_KEYS.contains(fieldNames.next())) {
+                return false;
+            }
+        }
         JsonNode dimensions = node.get("dimensions");
         if (dimensions == null
             || !positiveInteger(dimensions.get("width"))
@@ -222,8 +262,8 @@ public class ImportWsiData extends ConsoleRunnable {
             || !"WSI".equals(properties.getProperty("datatype"))) {
             throw new IllegalArgumentException("WSI metadata must use PATHOLOGY_SLIDES / WSI");
         }
-        if (!"1".equals(properties.getProperty("format_version"))) {
-            throw new IllegalArgumentException("Unsupported WSI format_version; expected 1");
+        if (!"2".equals(properties.getProperty("format_version"))) {
+            throw new IllegalArgumentException("Unsupported WSI format_version; expected 2");
         }
         for (String field : List.of("cancer_study_identifier", "data_filename")) {
             require(properties.getProperty(field), field, 0);
@@ -316,13 +356,14 @@ public class ImportWsiData extends ConsoleRunnable {
         }
     }
 
-    private static ImportRows normalize(List<String[]> input, StudyRefs refs, String releaseId) {
+    private static ImportRows normalize(List<String[]> input, StudyRefs refs) {
         ImportRows output = new ImportRows();
         Set<String> imageIds = new HashSet<>();
         Map<String, Long> patientReferences = new HashMap<>();
         for (int rowIndex = 0; rowIndex < input.size(); rowIndex++) {
             int line = rowIndex + 6;
             String[] fields = input.get(rowIndex);
+            validateDeidRow(fields, line);
             String patientStableId = value(fields, 0);
             String patientKey = patientStableId;
             long patientId = refs.patients.getOrDefault(patientStableId, -1L);
@@ -374,12 +415,12 @@ public class ImportWsiData extends ConsoleRunnable {
             }
             patientReferences.put(patientKey, referenceSampleId);
             output.patients.putIfAbsent(patientKey, new String[] {
-                Long.toString(refs.studyId()), releaseId, Long.toString(patientId), nullableLong(referenceSampleId)
+                Long.toString(refs.studyId()), Long.toString(patientId), nullableLong(referenceSampleId)
             });
 
             String partMapKey = patientKey + "\u0000" + partKey;
             String[] part = new String[] {
-                Long.toString(refs.studyId()), releaseId, Long.toString(patientId), partKey,
+                Long.toString(refs.studyId()), Long.toString(patientId), partKey,
                 nullable(value(fields, 5)), nullable(value(fields, 6)), nullable(value(fields, 7)),
                 nullable(value(fields, 8)), nullable(value(fields, 9)), nullable(value(fields, 10))
             };
@@ -387,29 +428,24 @@ public class ImportWsiData extends ConsoleRunnable {
 
             String blockMapKey = partMapKey + "\u0000" + blockKey;
             String[] block = new String[] {
-                Long.toString(refs.studyId()), releaseId, Long.toString(patientId), partKey, blockKey,
+                Long.toString(refs.studyId()), Long.toString(patientId), partKey, blockKey,
                 nullable(value(fields, 12)), nullable(value(fields, 13))
             };
             putConsistent(output.blocks, blockMapKey, block, line, "block");
 
             boolean isHne = requiredBoolean(value(fields, 18), "IS_HNE", line);
             boolean isIhc = requiredBoolean(value(fields, 19), "IS_IHC", line);
-            boolean canServe = requiredBoolean(value(fields, 26), "CAN_SERVE_TILES", line);
+            boolean canServe = requiredBoolean(value(fields, 24), "CAN_SERVE_TILES", line);
             Long fileSize = optionalLong(value(fields, 21), "FILE_SIZE_BYTES", line);
             if (fileSize != null && fileSize < 0) {
                 throw new IllegalArgumentException("Line " + line + ": FILE_SIZE_BYTES cannot be negative");
             }
-            String sourceUrl = nullable(value(fields, 27));
-            String tileMetadata = nullable(value(fields, 28));
-            String thumbnailUrl = nullable(value(fields, 29));
-            String thumbnailContentType = nullable(value(fields, 32));
-            Long thumbnailWidth = optionalLong(value(fields, 30), "THUMBNAIL_WIDTH", line);
-            Long thumbnailHeight = optionalLong(value(fields, 31), "THUMBNAIL_HEIGHT", line);
-            Long procedureDateDays = optionalLong(value(fields, 24), "PROCEDURE_DATE_DAYS", line);
-            if (procedureDateDays != null
-                && (procedureDateDays < Integer.MIN_VALUE || procedureDateDays > Integer.MAX_VALUE)) {
-                throw new IllegalArgumentException("Line " + line + ": PROCEDURE_DATE_DAYS is out of range");
-            }
+            String sourceUrl = nullable(value(fields, 25));
+            String tileMetadata = nullable(value(fields, 26));
+            String thumbnailUrl = nullable(value(fields, 27));
+            String thumbnailContentType = nullable(value(fields, 30));
+            Long thumbnailWidth = optionalLong(value(fields, 28), "THUMBNAIL_WIDTH", line);
+            Long thumbnailHeight = optionalLong(value(fields, 29), "THUMBNAIL_HEIGHT", line);
             if ((thumbnailWidth != null && (thumbnailWidth < 0 || thumbnailWidth > 0xffffffffL))
                 || (thumbnailHeight != null && (thumbnailHeight < 0 || thumbnailHeight > 0xffffffffL))) {
                 throw new IllegalArgumentException("Line " + line + ": thumbnail dimension is out of range");
@@ -422,7 +458,7 @@ public class ImportWsiData extends ConsoleRunnable {
                 require(tileMetadata, "TILE_METADATA_JSON", line);
                 requireValidTileMetadata(tileMetadata, line);
                 require(thumbnailUrl, "THUMBNAIL_URL", line);
-                require(value(fields, 32), "THUMBNAIL_CONTENT_TYPE", line);
+                require(value(fields, 30), "THUMBNAIL_CONTENT_TYPE", line);
                 if (thumbnailWidth == null || thumbnailWidth < 1 || thumbnailWidth > 8192
                     || thumbnailHeight == null || thumbnailHeight < 1 || thumbnailHeight > 8192) {
                     throw new IllegalArgumentException(
@@ -437,7 +473,7 @@ public class ImportWsiData extends ConsoleRunnable {
                 thumbnailContentType = null;
             }
             String[] slide = new String[] {
-                Long.toString(refs.studyId()), releaseId, Long.toString(patientId), imageId,
+                Long.toString(refs.studyId()), Long.toString(patientId), imageId,
                 nullable(value(fields, 16)), nullable(value(fields, 17)), isHne ? "1" : "0",
                 isIhc ? "1" : "0", nullable(value(fields, 20)), nullableLong(fileSize),
                 canServe ? "1" : "0", nullable(value(fields, 22)), nullable(value(fields, 23)),
@@ -447,14 +483,170 @@ public class ImportWsiData extends ConsoleRunnable {
             output.slides.put(imageId, slide);
 
             String[] placement = new String[] {
-                Long.toString(refs.studyId()), releaseId, Long.toString(patientId), imageId, partKey,
+                Long.toString(refs.studyId()), Long.toString(patientId), imageId, partKey,
                 blockKey, sample == null ? null : Long.toString(sample.internalId()), matchLevel,
-                value(fields, 15), nullableLong(procedureDateDays),
-                nullable(value(fields, 25))
+                value(fields, 15)
             };
             output.placements.put(imageId, placement);
         }
         return output;
+    }
+
+    private static void validateDeidRow(String[] fields, int line) {
+        String imageId = value(fields, 3);
+        if (imageId.isBlank()) {
+            return;
+        }
+        for (int index = 0; index < fields.length; index++) {
+            if (index == 0 || index == 1 || index == 2 || index == 3
+                || NON_TEXT_WSI_COLUMNS.contains(index)) {
+                continue; // approved portal/image pseudonyms
+            }
+            String fieldValue = fields[index] == null ? "" : fields[index].trim();
+            if (LABELLED_MRN.matcher(fieldValue).find()
+                || ABSOLUTE_DATE.matcher(fieldValue).find()
+                || COMPACT_DATE.matcher(fieldValue).find()) {
+                throw new IllegalArgumentException(
+                    "Line " + line + ": WSI value violates the de-identification contract");
+            }
+        }
+        String metadata = nullable(value(fields, 26));
+        if (metadata != null && containsForbiddenMetadataText(metadata)) {
+            throw new IllegalArgumentException(
+                "Line " + line + ": TILE_METADATA_JSON violates the de-identification contract");
+        }
+        String source = nullable(value(fields, 25));
+        String thumbnail = nullable(value(fields, 27));
+        if (source != null && !safeArtifactUrl(source, SOURCE_EXTENSIONS, "WSI_ALLOWED_SOURCE_PREFIXES")) {
+            throw new IllegalArgumentException(
+                "Line " + line + ": SOURCE_URL violates the de-identification contract");
+        }
+        if (thumbnail != null && !safeArtifactUrl(thumbnail, THUMBNAIL_EXTENSIONS, "WSI_ALLOWED_THUMBNAIL_PREFIXES")) {
+            throw new IllegalArgumentException(
+                "Line " + line + ": THUMBNAIL_URL violates the de-identification contract");
+        }
+        for (int index : new int[] {0, 1, 2, 22}) {
+            String identifier = fields[index] == null ? "" : fields[index].trim();
+            if (!identifier.isBlank()) {
+                String lower = identifier.toLowerCase(Locale.ROOT);
+                if ((source != null && containsDecoded(source, lower))
+                    || (thumbnail != null && containsDecoded(thumbnail, lower))) {
+                    throw new IllegalArgumentException(
+                        "Line " + line + ": WSI URI contains a related identifier");
+                }
+            }
+        }
+        if (thumbnail != null) {
+            String contentType = nullable(value(fields, 30));
+            if (contentType != null && !thumbnailContentTypeMatches(thumbnail, contentType)) {
+                throw new IllegalArgumentException(
+                    "Line " + line + ": THUMBNAIL_CONTENT_TYPE does not match THUMBNAIL_URL");
+            }
+        }
+    }
+
+    private static boolean containsForbiddenMetadataText(JsonNode node) {
+        if (node == null) return false;
+        if (node.isTextual()) {
+            String value = node.asText();
+            return LABELLED_MRN.matcher(value).find()
+                || ABSOLUTE_DATE.matcher(value).find()
+                || COMPACT_DATE.matcher(value).find();
+        }
+        if (node.isObject()) {
+            var values = node.elements();
+            while (values.hasNext()) {
+                if (containsForbiddenMetadataText(values.next())) return true;
+            }
+        } else if (node.isArray()) {
+            for (JsonNode child : node) {
+                if (containsForbiddenMetadataText(child)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsForbiddenMetadataText(String value) {
+        try {
+            return containsForbiddenMetadataText(JSON.readTree(value));
+        } catch (IOException | IllegalArgumentException exception) {
+            return true;
+        }
+    }
+
+    private static boolean thumbnailContentTypeMatches(String value, String contentType) {
+        try {
+            URI uri = new URI(value);
+            String path = uri.getPath();
+            if (path == null) return false;
+            int dot = path.lastIndexOf('.');
+            if (dot <= path.lastIndexOf('/')) return false;
+            String extension = path.substring(dot + 1).toLowerCase(Locale.ROOT);
+            return contentType.trim().toLowerCase(Locale.ROOT)
+                .equals(THUMBNAIL_CONTENT_TYPES.get(extension));
+        } catch (URISyntaxException exception) {
+            return false;
+        }
+    }
+
+    private static boolean safeArtifactUrl(String value, Set<String> extensions, String prefixEnv) {
+        try {
+            URI uri = new URI(value);
+            String scheme = uri.getScheme();
+            if (scheme == null || !("s3".equalsIgnoreCase(scheme) || "file".equalsIgnoreCase(scheme))
+                || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null) {
+                return false;
+            }
+            if ("s3".equalsIgnoreCase(scheme) && (uri.getHost() == null || uri.getHost().isBlank())) {
+                return false;
+            }
+            if ("file".equalsIgnoreCase(scheme)
+                && uri.getHost() != null
+                && !uri.getHost().isBlank()
+                && !"localhost".equalsIgnoreCase(uri.getHost())) {
+                return false;
+            }
+            String path = uri.getPath();
+            String rawPath = uri.getRawPath();
+            if (path == null || path.endsWith("/")
+                || Arrays.stream(path.split("/", -1))
+                    .anyMatch(segment -> ".".equals(segment) || "..".equals(segment))) {
+                return false;
+            }
+            String prefixes = System.getenv(prefixEnv);
+            if (prefixes != null && !prefixes.isBlank()) {
+                boolean approved = Arrays.stream(prefixes.split(","))
+                    .map(String::trim).filter(prefix -> !prefix.isBlank())
+                    .anyMatch(prefix -> value.startsWith(prefix.replaceAll("/+$", "") + "/"));
+                if (!approved) return false;
+            }
+            String filename = path.substring(path.lastIndexOf('/') + 1);
+            int dot = filename.lastIndexOf('.');
+            return dot > 0
+                && !ABSOLUTE_DATE.matcher(value).find()
+                && !ABSOLUTE_DATE.matcher(path).find()
+                && !COMPACT_DATE.matcher(value).find()
+                && !COMPACT_DATE.matcher(path).find()
+                && (rawPath == null || !COMPACT_DATE.matcher(rawPath).find())
+                && !LABELLED_MRN.matcher(value).find()
+                && !LABELLED_MRN.matcher(path).find()
+                && extensions.contains(filename.substring(dot + 1).toLowerCase(Locale.ROOT));
+        } catch (URISyntaxException exception) {
+            return false;
+        }
+    }
+
+    private static boolean containsDecoded(String value, String identifier) {
+        if (value.toLowerCase(Locale.ROOT).contains(identifier)) {
+            return true;
+        }
+        try {
+            URI uri = new URI(value);
+            return uri.getPath() != null
+                && uri.getPath().toLowerCase(Locale.ROOT).contains(identifier);
+        } catch (URISyntaxException exception) {
+            return true;
+        }
     }
 
     private static String nullableLong(Long value) {
@@ -469,9 +661,138 @@ public class ImportWsiData extends ConsoleRunnable {
         }
     }
 
-    private static void insertRows(ImportRows rows) throws DaoException {
-        ClickHouseBulkLoader.getClickHouseBulkLoader("wsi_release_patient").setFieldNames(RELEASE_PATIENT_FIELDS);
-        rows.patients.values().forEach(record -> ClickHouseBulkLoader.getClickHouseBulkLoader("wsi_release_patient").insertRecord(record));
+    /**
+     * Adds the sample- and patient-level WSI attributes consumed by Study View.
+     * Patient totals are written directly so pagination cannot produce partial
+     * values; the frontend still supports sample aggregation for older studies.
+     * Counts intentionally include all associations, including slides that are
+     * not currently tile-servable, matching the WSI study-file contract and the
+     * standalone count-file generator.
+     */
+    private static void insertSampleSlideCounts(ImportRows rows, long studyId)
+        throws DaoException {
+        Map<Long, int[]> countsBySample = new LinkedHashMap<>();
+        Map<Long, int[]> countsByPatient = new LinkedHashMap<>();
+        for (String[] placement : rows.placements.values()) {
+            if (placement[5] == null || placement[5].isBlank()) {
+                continue; // unmatched slides have no sample-level count
+            }
+            long sampleId = Long.parseLong(placement[5]);
+            int[] counts = countsBySample.computeIfAbsent(sampleId, ignored -> new int[3]);
+            int[] patientCounts = countsByPatient.computeIfAbsent(
+                Long.parseLong(placement[1]), ignored -> new int[3]);
+            counts[0]++;
+            patientCounts[0]++;
+            if ("PART".equals(placement[6])) {
+                counts[1]++;
+                patientCounts[1]++;
+            } else if ("BLOCK".equals(placement[6])) {
+                counts[2]++;
+                patientCounts[2]++;
+            }
+        }
+
+        String[][] attributes = {
+            {WSI_SAMPLE_SLIDE_COUNT, "WSI Slides per Sample",
+                "Associated pathology slide count for the sample."},
+            {WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT, "WSI Slides per Sample, Part-matched",
+                "Associated pathology slides matched to a specimen part."},
+            {WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT, "WSI Slides per Sample, Block-matched",
+                "Associated pathology slides matched to a specimen block."},
+            {WSI_PATIENT_SLIDE_COUNT, "WSI Slides per Patient",
+                "Associated pathology slide count for the patient."},
+            {WSI_PATIENT_PART_MATCHED_SLIDE_COUNT, "WSI Slides per Patient, Part-matched",
+                "Associated pathology slides matched to a specimen part for the patient."},
+            {WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT, "WSI Slides per Patient, Block-matched",
+                "Associated pathology slides matched to a specimen block for the patient."}
+        };
+        for (String[] attribute : attributes) {
+            if (DaoClinicalAttributeMeta.getDatum(attribute[0], Math.toIntExact(studyId)) == null) {
+                boolean patientAttribute = attribute[0].startsWith("WSI_PATIENT_");
+                DaoClinicalAttributeMeta.addDatum(new ClinicalAttribute(
+                    attribute[0], attribute[1], attribute[2], "NUMBER", patientAttribute, "1",
+                    Math.toIntExact(studyId)));
+            }
+        }
+
+        Set<String> existingSamples = existingSlideCountKeys("clinical_sample", countsBySample.keySet());
+        ClickHouseBulkLoader sampleLoader =
+            ClickHouseBulkLoader.getClickHouseBulkLoader("clinical_sample");
+        sampleLoader.setFieldNames(CLINICAL_SAMPLE_FIELDS);
+        for (Map.Entry<Long, int[]> entry : countsBySample.entrySet()) {
+            int[] counts = entry.getValue();
+            String sampleId = Long.toString(entry.getKey());
+            if (!existingSamples.contains(sampleId + "\u0000" + WSI_SAMPLE_SLIDE_COUNT)) {
+                sampleLoader.insertRecord(sampleId, WSI_SAMPLE_SLIDE_COUNT, Integer.toString(counts[0]));
+            }
+            if (!existingSamples.contains(sampleId + "\u0000" + WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT)) {
+                sampleLoader.insertRecord(sampleId, WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT,
+                    Integer.toString(counts[1]));
+            }
+            if (!existingSamples.contains(sampleId + "\u0000" + WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT)) {
+                sampleLoader.insertRecord(sampleId, WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT,
+                    Integer.toString(counts[2]));
+            }
+        }
+
+        Set<String> existingPatients = existingSlideCountKeys("clinical_patient", countsByPatient.keySet());
+        ClickHouseBulkLoader patientLoader =
+            ClickHouseBulkLoader.getClickHouseBulkLoader("clinical_patient");
+        patientLoader.setFieldNames(CLINICAL_PATIENT_FIELDS);
+        for (Map.Entry<Long, int[]> entry : countsByPatient.entrySet()) {
+            int[] counts = entry.getValue();
+            String patientId = Long.toString(entry.getKey());
+            if (!existingPatients.contains(patientId + "\u0000" + WSI_PATIENT_SLIDE_COUNT)) {
+                patientLoader.insertRecord(patientId, WSI_PATIENT_SLIDE_COUNT, Integer.toString(counts[0]));
+            }
+            if (!existingPatients.contains(patientId + "\u0000" + WSI_PATIENT_PART_MATCHED_SLIDE_COUNT)) {
+                patientLoader.insertRecord(patientId, WSI_PATIENT_PART_MATCHED_SLIDE_COUNT,
+                    Integer.toString(counts[1]));
+            }
+            if (!existingPatients.contains(patientId + "\u0000" + WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT)) {
+                patientLoader.insertRecord(patientId, WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT,
+                    Integer.toString(counts[2]));
+            }
+        }
+    }
+
+    private static Set<String> existingSlideCountKeys(String tableName, Set<Long> entityIds)
+        throws DaoException {
+        Set<String> existing = new HashSet<>();
+        if (entityIds.isEmpty()) {
+            return existing;
+        }
+        String placeholders = String.join(",", Collections.nCopies(entityIds.size(), "?"));
+        String query = "SELECT internal_id, attr_id FROM " + tableName + " WHERE internal_id IN ("
+            + placeholders + ") AND attr_id IN ('" + WSI_SAMPLE_SLIDE_COUNT + "','"
+            + WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT + "','" + WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT
+            + "','" + WSI_PATIENT_SLIDE_COUNT + "','" + WSI_PATIENT_PART_MATCHED_SLIDE_COUNT
+            + "','" + WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT + "')";
+        Connection connection = null;
+        try {
+            connection = JdbcUtil.getDbConnection(ImportWsiData.class);
+            try (PreparedStatement statement = connection.prepareStatement(query)) {
+                int index = 1;
+                for (Long entityId : entityIds) {
+                    statement.setLong(index++, entityId);
+                }
+                try (ResultSet results = statement.executeQuery()) {
+                    while (results.next()) {
+                        existing.add(results.getLong("internal_id") + "\u0000" + results.getString("attr_id"));
+                    }
+                }
+            }
+        } catch (SQLException exception) {
+            throw new DaoException(exception);
+        } finally {
+            JdbcUtil.closeAll(ImportWsiData.class, connection, null, null);
+        }
+        return existing;
+    }
+
+    private static void insertRows(ImportRows rows, long studyId) throws DaoException {
+        ClickHouseBulkLoader.getClickHouseBulkLoader("wsi_patient").setFieldNames(PATIENT_FIELDS);
+        rows.patients.values().forEach(record -> ClickHouseBulkLoader.getClickHouseBulkLoader("wsi_patient").insertRecord(record));
         ClickHouseBulkLoader.getClickHouseBulkLoader("wsi_part").setFieldNames(PART_FIELDS);
         rows.parts.values().forEach(record -> ClickHouseBulkLoader.getClickHouseBulkLoader("wsi_part").insertRecord(record));
         ClickHouseBulkLoader.getClickHouseBulkLoader("wsi_block").setFieldNames(BLOCK_FIELDS);
@@ -480,25 +801,8 @@ public class ImportWsiData extends ConsoleRunnable {
         rows.slides.values().forEach(record -> ClickHouseBulkLoader.getClickHouseBulkLoader("wsi_slide").insertRecord(record));
         ClickHouseBulkLoader.getClickHouseBulkLoader("wsi_slide_placement").setFieldNames(PLACEMENT_FIELDS);
         rows.placements.values().forEach(record -> ClickHouseBulkLoader.getClickHouseBulkLoader("wsi_slide_placement").insertRecord(record));
+        insertSampleSlideCounts(rows, studyId);
         ClickHouseBulkLoader.flushAll();
-    }
-
-    private static void insertRelease(long studyId, String releaseId, long releaseVersion, Instant releasedAt)
-        throws SQLException {
-        Connection connection = null;
-        try {
-            connection = JdbcUtil.getDbConnection(ImportWsiData.class);
-            try (PreparedStatement statement = connection.prepareStatement(
-                "INSERT INTO wsi_release (cancer_study_id, release_id, release_version, released_at) VALUES (?, ?, ?, ?)")) {
-                statement.setLong(1, studyId);
-                statement.setString(2, releaseId);
-                statement.setLong(3, releaseVersion);
-                statement.setTimestamp(4, Timestamp.from(releasedAt));
-                statement.executeUpdate();
-            }
-        } finally {
-            JdbcUtil.closeAll(ImportWsiData.class, connection, null, null);
-        }
     }
 
     private static void importData(String metadataFile, String dataFile)
@@ -511,15 +815,11 @@ public class ImportWsiData extends ConsoleRunnable {
         }
         List<String[]> rows = readRows(dataFile);
         StudyRefs references = resolveReferences(metadata);
-        Instant releasedAt = Instant.now();
-        long releaseVersion = releasedAt.getEpochSecond() * 1_000_000L + releasedAt.getNano() / 1_000L;
-        String releaseId = String.format("%020d-%s", releaseVersion, UUID.randomUUID().toString().replace("-", ""));
-        ImportRows normalized = normalize(rows, references, releaseId);
+        ImportRows normalized = normalize(rows, references);
 
         ClickHouseBulkLoader.bulkLoadOn();
         try {
-            insertRows(normalized);
-            insertRelease(references.studyId(), releaseId, releaseVersion, releasedAt);
+            insertRows(normalized, references.studyId());
         } finally {
             ClickHouseBulkLoader.bulkLoadOff();
         }

@@ -547,10 +547,7 @@ public final class DaoCancerStudy {
 
             ClickHouseBulkDeleter.flushAll();
 
-            // WSI release rows are the visibility boundary. Remove the
-            // manifest before its immutable child rows during study deletion.
-            deleteByStudyId("DELETE FROM wsi_release WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId("DELETE FROM wsi_release_patient WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM wsi_patient WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM wsi_part WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM wsi_block WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM wsi_slide WHERE cancer_study_id=?", internalCancerStudyId);

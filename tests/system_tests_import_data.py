@@ -23,23 +23,18 @@ class DataImporterTests(unittest.TestCase):
     @mock.patch('importer.cbioportalImporter.cbioportal_common.parse_metadata_file')
     @mock.patch('importer.cbioportalImporter.run_java')
     def test_wsi_import_dispatch(self, run_java, parse_metadata_file):
-        """WSI uses the standard Java importer for full and incremental loads."""
+        """WSI cannot be imported incrementally into an existing database."""
         parse_metadata_file.return_value = {
             'meta_file_type': cbioportalImporter.MetaFileTypes.WSI,
             'data_filename': 'data_wsi.txt',
             'cancer_study_identifier': 'study_es_0',
         }
 
-        cbioportalImporter.import_data(
-            '-Dspring.profiles.active=dbcp -cp test.jar',
-            '/tmp/meta_wsi.txt', '/tmp/data_wsi.txt', incremental=True)
-
-        run_java.assert_called_once_with(
-            '-Dspring.profiles.active=dbcp', '-cp', 'test.jar',
-            'org.mskcc.cbio.portal.scripts.ImportWsiData',
-            '--overwrite-existing', '--meta', '/tmp/meta_wsi.txt',
-            '--loadMode', 'bulkload', '--data', '/tmp/data_wsi.txt',
-            '--noprogress')
+        with self.assertRaises(NotImplementedError):
+            cbioportalImporter.import_data(
+                '-Dspring.profiles.active=dbcp -cp test.jar',
+                '/tmp/meta_wsi.txt', '/tmp/data_wsi.txt', incremental=True)
+        run_java.assert_not_called()
 
     @mock.patch('importer.cbioportalImporter.locate_jar')
     @mock.patch('importer.cbioportalImporter.run_java')

@@ -46,7 +46,30 @@ from pathlib import Path
 from base64 import urlsafe_b64encode
 import math
 from abc import ABCMeta, abstractmethod
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
+
+WSI_ABSOLUTE_DATE = re.compile(
+    r'(?<!\d)(?:19|20)\d{2}[-_/](?:0?[1-9]|1[0-2])[-_/](?:0?[1-9]|[12]\d|3[01])(?!\d)'
+)
+WSI_COMPACT_DATE = re.compile(r'(?<!\d)(?:19|20)\d{6}(?!\d)')
+WSI_LABELLED_MRN = re.compile(
+    r'(?i)\b(?:mrn|medical[ _-]?record(?:[ _-]?number)?)\b\s*[:=#-]?\s*\d{4,}'
+)
+WSI_SOURCE_EXTENSIONS = {'svs', 'tif', 'tiff', 'ndpi', 'mrxs', 'scn'}
+WSI_THUMBNAIL_EXTENSIONS = {'jpg', 'jpeg', 'png'}
+WSI_METADATA_KEYS = {
+    'dimensions', 'levels', 'level_dimensions', 'level_downsamples', 'max_zoom',
+    'tile_size', 'mpp', 'objective_power', 'vendor', 'identity_version', 'safe_min_level',
+    'tile_metadata_schema_version', 'decode_policy_version', 'max_decode_pixels',
+    'thumbnail_max_decode_pixels', 'source_fingerprint',
+}
+WSI_NON_TEXT_FIELDS = {
+    'IS_HNE', 'IS_IHC', 'CAN_SERVE_TILES', 'FILE_SIZE_BYTES',
+    'THUMBNAIL_WIDTH', 'THUMBNAIL_HEIGHT', 'TILE_METADATA_JSON',
+}
+WSI_THUMBNAIL_CONTENT_TYPES = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+}
 
 # Configure relative imports if running as a script; see PEP 366
 # it might passed as empty string by certain tooling to mark a top level module.
@@ -4427,8 +4450,7 @@ class WsiValidator(Validator):
         'PART_DESCRIPTION', 'SUBSPECIALTY', 'PATH_DX_TITLE', 'BLOCK_KEY',
         'BLOCK_NUMBER', 'BLOCK_LABEL', 'MATCH_LEVEL', 'SPECIMEN_KEY',
         'STAIN_NAME', 'STAIN_GROUP', 'IS_HNE', 'IS_IHC', 'MAGNIFICATION',
-        'FILE_SIZE_BYTES', 'BARCODE', 'SLIDE_TYPE', 'PROCEDURE_DATE_DAYS',
-        'TIMEPOINT_SOURCE', 'CAN_SERVE_TILES', 'SOURCE_URL',
+        'FILE_SIZE_BYTES', 'BARCODE', 'SLIDE_TYPE', 'CAN_SERVE_TILES', 'SOURCE_URL',
         'TILE_METADATA_JSON', 'THUMBNAIL_URL', 'THUMBNAIL_WIDTH',
         'THUMBNAIL_HEIGHT', 'THUMBNAIL_CONTENT_TYPE',
     ]
@@ -4441,6 +4463,8 @@ class WsiValidator(Validator):
     def _is_valid_tile_metadata(metadata):
         """Return whether metadata contains the browser tile contract."""
         if not isinstance(metadata, dict):
+            return False
+        if set(metadata) - WSI_METADATA_KEYS:
             return False
 
         dimensions = metadata.get('dimensions')
@@ -4482,6 +4506,116 @@ class WsiValidator(Validator):
     def _is_absolute_url(value):
         parsed = urlparse(value)
         return bool(parsed.scheme and (parsed.netloc or parsed.path))
+
+    @staticmethod
+    def _uri_prefixes(name):
+        return tuple(
+            value.strip().rstrip('/')
+            for value in os.environ.get(name, '').split(',')
+            if value.strip()
+        )
+
+    @classmethod
+    def _is_safe_artifact_url(cls, value, kind):
+        try:
+            parsed = urlparse(value)
+        except ValueError:
+            return False
+        if (
+            parsed.scheme.lower() not in ('s3', 'file')
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            return False
+        if parsed.scheme.lower() == 's3' and not parsed.netloc:
+            return False
+        if parsed.scheme.lower() == 'file' and (
+                parsed.netloc not in ('', 'localhost') or not parsed.path.startswith('/')):
+            return False
+        path = unquote(unquote(parsed.path))
+        if (not path or path.endswith('/')
+                or any(segment in ('.', '..') for segment in path.split('/'))):
+            return False
+        if (WSI_ABSOLUTE_DATE.search(value) or WSI_ABSOLUTE_DATE.search(path)
+                or WSI_COMPACT_DATE.search(value) or WSI_COMPACT_DATE.search(path)):
+            return False
+        if WSI_LABELLED_MRN.search(value) or WSI_LABELLED_MRN.search(path):
+            return False
+        prefixes = cls._uri_prefixes(
+            'WSI_ALLOWED_SOURCE_PREFIXES'
+            if kind == 'source'
+            else 'WSI_ALLOWED_THUMBNAIL_PREFIXES'
+        )
+        if prefixes and not any(value.startswith(prefix + '/') for prefix in prefixes):
+            return False
+        filename = path.rsplit('/', 1)[-1]
+        stem, separator, extension = filename.rpartition('.')
+        extensions = WSI_SOURCE_EXTENSIONS if kind == 'source' else WSI_THUMBNAIL_EXTENSIONS
+        return bool(separator and stem and extension.lower() in extensions)
+
+    def _validate_deid_row(self, row, line_number, header):
+        approved_identifier_fields = {
+            'PATIENT_ID', 'REFERENCE_SAMPLE_ID', 'SAMPLE_ID', 'IMAGE_ID'
+        }
+        for name, value in row.items():
+            if name in approved_identifier_fields or name in WSI_NON_TEXT_FIELDS or not value:
+                continue
+            if (WSI_LABELLED_MRN.search(value) or WSI_ABSOLUTE_DATE.search(value)
+                    or WSI_COMPACT_DATE.search(value)):
+                self._deid_error(name, line_number, header)
+        metadata_value = row.get('TILE_METADATA_JSON', '').strip()
+        if metadata_value:
+            try:
+                metadata = json.loads(metadata_value)
+            except (TypeError, ValueError):
+                metadata = None
+            if isinstance(metadata, dict):
+                self._validate_metadata_deid(metadata, line_number, header)
+        related = [
+            row.get(name, '').lower()
+            for name in ('PATIENT_ID', 'REFERENCE_SAMPLE_ID', 'SAMPLE_ID', 'BARCODE')
+        ]
+        for name, kind in (('SOURCE_URL', 'source'), ('THUMBNAIL_URL', 'thumbnail')):
+            value = row[name]
+            if value and not self._is_safe_artifact_url(value, kind):
+                self._deid_error(name, line_number, header)
+            decoded_value = unquote(unquote(value)).lower() if value else ''
+            if value and any(
+                    token and (token in value.lower() or token in decoded_value)
+                    for token in related):
+                self._deid_error(name, line_number, header)
+        thumbnail = row.get('THUMBNAIL_URL', '')
+        content_type = row.get('THUMBNAIL_CONTENT_TYPE', '').strip().lower()
+        if thumbnail and content_type:
+            try:
+                path = unquote(unquote(urlparse(thumbnail).path))
+            except ValueError:
+                path = ''
+            if path:
+                filename = path.rsplit('/', 1)[-1]
+                extension = '.' + filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+                if WSI_THUMBNAIL_CONTENT_TYPES.get(extension) != content_type:
+                    self._deid_error('THUMBNAIL_CONTENT_TYPE', line_number, header)
+
+    def _deid_error(self, name, line_number, header):
+        self._error('WSI value violates the de-identification contract', line_number,
+                    header.index(name), name)
+
+    def _validate_metadata_deid(self, value, line_number, header, field='TILE_METADATA_JSON'):
+        if isinstance(value, str):
+            if (WSI_LABELLED_MRN.search(value) or WSI_ABSOLUTE_DATE.search(value)
+                    or WSI_COMPACT_DATE.search(value)):
+                self._deid_error('TILE_METADATA_JSON', line_number, header)
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                self._validate_metadata_deid(child, line_number, header,
+                                             f'{field}.{key}')
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                self._validate_metadata_deid(child, line_number, header,
+                                             f'{field}[{index}]')
 
     def _validate_file(self):
         try:
@@ -4530,6 +4664,7 @@ class WsiValidator(Validator):
                 continue
             rows += 1
             row = dict(zip(self.EXPECTED_HEADERS, (value.strip() for value in values)))
+            self._validate_deid_row(row, line_number, self.EXPECTED_HEADERS)
 
             for name in self.REQUIRED_VALUES:
                 if not row[name]:
@@ -4539,14 +4674,11 @@ class WsiValidator(Validator):
                 if row[name] not in ('TRUE', 'FALSE'):
                     self._error('WSI boolean must be TRUE or FALSE', line_number,
                                 self.EXPECTED_HEADERS.index(name), row[name])
-            for name in ('FILE_SIZE_BYTES', 'PROCEDURE_DATE_DAYS',
-                         'THUMBNAIL_WIDTH', 'THUMBNAIL_HEIGHT'):
+            for name in ('FILE_SIZE_BYTES', 'THUMBNAIL_WIDTH', 'THUMBNAIL_HEIGHT'):
                 if row[name]:
                     try:
                         value = int(row[name])
                         if name == 'FILE_SIZE_BYTES' and value < 0:
-                            raise ValueError
-                        if name == 'PROCEDURE_DATE_DAYS' and not (-2147483648 <= value <= 2147483647):
                             raise ValueError
                         if name in ('THUMBNAIL_WIDTH', 'THUMBNAIL_HEIGHT') and not (0 <= value <= 4294967295):
                             raise ValueError

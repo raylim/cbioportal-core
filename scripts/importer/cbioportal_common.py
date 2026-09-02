@@ -398,7 +398,6 @@ INCREMENTAL_UPLOAD_SUPPORTED_META_TYPES = [
     MetaFileTypes.GENE_PANEL_MATRIX,
     MetaFileTypes.STRUCTURAL_VARIANT,
     MetaFileTypes.SEG,
-    MetaFileTypes.WSI,
 ]
 
 IMPORTER_CLASSNAME_BY_META_TYPE = {
@@ -997,9 +996,9 @@ def parse_metadata_file(filename,
                 'WSI metadata must use genetic_alteration_type PATHOLOGY_SLIDES and datatype WSI',
                 extra={'filename_': filename})
             meta_dictionary['meta_file_type'] = None
-        elif meta_dictionary.get('format_version') != '1':
+        elif meta_dictionary.get('format_version') != '2':
             logger.error(
-                "Unsupported WSI format_version; expected '1'",
+                "Unsupported WSI format_version; expected '2'",
                 extra={'filename_': filename,
                        'cause': meta_dictionary.get('format_version')})
             meta_dictionary['meta_file_type'] = None

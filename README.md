@@ -11,8 +11,9 @@ If you are a developer and want to help contribute to the cBioPortal importer co
 ## WSI imports
 
 The WSI importer is documented in [`docs/wsi-study-format.md`](docs/wsi-study-format.md).
-cBioPortal core is the sole ClickHouse writer for WSI releases. Thumbnail
+cBioPortal core is the sole ClickHouse writer for WSI snapshots. Thumbnail
 artifacts and `slide_thumbnail_registry` rows must be published by the
 upstream scheduled batch before `metaImport.py` imports the complete
 `meta_wsi.txt`/`data_wsi.txt` snapshot; core does not generate thumbnails or
-write the object store.
+write the object store. Pathology procedure timing is imported separately as
+standard `PATHOLOGY SLIDES` clinical timeline data.
