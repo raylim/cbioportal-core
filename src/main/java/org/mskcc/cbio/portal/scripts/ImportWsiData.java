@@ -104,6 +104,18 @@ public class ImportWsiData extends ConsoleRunnable {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Pattern ABSOLUTE_DATE = Pattern.compile(
         "(?<!\\d)(?:19|20)\\d{2}[-_/](?:0?[1-9]|1[0-2])[-_/](?:0?[1-9]|[12]\\d|3[01])(?!\\d)");
+    private static final Pattern MONTH_FIRST_DATE = Pattern.compile(
+        "(?<!\\d)(?:0?[1-9]|1[0-2])[-_/](?:0?[1-9]|[12]\\d|3[01])[-_/](?:19|20)\\d{2}(?!\\d)");
+    private static final Pattern DAY_FIRST_DATE = Pattern.compile(
+        "(?<!\\d)(?:0?[1-9]|[12]\\d|3[01])[-_/](?:0?[1-9]|1[0-2])[-_/](?:19|20)\\d{2}(?!\\d)");
+    private static final Pattern NAMED_MONTH_DATE = Pattern.compile(
+        "(?i)(?<![a-z0-9])(?:(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|"
+            + "may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+            + "nov(?:ember)?|dec(?:ember)?)\\s+(?:0?[1-9]|[12]\\d|3[01])(?:st|nd|rd|th)?"
+            + "(?:,)?\\s+(?:19|20)\\d{2}|(?:0?[1-9]|[12]\\d|3[01])[-/\\s]+"
+            + "(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+            + "jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
+            + "dec(?:ember)?)[-/\\s]+(?:19|20)\\d{2})(?![a-z0-9])");
     private static final Pattern COMPACT_DATE = Pattern.compile(
         "(?<!\\d)(?:19|20)\\d{6}(?!\\d)");
     private static final Pattern LABELLED_MRN = Pattern.compile(
@@ -504,7 +516,7 @@ public class ImportWsiData extends ConsoleRunnable {
             }
             String fieldValue = fields[index] == null ? "" : fields[index].trim();
             if (LABELLED_MRN.matcher(fieldValue).find()
-                || ABSOLUTE_DATE.matcher(fieldValue).find()
+                || containsAbsoluteDate(fieldValue)
                 || COMPACT_DATE.matcher(fieldValue).find()) {
                 throw new IllegalArgumentException(
                     "Line " + line + ": WSI value violates the de-identification contract");
@@ -550,7 +562,7 @@ public class ImportWsiData extends ConsoleRunnable {
         if (node.isTextual()) {
             String value = node.asText();
             return LABELLED_MRN.matcher(value).find()
-                || ABSOLUTE_DATE.matcher(value).find()
+                || containsAbsoluteDate(value)
                 || COMPACT_DATE.matcher(value).find();
         }
         if (node.isObject()) {
@@ -623,8 +635,8 @@ public class ImportWsiData extends ConsoleRunnable {
             String filename = path.substring(path.lastIndexOf('/') + 1);
             int dot = filename.lastIndexOf('.');
             return dot > 0
-                && !ABSOLUTE_DATE.matcher(value).find()
-                && !ABSOLUTE_DATE.matcher(path).find()
+                && !containsAbsoluteDate(value)
+                && !containsAbsoluteDate(path)
                 && !COMPACT_DATE.matcher(value).find()
                 && !COMPACT_DATE.matcher(path).find()
                 && (rawPath == null || !COMPACT_DATE.matcher(rawPath).find())
@@ -647,6 +659,13 @@ public class ImportWsiData extends ConsoleRunnable {
         } catch (URISyntaxException exception) {
             return true;
         }
+    }
+
+    private static boolean containsAbsoluteDate(String value) {
+        return ABSOLUTE_DATE.matcher(value).find()
+            || MONTH_FIRST_DATE.matcher(value).find()
+            || DAY_FIRST_DATE.matcher(value).find()
+            || NAMED_MONTH_DATE.matcher(value).find();
     }
 
     private static String nullableLong(Long value) {
@@ -672,23 +691,18 @@ public class ImportWsiData extends ConsoleRunnable {
     private static void insertSampleSlideCounts(ImportRows rows, long studyId)
         throws DaoException {
         Map<Long, int[]> countsBySample = new LinkedHashMap<>();
-        Map<Long, int[]> countsByPatient = new LinkedHashMap<>();
+        Map<Long, int[]> countsByPatient = countPatientSlidePlacements(rows.placements.values());
         for (String[] placement : rows.placements.values()) {
             if (placement[5] == null || placement[5].isBlank()) {
                 continue; // unmatched slides have no sample-level count
             }
             long sampleId = Long.parseLong(placement[5]);
             int[] counts = countsBySample.computeIfAbsent(sampleId, ignored -> new int[3]);
-            int[] patientCounts = countsByPatient.computeIfAbsent(
-                Long.parseLong(placement[1]), ignored -> new int[3]);
             counts[0]++;
-            patientCounts[0]++;
             if ("PART".equals(placement[6])) {
                 counts[1]++;
-                patientCounts[1]++;
             } else if ("BLOCK".equals(placement[6])) {
                 counts[2]++;
-                patientCounts[2]++;
             }
         }
 
@@ -754,6 +768,21 @@ public class ImportWsiData extends ConsoleRunnable {
                     Integer.toString(counts[2]));
             }
         }
+    }
+
+    static Map<Long, int[]> countPatientSlidePlacements(Iterable<String[]> placements) {
+        Map<Long, int[]> countsByPatient = new LinkedHashMap<>();
+        for (String[] placement : placements) {
+            int[] counts = countsByPatient.computeIfAbsent(
+                Long.parseLong(placement[1]), ignored -> new int[3]);
+            counts[0]++;
+            if ("PART".equals(placement[6])) {
+                counts[1]++;
+            } else if ("BLOCK".equals(placement[6])) {
+                counts[2]++;
+            }
+        }
+        return countsByPatient;
     }
 
     private static Set<String> existingSlideCountKeys(String tableName, Set<Long> entityIds)

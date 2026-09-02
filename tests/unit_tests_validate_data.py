@@ -3238,6 +3238,11 @@ class CNADiscretePDAAnnotationsValidatorTestCase(PostClinicalDataFileTestCase):
 
 class WsiValidatorTestCase(PostClinicalDataFileTestCase):
 
+    def test_deid_rejects_common_absolute_date_formats(self):
+        for value in ('2021-03-14', '03/14/2021', '14/03/2021',
+                      'March 14, 2021', '14 March 2021'):
+            self.assertTrue(validateData._wsi_contains_absolute_date(value))
+
     def test_valid_unmatched_slide(self):
         self.logger.setLevel(logging.ERROR)
         record_list = self.validate('data_wsi_valid.txt', validateData.WsiValidator)

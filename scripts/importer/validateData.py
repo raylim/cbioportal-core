@@ -51,10 +51,34 @@ from urllib.parse import unquote, urlparse
 WSI_ABSOLUTE_DATE = re.compile(
     r'(?<!\d)(?:19|20)\d{2}[-_/](?:0?[1-9]|1[0-2])[-_/](?:0?[1-9]|[12]\d|3[01])(?!\d)'
 )
+WSI_MONTH_FIRST_DATE = re.compile(
+    r'(?<!\d)(?:0?[1-9]|1[0-2])[-_/](?:0?[1-9]|[12]\d|3[01])[-_/](?:19|20)\d{2}(?!\d)'
+)
+WSI_DAY_FIRST_DATE = re.compile(
+    r'(?<!\d)(?:0?[1-9]|[12]\d|3[01])[-_/](?:0?[1-9]|1[0-2])[-_/](?:19|20)\d{2}(?!\d)'
+)
+WSI_NAMED_MONTH_DATE = re.compile(
+    r'(?i)(?<![a-z0-9])(?:(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|'
+    r'may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|'
+    r'nov(?:ember)?|dec(?:ember)?)\s+(?:0?[1-9]|[12]\d|3[01])(?:st|nd|rd|th)?'
+    r'(?:,)?\s+(?:19|20)\d{2}|(?:0?[1-9]|[12]\d|3[01])[-/\s]+'
+    r'(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
+    r'jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|'
+    r'dec(?:ember)?)[-/\s]+(?:19|20)\d{2})(?![a-z0-9])'
+)
 WSI_COMPACT_DATE = re.compile(r'(?<!\d)(?:19|20)\d{6}(?!\d)')
 WSI_LABELLED_MRN = re.compile(
     r'(?i)\b(?:mrn|medical[ _-]?record(?:[ _-]?number)?)\b\s*[:=#-]?\s*\d{4,}'
 )
+
+
+def _wsi_contains_absolute_date(value):
+    return any(pattern.search(value) for pattern in (
+        WSI_ABSOLUTE_DATE,
+        WSI_MONTH_FIRST_DATE,
+        WSI_DAY_FIRST_DATE,
+        WSI_NAMED_MONTH_DATE,
+    ))
 WSI_SOURCE_EXTENSIONS = {'svs', 'tif', 'tiff', 'ndpi', 'mrxs', 'scn'}
 WSI_THUMBNAIL_EXTENSIONS = {'jpg', 'jpeg', 'png'}
 WSI_METADATA_KEYS = {
@@ -4538,7 +4562,7 @@ class WsiValidator(Validator):
         if (not path or path.endswith('/')
                 or any(segment in ('.', '..') for segment in path.split('/'))):
             return False
-        if (WSI_ABSOLUTE_DATE.search(value) or WSI_ABSOLUTE_DATE.search(path)
+        if (_wsi_contains_absolute_date(value) or _wsi_contains_absolute_date(path)
                 or WSI_COMPACT_DATE.search(value) or WSI_COMPACT_DATE.search(path)):
             return False
         if WSI_LABELLED_MRN.search(value) or WSI_LABELLED_MRN.search(path):
@@ -4562,7 +4586,7 @@ class WsiValidator(Validator):
         for name, value in row.items():
             if name in approved_identifier_fields or name in WSI_NON_TEXT_FIELDS or not value:
                 continue
-            if (WSI_LABELLED_MRN.search(value) or WSI_ABSOLUTE_DATE.search(value)
+            if (WSI_LABELLED_MRN.search(value) or _wsi_contains_absolute_date(value)
                     or WSI_COMPACT_DATE.search(value)):
                 self._deid_error(name, line_number, header)
         metadata_value = row.get('TILE_METADATA_JSON', '').strip()
@@ -4605,7 +4629,7 @@ class WsiValidator(Validator):
 
     def _validate_metadata_deid(self, value, line_number, header, field='TILE_METADATA_JSON'):
         if isinstance(value, str):
-            if (WSI_LABELLED_MRN.search(value) or WSI_ABSOLUTE_DATE.search(value)
+            if (WSI_LABELLED_MRN.search(value) or _wsi_contains_absolute_date(value)
                     or WSI_COMPACT_DATE.search(value)):
                 self._deid_error('TILE_METADATA_JSON', line_number, header)
         elif isinstance(value, dict):
