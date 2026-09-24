@@ -85,6 +85,13 @@ class MetaFileTypes(object):
     RESOURCES_DEFINITION = 'meta_resource_definition'
     WSI = 'meta_wsi'
 
+# Legacy format-v3 WSI files are no longer imported directly; both the importer and the
+# validator reject a study that still contains them with this message.
+LEGACY_WSI_IMPORT_MESSAGE = (
+    'Legacy meta_wsi input is no longer imported. Convert it with '
+    'scripts/importer/convertWsiToResources.py and import the generated '
+    'resource definition and resource data files instead.')
+
 # class to hold information about a failed java process execution
 class JavaRunException(Exception):
     def __init__(self, process_return_status, message):
