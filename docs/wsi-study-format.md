@@ -73,7 +73,10 @@ For every `WHOLE_SLIDE_IMAGE` row, `validateData.py` applies the same checks
 as the legacy WSI validator described under [Legacy format](#legacy-format-v3):
 required hierarchy keys, typed values, consistent timing, `match_level`
 agreement with the file type (sample rows are matched, patient rows are
-unmatched), `image_id` unique across both files of the study, consistent part
+unmatched), `slide_type` being `H&E`, `IHC`, `Other`, or `Unknown` with
+consistent stain flags (never both `is_hne` and `is_ihc`; `H&E` requires
+`is_hne`, `IHC` requires `is_ihc`, `Other`/`Unknown` allow neither), as the
+native `wsi_slide` table constraints required, `image_id` unique across both files of the study, consistent part
 and block metadata, the sample and reference sample belonging to the row's
 patient, and the `wsi_serving` shape and URL safety rules. The row's
 `RESOURCE_ID` must be `WSI_SAMPLE` in sample files and `WSI_PATIENT` in
@@ -115,7 +118,8 @@ python scripts/importer/convertWsiToResources.py \
 
 Rows are parsed like the retired native importer: leading `#` rows are
 skipped, the header must match format v3 exactly, `MATCH_LEVEL` must agree
-with `SAMPLE_ID`, an `UNMATCHED` reference sample is dropped, a missing
+with `SAMPLE_ID`, `SLIDE_TYPE` and the stain flags must satisfy the native
+`wsi_slide` constraints above, an `UNMATCHED` reference sample is dropped, a missing
 `TIMEPOINT_SOURCE` is derived from the timing provenance, and serving fields
 are dropped when `CAN_SERVE_TILES=FALSE`. Run `validateData.py` on the study
 afterwards; the converter does not re-implement URL allowlists or the tile

@@ -64,6 +64,7 @@ MATCH_LEVELS = ("BLOCK", "PART", "UNMATCHED")
 TIMELINE_STATUSES = ("AVAILABLE", "MISSING_PROCEDURE_DATE", "MISSING_REFERENCE_SEQUENCING_DATE")
 TIMELINE_KINDS = ("RECORDED", "ESTIMATED", "UNDATED")
 TIMELINE_COORDINATE_SYSTEM = "patient_first_tumor_sequencing_day_zero"
+SLIDE_TYPES = ("H&E", "IHC", "Other", "Unknown")
 
 # Names and descriptions must stay identical to ImportWsiData.insertSampleSlideCounts.
 SAMPLE_COUNT_ATTRIBUTES = [
@@ -228,6 +229,14 @@ def _validate_timing(start_days, status, kind, source, reason, coordinate_system
         _fail(line, "missing reference date cannot be UNDATED")
 
 
+def stain_flags_valid(slide_type, is_hne, is_ihc):
+    """Mirror the native wsi_slide_stain_flags_valid CHECK constraint."""
+    return (not (is_hne and is_ihc)
+            and (slide_type != "H&E" or is_hne)
+            and (slide_type != "IHC" or is_ihc)
+            and (slide_type not in ("Other", "Unknown") or (not is_hne and not is_ihc)))
+
+
 def derive_timepoint_source(kind, reason, source, status):
     # Mirrors ImportWsiData.deriveTimepointSource.
     if kind == "ESTIMATED":
@@ -250,6 +259,12 @@ def normalize_row(row, line):
     metadata["is_ihc"] = _boolean(row, "IS_IHC", line)
     can_serve = _boolean(row, "CAN_SERVE_TILES", line)
     metadata["can_serve_tiles"] = can_serve
+    # The native wsi_slide table enforced these as CHECK constraints
+    # (wsi_slide_type_valid and wsi_slide_stain_flags_valid).
+    if row["SLIDE_TYPE"] not in SLIDE_TYPES:
+        _fail(line, "SLIDE_TYPE must be one of " + ", ".join(SLIDE_TYPES))
+    if not stain_flags_valid(row["SLIDE_TYPE"], metadata["is_hne"], metadata["is_ihc"]):
+        _fail(line, "IS_HNE/IS_IHC are inconsistent with SLIDE_TYPE " + row["SLIDE_TYPE"])
 
     file_size = _optional_int(row, "FILE_SIZE_BYTES", line)
     if file_size is not None:

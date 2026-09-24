@@ -3443,6 +3443,7 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
         value = {
             'image_id': 'IMG-1', 'part_key': 'PART-A', 'block_key': 'BLOCK-A1',
             'match_level': 'BLOCK', 'specimen_key': 'SPEC-1', 'is_hne': True, 'is_ihc': False,
+            'slide_type': 'H&E',
             'can_serve_tiles': True, 'timeline_start_days': -3,
             'timeline_date_status': 'AVAILABLE', 'timeline_date_kind': 'RECORDED',
             'timeline_date_source': 'PATHOLOGY_REPORT',
@@ -3531,6 +3532,26 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
         errors = self.validate_resource(validateData.SampleResourceValidator,
                                         [self.sample_row(self.metadata(part_number=1))])
         self.assertEqual([('WHOLE_SLIDE_IMAGE metadata value must be a JSON string', 'part_number')], errors)
+
+    def test_slide_type_and_stain_flags(self):
+        # mirrors the native wsi_slide_type_valid / wsi_slide_stain_flags_valid constraints
+        errors = self.validate_resource(validateData.SampleResourceValidator,
+                                        [self.sample_row(self.metadata(slide_type=None))])
+        self.assertIn(('WSI SLIDE_TYPE must be H&E, IHC, Other, or Unknown', ''), errors)
+        errors = self.validate_resource(validateData.SampleResourceValidator,
+                                        [self.sample_row(self.metadata(slide_type='Frozen'))])
+        self.assertIn(('WSI SLIDE_TYPE must be H&E, IHC, Other, or Unknown', 'Frozen'), errors)
+        for changes, cause in (
+                ({'is_hne': False}, 'H&E: IS_HNE=FALSE, IS_IHC=FALSE'),
+                ({'is_ihc': True}, 'H&E: IS_HNE=TRUE, IS_IHC=TRUE'),
+                ({'slide_type': 'IHC'}, 'IHC: IS_HNE=TRUE, IS_IHC=FALSE'),
+                ({'slide_type': 'Other'}, 'Other: IS_HNE=TRUE, IS_IHC=FALSE')):
+            errors = self.validate_resource(validateData.SampleResourceValidator,
+                                            [self.sample_row(self.metadata(**changes))])
+            self.assertEqual([('WSI IS_HNE/IS_IHC are inconsistent with SLIDE_TYPE', cause)], errors)
+        errors = self.validate_resource(validateData.SampleResourceValidator, [self.sample_row(
+            self.metadata(slide_type='Unknown', is_hne=False))])
+        self.assertEqual([], errors)
 
     def test_consistent_timing(self):
         errors = self.validate_resource(validateData.SampleResourceValidator,

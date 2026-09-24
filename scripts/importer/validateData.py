@@ -3932,6 +3932,7 @@ class WsiRowChecks(object):
         'TIMELINE_DATE_STATUS', 'TIMELINE_DATE_KIND', 'TIMELINE_DATE_SOURCE',
         'TIMELINE_DATE_REASON', 'TIMELINE_COORDINATE_SYSTEM', 'TIMEPOINT_SOURCE',
     ]
+    SLIDE_TYPES = ('H&E', 'IHC', 'Other', 'Unknown')
     REQUIRED_VALUES = {
         'PATIENT_ID', 'IMAGE_ID', 'PART_KEY', 'BLOCK_KEY', 'MATCH_LEVEL',
         'SPECIMEN_KEY', 'IS_HNE', 'IS_IHC', 'CAN_SERVE_TILES',
@@ -4103,6 +4104,23 @@ class WsiRowChecks(object):
                 except ValueError:
                     self._error('WSI numeric value is invalid', line_number,
                                 column(name), row[name])
+
+        # The native wsi_slide table enforced these as CHECK constraints
+        # (wsi_slide_type_valid and wsi_slide_stain_flags_valid).
+        slide_type = row['SLIDE_TYPE']
+        if slide_type not in self.SLIDE_TYPES:
+            self._error('WSI SLIDE_TYPE must be H&E, IHC, Other, or Unknown', line_number,
+                        column('SLIDE_TYPE'), slide_type)
+        elif row['IS_HNE'] in ('TRUE', 'FALSE') and row['IS_IHC'] in ('TRUE', 'FALSE'):
+            is_hne = row['IS_HNE'] == 'TRUE'
+            is_ihc = row['IS_IHC'] == 'TRUE'
+            if ((is_hne and is_ihc)
+                    or (slide_type == 'H&E' and not is_hne)
+                    or (slide_type == 'IHC' and not is_ihc)
+                    or (slide_type in ('Other', 'Unknown') and (is_hne or is_ihc))):
+                self._error('WSI IS_HNE/IS_IHC are inconsistent with SLIDE_TYPE', line_number,
+                            column('SLIDE_TYPE'),
+                            '%s: IS_HNE=%s, IS_IHC=%s' % (slide_type, row['IS_HNE'], row['IS_IHC']))
 
         timeline_start = row['TIMELINE_START_DAYS']
         if timeline_start:

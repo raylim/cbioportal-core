@@ -252,6 +252,18 @@ class ConverterInputTestCase(ConverterTestCase):
         rows[3] = rows[3].replace('\tUNMATCHED\t', '\tPART\t', 1)
         self.assertConversionError('matched rows require SAMPLE_ID', meta=self.write_legacy(rows))
 
+    def test_slide_type_and_stain_flags_follow_native_constraints(self):
+        slide_type = converter.COLUMNS.index('SLIDE_TYPE')
+        is_hne = converter.COLUMNS.index('IS_HNE')
+        for column, value, message in ((slide_type, 'Frozen', 'SLIDE_TYPE must be one of'),
+                                       (slide_type, '', 'SLIDE_TYPE must be one of'),
+                                       (is_hne, 'FALSE', 'inconsistent with SLIDE_TYPE H&E')):
+            rows = self.fixture_rows()
+            fields = rows[0].split('\t')
+            fields[column] = value
+            rows[0] = '\t'.join(fields)
+            self.assertConversionError(message, meta=self.write_legacy(rows))
+
     def test_duplicate_image_is_rejected(self):
         rows = self.fixture_rows()
         self.assertConversionError('IMAGE_ID is not unique', meta=self.write_legacy(rows + rows[:1]))
