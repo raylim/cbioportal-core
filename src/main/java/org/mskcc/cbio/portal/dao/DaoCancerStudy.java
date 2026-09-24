@@ -546,9 +546,23 @@ public final class DaoCancerStudy {
 
             ClickHouseBulkDeleter.flushAll();
 
+            // The native WSI tables are deprecated but retained: studies loaded by the legacy
+            // ImportWsiData path must still be removed completely.
+            // ClickHouse 24.7+ rejects lightweight deletes against tables with
+            // projections unless the query explicitly opts into projection
+            // maintenance. Keep WSI lifecycle deletes portable across server
+            // profiles rather than relying on a deployment-wide user setting.
+            deleteByStudyId("DELETE FROM wsi_patient WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM wsi_part WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM wsi_block WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM wsi_slide WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM wsi_slide_placement WHERE cancer_study_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM wsi_slide_timing WHERE cancer_study_id=?", internalCancerStudyId);
+
             deleteByStudyId("DELETE FROM clinical_attribute_meta WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM resource_definition WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId("DELETE FROM resource_data WHERE cancer_study_id=?", internalCancerStudyId);
+            // resource_data declares its columns in upper case; ClickHouse identifiers are case-sensitive.
+            deleteByStudyId("DELETE FROM resource_data WHERE CANCER_STUDY_ID=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM cancer_study_tags WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM copy_number_seg WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM copy_number_seg_file WHERE cancer_study_id=?", internalCancerStudyId);
@@ -620,6 +634,18 @@ public final class DaoCancerStudy {
         try {
             con = JdbcUtil.getDbConnection(DaoCancerStudy.class);
             if (sql.startsWith("DELETE FROM wsi_")) {
+                // The deprecated native WSI tables are only populated by the legacy
+                // ImportWsiData entry point. Skip the mutation (and its server-version
+                // specific projection setting) when the study has no rows there.
+                String countSql = sql.replaceFirst("^DELETE FROM ", "SELECT count() FROM ");
+                try (PreparedStatement countStmt = con.prepareStatement(countSql)) {
+                    countStmt.setInt(1, cancerStudyId);
+                    try (ResultSet rs = countStmt.executeQuery()) {
+                        if (rs.next() && rs.getLong(1) == 0) {
+                            return;
+                        }
+                    }
+                }
                 // The ClickHouse HTTP JDBC driver does not preserve SET
                 // statements between requests. Use a literal, integer-only
                 // WSI query so the projection setting travels with DELETE.

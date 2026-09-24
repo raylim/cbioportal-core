@@ -83,23 +83,27 @@ public final class DaoResourceData {
         PreparedStatement pstmt = null;
         ResultSet rs = null;
         try {
+            // RESOURCE_DATA_ID has no server-side default: allocate it from the same
+            // sequence as the bulk-load path so both paths produce unique row IDs.
+            long resourceDataId = ClickHouseAutoIncrement.nextId("seq_resource_data");
             con = JdbcUtil.getDbConnection(DaoResourceData.class);
             pstmt = con.prepareStatement(
                 "INSERT INTO `" + RESOURCE_DATA_TABLE + "` "
-                + "(`RESOURCE_ID`,`CANCER_STUDY_ID`,`ENTITY_TYPE`,"
+                + "(`RESOURCE_DATA_ID`,`RESOURCE_ID`,`CANCER_STUDY_ID`,`ENTITY_TYPE`,"
                 + "`PATIENT_ID`,`SAMPLE_ID`,`URL`,"
                 + "`DISPLAY_NAME`,`TYPE`,`METADATA`) "
-                + "VALUES (?,?,?,?,?,?,?,?,?)"
+                + "VALUES (?,?,?,?,?,?,?,?,?,?)"
             );
-            pstmt.setString(1, resourceId);
-            pstmt.setInt(2, cancerStudyId);
-            pstmt.setString(3, entityType);
-            pstmt.setString(4, patientId);
-            pstmt.setString(5, sampleId);
-            pstmt.setString(6, url);
-            pstmt.setString(7, displayName);
-            pstmt.setString(8, type);
-            pstmt.setString(9, metadata);
+            pstmt.setLong(1, resourceDataId);
+            pstmt.setString(2, resourceId);
+            pstmt.setInt(3, cancerStudyId);
+            pstmt.setString(4, entityType);
+            pstmt.setString(5, patientId);
+            pstmt.setString(6, sampleId);
+            pstmt.setString(7, url);
+            pstmt.setString(8, displayName);
+            pstmt.setString(9, type);
+            pstmt.setString(10, metadata);
             return pstmt.executeUpdate();
         } catch (SQLException e) {
             throw new DaoException(e);
@@ -128,22 +132,64 @@ public final class DaoResourceData {
         ClickHouseBulkDeleter.flushAll();
     }
 
+    /**
+     * Queues deletion of the {@code resource_data} rows attached to the given samples of a
+     * study. The rows are removed by the next {@link ClickHouseBulkDeleter#flushAll()}, so
+     * callers can combine this with the other per-sample deletes they already batch.
+     *
+     * @param cancerStudyId   internal cancer-study ID
+     * @param sampleStableIds stable sample IDs; a no-op if empty
+     */
+    public static void addSampleResourceDataToBulkDelete(int cancerStudyId, Set<String> sampleStableIds)
+            throws DaoException {
+        addEntityResourceDataToBulkDelete(cancerStudyId, "SAMPLE_ID", sampleStableIds);
+    }
+
+    /**
+     * Queues deletion of every {@code resource_data} row attached to the given patients of a
+     * study, including sample-level rows that carry the patient ID. The rows are removed by
+     * the next {@link ClickHouseBulkDeleter#flushAll()}.
+     *
+     * @param cancerStudyId    internal cancer-study ID
+     * @param patientStableIds stable patient IDs; a no-op if empty
+     */
+    public static void addPatientResourceDataToBulkDelete(int cancerStudyId, Set<String> patientStableIds)
+            throws DaoException {
+        addEntityResourceDataToBulkDelete(cancerStudyId, "PATIENT_ID", patientStableIds);
+    }
+
+    private static void addEntityResourceDataToBulkDelete(int cancerStudyId, String entityColumn,
+            Set<String> stableIds) throws DaoException {
+        if (stableIds == null || stableIds.isEmpty()) {
+            return;
+        }
+        Set<Long> idsToDelete = findResourceDataIds(cancerStudyId, entityColumn, stableIds);
+        if (!idsToDelete.isEmpty()) {
+            ClickHouseBulkDeleter.getBulkDeleter(RESOURCE_DATA_TABLE, "RESOURCE_DATA_ID").addIds(idsToDelete);
+        }
+    }
+
     private static Set<Long> findResourceDataIds(int cancerStudyId, Set<String> resourceIds) throws DaoException {
+        return findResourceDataIds(cancerStudyId, "RESOURCE_ID", resourceIds);
+    }
+
+    private static Set<Long> findResourceDataIds(int cancerStudyId, String filterColumn, Set<String> values)
+            throws DaoException {
         Set<Long> ids = new HashSet<>();
         Connection con = null;
         PreparedStatement pstmt = null;
         ResultSet rs = null;
         try {
             con = JdbcUtil.getDbConnection(DaoResourceData.class);
-            String placeholders = resourceIds.stream().map(id -> "?").collect(Collectors.joining(","));
+            String placeholders = values.stream().map(id -> "?").collect(Collectors.joining(","));
             pstmt = con.prepareStatement(
                 "SELECT `RESOURCE_DATA_ID` FROM `" + RESOURCE_DATA_TABLE + "` "
-                + "WHERE `CANCER_STUDY_ID` = ? AND `RESOURCE_ID` IN (" + placeholders + ")"
+                + "WHERE `CANCER_STUDY_ID` = ? AND `" + filterColumn + "` IN (" + placeholders + ")"
             );
             int paramIndex = 1;
             pstmt.setInt(paramIndex++, cancerStudyId);
-            for (String resourceId : resourceIds) {
-                pstmt.setString(paramIndex++, resourceId);
+            for (String value : values) {
+                pstmt.setString(paramIndex++, value);
             }
             rs = pstmt.executeQuery();
             while (rs.next()) {
