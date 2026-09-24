@@ -16,7 +16,7 @@ from urllib.parse import quote
 SAMPLE_RESOURCE_ID = "WSI_SAMPLE"
 PATIENT_RESOURCE_ID = "WSI_PATIENT"
 PUBLIC_FIELDS = {
-    "IMAGE_ID", "PART_KEY", "PART_NUMBER", "PART_DESIGNATOR", "PART_TYPE",
+    "IMAGE_ID", "REFERENCE_SAMPLE_ID", "PART_KEY", "PART_NUMBER", "PART_DESIGNATOR", "PART_TYPE",
     "PART_DESCRIPTION", "SUBSPECIALTY", "PATH_DX_TITLE", "BLOCK_KEY",
     "BLOCK_NUMBER", "BLOCK_LABEL", "MATCH_LEVEL", "SPECIMEN_KEY", "STAIN_NAME",
     "STAIN_GROUP", "IS_HNE", "IS_IHC", "MAGNIFICATION", "FILE_SIZE_BYTES",
@@ -56,8 +56,16 @@ def metadata(row: dict[str, str]) -> str:
             return int(raw)
         return raw
 
-    value = {key.lower(): typed(key) for key in PUBLIC_FIELDS if typed(key) is not None}
-    serving = {key.lower(): typed(key) for key in SERVING_FIELDS if typed(key) is not None}
+    value = {}
+    for key in PUBLIC_FIELDS:
+        converted = typed(key)
+        if converted is not None:
+            value[key.lower()] = converted
+    serving = {}
+    for key in SERVING_FIELDS:
+        converted = typed(key)
+        if converted is not None:
+            serving[key.lower()] = converted
     if "tile_metadata_json" in serving:
         serving["tile_metadata_json"] = json.loads(serving["tile_metadata_json"])
     value["wsi_serving"] = serving

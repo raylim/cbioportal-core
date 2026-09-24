@@ -390,12 +390,10 @@ def process_study_directory(jvm_args, study_directory, update_generic_assay_enti
             cna_long_filepair = (
                 (meta_filename, os.path.join(study_directory, meta_dictionary['data_filename'])))
         elif meta_file_type == MetaFileTypes.WSI:
-            if wsi_filepair is not None:
-                raise RuntimeError(
-                    'Multiple WSI files found: {} and {}'.format(
-                        wsi_filepair[0], meta_filename))
-            wsi_filepair = (
-                meta_filename, os.path.join(study_directory, meta_dictionary['data_filename']))
+            raise RuntimeError(
+                'Legacy meta_wsi input is no longer imported. Convert it with '
+                'scripts/importer/convertWsiToResources.py and import the generated '
+                'resource definition and resource data files instead.')
         # Add all other types of data
         else:
             regular_filepairs.append(
