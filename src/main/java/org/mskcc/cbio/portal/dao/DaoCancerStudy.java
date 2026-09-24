@@ -540,28 +540,15 @@ public final class DaoCancerStudy {
             ClickHouseBulkDeleter.getBulkDeleter("sample_list_list", "list_id").addIds(sampleListIds);
 
             ClickHouseBulkDeleter.getBulkDeleter("clinical_sample", "internal_id").addIds(sampleIds);
-            ClickHouseBulkDeleter.getBulkDeleter("resource_sample", "internal_id").addIds(sampleIds);
 
             ClickHouseBulkDeleter.getBulkDeleter("sample", "internal_id").addIds(sampleIds);
             ClickHouseBulkDeleter.getBulkDeleter("clinical_patient", "internal_id").addIds(patientIds);
-            ClickHouseBulkDeleter.getBulkDeleter("resource_patient", "internal_id").addIds(patientIds);
 
             ClickHouseBulkDeleter.flushAll();
 
-            // ClickHouse 24.7+ rejects lightweight deletes against tables with
-            // projections unless the query explicitly opts into projection
-            // maintenance. Keep WSI lifecycle deletes portable across server
-            // profiles rather than relying on a deployment-wide user setting.
-            deleteByStudyId("DELETE FROM wsi_patient WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId("DELETE FROM wsi_part WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId("DELETE FROM wsi_block WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId("DELETE FROM wsi_slide WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId("DELETE FROM wsi_slide_placement WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId("DELETE FROM wsi_slide_timing WHERE cancer_study_id=?", internalCancerStudyId);
-
             deleteByStudyId("DELETE FROM clinical_attribute_meta WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM resource_definition WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId("DELETE FROM resource_study WHERE internal_id=?", internalCancerStudyId);
+            deleteByStudyId("DELETE FROM resource_data WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM cancer_study_tags WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM copy_number_seg WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM copy_number_seg_file WHERE cancer_study_id=?", internalCancerStudyId);

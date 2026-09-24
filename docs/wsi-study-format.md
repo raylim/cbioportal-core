@@ -28,6 +28,21 @@ publication mechanism. The export must wait until artifact generation and
 metadata publication are complete, and any producer-side metadata needed for
 serving must be finalized before the study is imported.
 
+## Migrating to Resource Data v2
+
+Format-v3 WSI files are a legacy import source. Convert them before loading a
+resource-backed release:
+
+```bash
+python scripts/importer/convertWsiToResources.py \
+  --meta-wsi /path/to/meta_wsi.txt --output-dir /path/to/resources
+```
+
+The converter writes standard resource-definition, sample-resource, and
+patient-resource files. Matched slides are emitted as <code>WSI_SAMPLE</code>
+resources and unmatched slides as <code>WSI_PATIENT</code> resources. Viewer
+metadata, timing, and serving fields are retained in the row metadata.
+
 ## Metadata
 
 ```text

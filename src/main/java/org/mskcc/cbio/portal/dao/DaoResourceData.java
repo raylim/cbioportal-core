@@ -3,7 +3,6 @@ package org.mskcc.cbio.portal.dao;
 import java.sql.*;
 import java.util.HashSet;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 /**
@@ -26,10 +25,6 @@ import java.util.stream.Collectors;
 public final class DaoResourceData {
 
     public static final String RESOURCE_DATA_TABLE = "resource_data";
-
-    // Monotonically increasing ID for bulk-load inserts into resource_data.
-    // ClickHouse has no AUTO_INCREMENT; uniqueness is not enforced by the engine.
-    private static final AtomicLong resourceDataIdSeq = new AtomicLong(System.currentTimeMillis());
 
     private DaoResourceData() {
     }
@@ -70,7 +65,7 @@ public final class DaoResourceData {
             // neither that nor "SAMPLE_ID IN (...)", so such rows would be silently dropped from
             // every cohort-scoped query and miscounted by the distinct-sample count.
             ClickHouseBulkLoader.getClickHouseBulkLoader(RESOURCE_DATA_TABLE).insertRecord(
-                Long.toString(resourceDataIdSeq.incrementAndGet()),
+                Long.toString(ClickHouseAutoIncrement.nextId("seq_resource_data")),
                 resourceId,
                 Integer.toString(cancerStudyId),
                 entityType,
@@ -162,4 +157,3 @@ public final class DaoResourceData {
         return ids;
     }
 }
-
