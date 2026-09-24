@@ -1,11 +1,17 @@
 # WSI study import
 
 cBioPortal core is the sole database writer for whole-slide-image (WSI)
-studies. An upstream artifact-generation/export pipeline produces a normal
-study directory with `meta_wsi.txt` and `data_wsi.txt`; the tile server only
+studies. Slides are imported as standard resource data: an upstream
+artifact-generation/export pipeline produces a normal study directory whose
+resource files describe the slides, `validateData.py` checks them, and
+`metaImport.py` loads them with the rest of the study. The tile server only
 serves the source and thumbnail artifacts returned by cBioPortal. The upstream
 pipeline is deployment-specific and may use Databricks, scripts, or another
 service; Databricks is not required by cBioPortal core.
+
+Legacy format-v3 `meta_wsi.txt`/`data_wsi.txt` pairs are no longer imported.
+Validation and import both fail for a study that still contains `meta_wsi.txt`;
+convert it offline first (see [Converting legacy files](#converting-legacy-format-v3-files)).
 
 ## Upstream artifact publication
 
@@ -13,8 +19,8 @@ Before the study files are imported, an upstream artifact-generation/export
 pipeline must read or receive the eligible slide inventory and source rows,
 generate the required master thumbnails and tile metadata, store the artifacts
 where the deployment's tile-serving layer can access them, and materialize the
-artifact fields below into `data_wsi.txt`. The pipeline must set
-`CAN_SERVE_TILES` consistently with the availability of the required source,
+artifact fields below into the study files. The pipeline must set
+`can_serve_tiles` consistently with the availability of the required source,
 tile-metadata, and thumbnail fields. An implementation may maintain a
 registry, perform canonical-association queries, or use a completion watermark,
 but those details are producer-specific and are not part of the cBioPortal core
@@ -28,22 +34,141 @@ publication mechanism. The export must wait until artifact generation and
 metadata publication are complete, and any producer-side metadata needed for
 serving must be finalized before the study is imported.
 
-## Migrating to Resource Data v2
+## Resource files
 
-Format-v3 WSI files are a legacy import source. Convert them before loading a
-resource-backed release:
+WSI slides use the standard resource definition, sample resource, and patient
+resource file pairs:
+
+- `WSI_SAMPLE` (resource type `SAMPLE`): slides matched to a sample
+  (`match_level` `PART` or `BLOCK`), one row per slide in the sample resource
+  file with columns `PATIENT_ID SAMPLE_ID RESOURCE_ID URL DISPLAY_NAME TYPE METADATA`.
+- `WSI_PATIENT` (resource type `PATIENT`): unmatched slides, one row per slide
+  in the patient resource file with columns
+  `PATIENT_ID RESOURCE_ID URL DISPLAY_NAME TYPE METADATA`.
+
+Both use `TYPE=WHOLE_SLIDE_IMAGE`, and the `WSI_SAMPLE`/`WSI_PATIENT` IDs are
+reserved for that type. Files are raw tab-separated text: values are not
+quoted, and no value may contain a tab or line break. `METADATA` is one compact
+JSON object per row whose keys are the lower-cased format-v3 column names:
+
+- strings: `image_id`, `reference_sample_id`, `part_key`, `part_number`,
+  `part_designator`, `part_type`, `part_description`, `subspecialty`,
+  `path_dx_title`, `block_key`, `block_number`, `block_label`, `match_level`,
+  `specimen_key`, `stain_name`, `stain_group`, `magnification`, `barcode`,
+  `slide_type`, `timeline_date_status`, `timeline_date_kind`,
+  `timeline_date_source`, `timeline_date_reason`,
+  `timeline_coordinate_system`, `timepoint_source`;
+- JSON booleans: `is_hne`, `is_ihc`, `can_serve_tiles`;
+- JSON integers: `file_size_bytes`, `timeline_start_days`;
+- `wsi_serving`: an object with `source_url`, `tile_metadata_json` (a JSON
+  object, not a string), `thumbnail_url`, `thumbnail_width`,
+  `thumbnail_height` (integers) and `thumbnail_content_type`. It is empty for
+  slides that cannot serve tiles.
+
+`wsi_serving` is private: the backend strips it from generic resource
+responses and only returns it through the authorized WSI access endpoint.
+Missing keys are treated as absent values.
+
+For every `WHOLE_SLIDE_IMAGE` row, `validateData.py` applies the same checks
+as the legacy WSI validator described under [Legacy format](#legacy-format-v3):
+required hierarchy keys, typed values, consistent timing, `match_level`
+agreement with the file type (sample rows are matched, patient rows are
+unmatched), `image_id` unique across both files of the study, consistent part
+and block metadata, the sample and reference sample belonging to the row's
+patient, and the `wsi_serving` shape and URL safety rules. The row's
+`RESOURCE_ID` must be `WSI_SAMPLE` in sample files and `WSI_PATIENT` in
+patient files.
+
+`URL` is the link opened from the Files & Links tab. The supported viewer link
+is the standalone viewer route:
+
+```text
+<portal base URL>/wsi/patient/<patient ID>?studyId=<study ID>&imageId=<image ID>
+```
+
+The base URL is absolute and includes any context path the portal is deployed
+under; each path and query value is percent-encoded.
+
+## Converting legacy format-v3 files
+
+`scripts/importer/convertWsiToResources.py` converts a legacy pair offline. It
+never contacts cBioPortal, a database, or the artifact store.
 
 ```bash
 python scripts/importer/convertWsiToResources.py \
-  --meta-wsi /path/to/meta_wsi.txt --output-dir /path/to/resources
+  --meta-wsi /path/to/legacy/meta_wsi.txt \
+  --output-dir /path/to/converted \
+  --portal-base-url https://portal.example.org/cbioportal \
+  --study-dir /path/to/study
 ```
 
-The converter writes standard resource-definition, sample-resource, and
-patient-resource files. Matched slides are emitted as <code>WSI_SAMPLE</code>
-resources and unmatched slides as <code>WSI_PATIENT</code> resources. Viewer
-metadata, timing, and serving fields are retained in the row metadata.
+- `--meta-wsi` (required): the legacy meta file; its `data_filename` is read
+  from the same directory.
+- `--output-dir` (required): where the converted files are written.
+- `--portal-base-url` (required): absolute `http`/`https` URL of the portal,
+  optionally with a context path; a trailing slash is ignored. It builds the
+  viewer links shown above.
+- `--study-dir` (optional): the study the output will join. The converter
+  fails without writing anything if a clinical file there already defines any
+  of the six `WSI_*` count attributes, or if the study already has a resource
+  definition, sample resource, or patient resource file.
 
-## Metadata
+Rows are parsed like the retired native importer: leading `#` rows are
+skipped, the header must match format v3 exactly, `MATCH_LEVEL` must agree
+with `SAMPLE_ID`, an `UNMATCHED` reference sample is dropped, a missing
+`TIMEPOINT_SOURCE` is derived from the timing provenance, and serving fields
+are dropped when `CAN_SERVE_TILES=FALSE`. Run `validateData.py` on the study
+afterwards; the converter does not re-implement URL allowlists or the tile
+metadata contract.
+
+The converter writes these meta/data pairs, each only when it has rows:
+
+| Files | Content |
+| --- | --- |
+| `meta_resource_definition.txt`, `data_resource_definition.txt` | `WSI_SAMPLE` and/or `WSI_PATIENT` definitions |
+| `meta_resource_sample.txt`, `data_resource_sample.txt` | matched slides |
+| `meta_resource_patient.txt`, `data_resource_patient.txt` | unmatched slides |
+| `meta_clinical_sample_wsi_counts.txt`, `data_clinical_sample_wsi_counts.txt` | sample slide counts |
+| `meta_clinical_patient_wsi_counts.txt`, `data_clinical_patient_wsi_counts.txt` | patient slide counts |
+
+A study may contain only one clinical sample file, one clinical patient file,
+and one file of each resource type. If the study already has one, merge the
+converted rows or columns into it instead of adding the converted pair.
+
+### Slide counts
+
+The count files carry the attributes the native importer used to write, as
+`NUMBER` attributes with priority 1:
+
+| Attribute | Display name |
+| --- | --- |
+| `WSI_SAMPLE_SLIDE_COUNT` | WSI Slides per Sample |
+| `WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT` | WSI Slides per Sample, Part-matched |
+| `WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT` | WSI Slides per Sample, Block-matched |
+| `WSI_PATIENT_SLIDE_COUNT` | WSI Slides per Patient |
+| `WSI_PATIENT_PART_MATCHED_SLIDE_COUNT` | WSI Slides per Patient, Part-matched |
+| `WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT` | WSI Slides per Patient, Block-matched |
+
+Each `IMAGE_ID` counts once. Sample counts cover matched slides only, so only
+samples with a matched slide get a row. Patient counts include unmatched
+slides, so every patient with a slide gets a row. Part and block counts follow
+`MATCH_LEVEL`, and zero is written for an entity that has a row. Slides that
+cannot serve tiles are counted. Study View uses the patient-level values so
+pagination cannot produce partial totals. Because the counts are ordinary
+clinical data, re-importing corrected files replaces them.
+
+### Timeline
+
+The converter does not produce timeline data. Pathology procedure events stay
+in the study's existing clinical timeline files, which are imported unchanged.
+The slide timing fields in `METADATA` drive the WSI hierarchy (including the
+undated section) and do not create clinical events.
+
+## Legacy format v3
+
+This is the converter's input format.
+
+### Legacy metadata
 
 ```text
 cancer_study_identifier: <study stable id>
@@ -53,7 +178,7 @@ data_filename: data_wsi.txt
 format_version: 3
 ```
 
-The importer rejects unsupported format versions. A study may contain one WSI
+The converter rejects unsupported format versions. A legacy study has one WSI
 pair. The data file follows the normal cBioPortal five-row preamble: four
 comment rows, followed by this exact header:
 
@@ -90,60 +215,27 @@ extension, or thumbnail URI extension; those choices belong to the serving
 layer. Deployments may restrict source and thumbnail roots with the
 `WSI_ALLOWED_SOURCE_PREFIXES` and `WSI_ALLOWED_THUMBNAIL_PREFIXES` environment
 variables.
-Non-servable rows have those artifact columns stored as null. The importer
-does not perform de-identification scanning; upstream publication pipelines are
+The converter drops those artifact columns for non-servable rows. Core does
+not perform de-identification scanning; upstream publication pipelines are
 responsible for removing protected health information and deployment-specific
 identifiers before export. Production deployments should set both URI prefix
 allowlists; development may explicitly include `file:///app/testdata/`.
 
-The importer assumes these values were already materialized by the upstream
-artifact-generation/export pipeline. It does not discover source slides,
-generate thumbnails, read a producer-specific registry, or write the object
-store.
+The converter and validator assume these values were already materialized by
+the upstream artifact-generation/export pipeline. They do not discover source
+slides, generate thumbnails, read a producer-specific registry, or write the
+object store.
 
-## Import commands
+## ClickHouse storage
 
-Full study import:
+Resource rows are stored in `resource_data` and definitions in
+`resource_definition`. Resource row IDs (`RESOURCE_DATA_ID`) come from the
+importer's sequence, so they stay unique across importer processes.
+Re-importing a resource file replaces the study's rows for the resource IDs in
+that file, and study deletion removes them.
 
-```bash
-metaImport.py -s /path/to/study
-```
-
-WSI snapshots are loaded as part of a full study import into the inactive
-blue/green database. WSI is not supported by incremental (`metaImport.py -d`)
-imports. WSI loading runs after clinical sample definitions and before a full
-study is marked `AVAILABLE`.
-
-During the WSI load, the importer also writes sample-level clinical attributes
-(`WSI_SAMPLE_SLIDE_COUNT`, `WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT`, and
-`WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT`) and authoritative patient-level
-attributes (`WSI_PATIENT_SLIDE_COUNT`, `WSI_PATIENT_PART_MATCHED_SLIDE_COUNT`,
-and `WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT`). Study View uses the patient-level
-values so pagination cannot produce partial totals, and falls back to summing
-sample values for older studies. Existing count attributes are preserved when a
-generated WSI count clinical file was loaded earlier in the same full import.
-
-## ClickHouse snapshot
-
-The importer resolves the stable identifiers to internal IDs and normalizes
-the flat file into these tables:
-
-- `wsi_patient`
-- `wsi_part`
-- `wsi_block`
-- `wsi_slide`
-- `wsi_slide_placement`
-- `wsi_slide_timing`
-The five tables are provisioned by the cBioPortal backend schema. Core does not
-create or migrate production tables. Study deletion removes the snapshot rows.
-The importer is insert-only and must run against a fresh inactive database;
-discard and rebuild that database after a failed or repeated WSI import.
-
-The backend schema also provisions the additive `wsi_slide_by_access`
-ClickHouse projection. It is ordered by `(cancer_study_id, image_id)` for the
-authenticated slide-access lookup. A production rebuild must materialize the
-projection before the new database is promoted; the importer itself does not
-perform live schema changes.
-
-The former tile-server ClickHouse loader is not supported; all WSI loads must
-use the standard cBioPortal importer.
+The native WSI tables (`wsi_patient`, `wsi_part`, `wsi_block`, `wsi_slide`,
+`wsi_slide_placement`, `wsi_slide_timing`) and the `ImportWsiData` Java entry
+point are deprecated but retained; nothing in the resource import path writes
+them. Study deletion still removes any rows a study has in them. Retiring the
+tables is a separate change.

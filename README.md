@@ -10,11 +10,19 @@ If you are a developer and want to help contribute to the cBioPortal importer co
 
 ## WSI imports
 
-The WSI importer is documented in [`docs/wsi-study-format.md`](docs/wsi-study-format.md).
-cBioPortal core is the sole ClickHouse writer for WSI snapshots. Thumbnail
-artifacts and the completed `meta_wsi.txt`/`data_wsi.txt` snapshot must be
-prepared by an upstream artifact-generation/export pipeline before
-`metaImport.py` runs. That pipeline is deployment-specific; it may use
-Databricks or another implementation. Core does not generate thumbnails or
-write the object store. Pathology procedure timing is imported separately as
-standard `PATHOLOGY SLIDES` clinical timeline data.
+Whole-slide images (WSI) are imported as standard resource data: matched slides
+are `WSI_SAMPLE` rows in the sample resource file, unmatched slides are
+`WSI_PATIENT` rows in the patient resource file, and both carry
+`TYPE=WHOLE_SLIDE_IMAGE` with the slide hierarchy, timing and serving metadata
+as JSON. `validateData.py` checks those rows against the WSI contract, and
+`metaImport.py` loads them with the other resource files. See
+[`docs/wsi-study-format.md`](docs/wsi-study-format.md).
+
+Legacy format-v3 `meta_wsi.txt`/`data_wsi.txt` pairs are no longer imported;
+convert them offline with `scripts/importer/convertWsiToResources.py`, which
+also writes the six `WSI_*` slide-count clinical attributes. The native WSI
+tables and the `ImportWsiData` Java entry point are deprecated but retained.
+Thumbnail artifacts and slide metadata must still be prepared by an upstream
+artifact-generation/export pipeline; core does not generate thumbnails or write
+the object store. Pathology procedure timing shown on the patient timeline is
+imported separately as standard clinical timeline data.
