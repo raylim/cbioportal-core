@@ -11,11 +11,13 @@ applies the same row parsing and normalization as the retired native importer
 * ``data_resource_sample.txt`` for slides matched to a sample (``PART`` or
   ``BLOCK``) and ``data_resource_patient.txt`` for unmatched slides; each row
   links to the standalone viewer and carries the slide metadata as JSON;
-* ``data_clinical_sample_wsi_counts.txt`` and
-  ``data_clinical_patient_wsi_counts.txt`` with the six ``WSI_*`` slide-count
-  attributes the native importer used to generate;
+* the six ``WSI_*`` slide-count attributes the native importer used to
+  generate: with ``--study-dir``, merged into copies of the study's clinical
+  sample and patient files (same file names); without it, as standalone
+  ``data_clinical_sample_wsi_counts.txt``/``data_clinical_patient_wsi_counts.txt``
+  pairs for studies without clinical files of their own or for hand merging;
 
-each with its meta file. A data/meta pair is only written when it has rows.
+each with its meta file. A generated data/meta pair is only written when it has rows.
 Timeline files are not produced: existing clinical timeline files stay in the
 study and are imported unchanged.
 
@@ -25,6 +27,7 @@ parsing; run ``validateData.py`` on the study after adding the files.
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -398,14 +401,17 @@ def _check_cell(value, file_name):
     return text
 
 
+def render_tsv(file_name, rows):
+    """Render raw tab-separated rows; no quoting, one physical line per record."""
+    return "\n".join("\t".join(_check_cell(value, file_name) for value in row) for row in rows) + "\n"
+
+
 def write_tsv(path, rows):
-    """Write raw tab-separated rows; no quoting, one physical line per record."""
-    lines = ["\t".join(_check_cell(value, path.name) for value in row) for row in rows]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_text(render_tsv(path.name, rows), encoding="utf-8")
 
 
-def write_meta(path, entries):
-    path.write_text("".join(f"{key}: {value}\n" for key, value in entries), encoding="utf-8")
+def render_meta(entries):
+    return "".join(f"{key}: {value}\n" for key, value in entries)
 
 
 def _clinical_header_rows(identifier_columns, attributes):
@@ -436,20 +442,38 @@ def _data_header(path):
     return []
 
 
-def check_study_conflicts(study_dir, own_outputs):
-    """Refuse to emit files that would duplicate definitions already in the study.
+def _find_clinical_meta(study_dir, datatype):
+    """Return (meta path, data path) of the study's clinical file of ``datatype``, or None."""
+    found = []
+    for meta_path in sorted(Path(study_dir).iterdir()):
+        if not meta_path.is_file() or "meta" not in meta_path.name.lower():
+            continue
+        try:
+            meta = read_meta(meta_path)
+        except ConversionError:
+            continue
+        if meta.get("genetic_alteration_type") == "CLINICAL" and meta.get("datatype") == datatype:
+            found.append((meta_path, meta))
+    if len(found) > 1:
+        raise ConversionError(
+            f"the study directory has more than one {datatype} clinical meta file "
+            f"({', '.join(path.name for path, _ in found)}); a study may contain only one")
+    if not found:
+        return None
+    meta_path, meta = found[0]
+    if not meta.get("data_filename"):
+        raise ConversionError(f"{meta_path.name}: data_filename is required")
+    return meta_path, Path(study_dir) / meta["data_filename"]
 
-    ``own_outputs`` are resolved paths the converter is about to (over)write;
-    they are ignored so the converter can be re-run into the same directory.
-    """
+
+def check_study_conflicts(study_dir):
+    """Refuse to emit files that would duplicate definitions already in the study."""
     study_dir = Path(study_dir)
-    if not study_dir.is_dir():
-        raise ConversionError(f"--study-dir is not a directory: {study_dir}")
     problems = []
     clinical_files = set(study_dir.glob("data_clinical*"))
     resource_meta = []
     for meta_path in sorted(study_dir.iterdir()):
-        if not meta_path.is_file() or "meta" not in meta_path.name.lower() or meta_path.resolve() in own_outputs:
+        if not meta_path.is_file() or "meta" not in meta_path.name.lower():
             continue
         try:
             meta = read_meta(meta_path)
@@ -460,11 +484,10 @@ def check_study_conflicts(study_dir, own_outputs):
         if meta.get("resource_type") in ("DEFINITION", "SAMPLE", "PATIENT"):
             resource_meta.append((meta_path.name, meta["resource_type"]))
     for path in sorted(clinical_files):
-        if path.resolve() in own_outputs:
-            continue
         duplicated = sorted(COUNT_ATTRIBUTE_IDS.intersection(_data_header(path)))
         if duplicated:
-            problems.append(f"{path.name} already defines {', '.join(duplicated)}")
+            problems.append(f"{path.name} already defines {', '.join(duplicated)}; remove those "
+                            f"columns first (the converted counts replace them)")
     for name, resource_type in resource_meta:
         problems.append(
             f"{name} already provides a {resource_type} resource file; a study may contain only one, "
@@ -472,13 +495,104 @@ def check_study_conflicts(study_dir, own_outputs):
     if problems:
         raise ConversionError(
             "the study directory already contains data the converter would duplicate:\n  - "
-            + "\n  - ".join(problems)
-            + "\nRemove the WSI count columns from those files (the converted counts replace them) "
-              "or merge the converted files by hand.")
+            + "\n  - ".join(problems))
+
+
+def _split_lines(text):
+    """Split text into (content, line ending) pairs, keeping endings byte for byte."""
+    lines = []
+    for chunk in re.findall(r"[^\n]*\n|[^\n]+$", text):
+        if chunk.endswith("\r\n"):
+            lines.append((chunk[:-2], "\r\n"))
+        elif chunk.endswith("\n"):
+            lines.append((chunk[:-1], "\n"))
+        else:
+            lines.append((chunk, ""))
+    return lines
+
+
+def merge_clinical_counts(data_path, attributes, key_columns, counts):
+    """Return the clinical file text with the count attributes appended.
+
+    ``key_columns`` names the identifier columns that key ``counts`` (a dict from
+    identifier tuples to three counts). Rows of entities without slides get NA,
+    as the native importer wrote no value for them. Every existing line, value and
+    line ending is kept; comment and blank lines after the header are unchanged.
+    """
+    name = data_path.name
+    try:
+        with open(data_path, encoding="utf-8", newline="") as stream:
+            text = stream.read()
+    except (OSError, UnicodeDecodeError) as error:
+        raise ConversionError(f"{name}: cannot read clinical file: {error}") from error
+    lines = _split_lines(text)
+    preamble = 0
+    while preamble < len(lines) and lines[preamble][0].startswith("#"):
+        preamble += 1
+    if preamble != 4:
+        raise ConversionError(
+            f"{name}: expected the four '#' attribute header rows before the column header, "
+            f"found {preamble}; add them so the WSI count attributes can be defined")
+    if preamble >= len(lines) or not lines[preamble][0].strip():
+        raise ConversionError(f"{name}: column header is missing")
+    header = [column.strip() for column in lines[preamble][0].split("\t")]
+    missing_columns = [column for column in key_columns if column not in header]
+    if missing_columns:
+        raise ConversionError(f"{name}: missing column {', '.join(missing_columns)}")
+    key_index = [header.index(column) for column in key_columns]
+    id_index = key_index[-1]
+    header_values = [
+        [attribute[1] for attribute in attributes],
+        [attribute[2] for attribute in attributes],
+        ["NUMBER"] * len(attributes),
+        ["1"] * len(attributes),
+    ]
+    out = []
+    for index, values in enumerate(header_values):
+        content, ending = lines[index]
+        out.append(content + "\t" + "\t".join(values) + ending)
+    content, ending = lines[preamble]
+    out.append(content + "\t" + "\t".join(attribute[0] for attribute in attributes) + ending)
+
+    counts_by_id = {key[-1]: (key, value) for key, value in counts.items()}
+    seen = {}
+    for line_number, (content, ending) in enumerate(lines[preamble + 1:], start=preamble + 2):
+        if content.startswith("#") or not content.strip():
+            out.append(content + ending)
+            continue
+        fields = content.split("\t")
+        if len(fields) != len(header):
+            raise ConversionError(f"{name}: line {line_number}: expected {len(header)} columns, "
+                                  f"found {len(fields)}")
+        identifier = fields[id_index].strip()
+        match = counts_by_id.get(identifier)
+        if match is None:
+            values = ["NA"] * len(attributes)
+        else:
+            key, value = match
+            row_key = tuple(fields[index].strip() for index in key_index)
+            if row_key != key:
+                raise ConversionError(
+                    f"{name}: line {line_number}: {key_columns[-1]} {identifier} belongs to "
+                    f"{row_key[0]} here but to {key[0]} in the WSI file")
+            values = [str(count) for count in value]
+            seen[identifier] = True
+        out.append(content + "\t" + "\t".join(values) + ending)
+    absent = [identifier for identifier in counts_by_id if identifier not in seen]
+    if absent:
+        raise ConversionError(
+            f"{name}: {key_columns[-1]} with WSI slides not found in the clinical file: "
+            + ", ".join(absent))
+    return "".join(out)
 
 
 def convert(meta_wsi, output_dir, portal_base_url, study_dir=None):
-    """Convert a legacy WSI pair; return the list of files written."""
+    """Convert a legacy WSI pair; return the list of files written.
+
+    Without ``study_dir`` the slide counts are written as standalone clinical file
+    pairs. With it, the study's clinical sample and patient files are copied to
+    ``output_dir`` under their own names with the count columns appended.
+    """
     meta_wsi = Path(meta_wsi)
     output_dir = Path(output_dir)
     base_url = normalize_base_url(portal_base_url)
@@ -502,7 +616,12 @@ def convert(meta_wsi, output_dir, portal_base_url, study_dir=None):
                                  slide["image_id"], RESOURCE_TYPE, metadata])
     by_sample, by_patient = count_slides(slides)
 
-    outputs = []  # (data file, rows, meta file, meta entries)
+    files = {}  # output file name -> content (str, or bytes for verbatim copies)
+
+    def add_pair(data_file, rows, meta_file, meta_entries):
+        files[meta_file] = render_meta(meta_entries + [("data_filename", data_file)])
+        files[data_file] = render_tsv(data_file, rows)
+
     definitions = []
     if sample_rows:
         definitions.append([SAMPLE_RESOURCE_ID, "Pathology slides",
@@ -510,53 +629,84 @@ def convert(meta_wsi, output_dir, portal_base_url, study_dir=None):
     if patient_rows:
         definitions.append([PATIENT_RESOURCE_ID, "Pathology slides",
                             "Whole-slide images not matched to a sample", "PATIENT", "FALSE", "1"])
-    outputs.append((DEFINITION_FILE,
-                    [["RESOURCE_ID", "DISPLAY_NAME", "DESCRIPTION", "RESOURCE_TYPE",
-                      "OPEN_BY_DEFAULT", "PRIORITY"]] + definitions,
-                    "meta_resource_definition.txt",
-                    [("cancer_study_identifier", study_id), ("resource_type", "DEFINITION")]))
+    add_pair(DEFINITION_FILE,
+             [["RESOURCE_ID", "DISPLAY_NAME", "DESCRIPTION", "RESOURCE_TYPE",
+               "OPEN_BY_DEFAULT", "PRIORITY"]] + definitions,
+             "meta_resource_definition.txt",
+             [("cancer_study_identifier", study_id), ("resource_type", "DEFINITION")])
     if sample_rows:
-        outputs.append((SAMPLE_RESOURCE_FILE, [RESOURCE_HEADER_SAMPLE] + sample_rows,
-                        "meta_resource_sample.txt",
-                        [("cancer_study_identifier", study_id), ("resource_type", "SAMPLE")]))
+        add_pair(SAMPLE_RESOURCE_FILE, [RESOURCE_HEADER_SAMPLE] + sample_rows,
+                 "meta_resource_sample.txt",
+                 [("cancer_study_identifier", study_id), ("resource_type", "SAMPLE")])
     if patient_rows:
-        outputs.append((PATIENT_RESOURCE_FILE, [RESOURCE_HEADER_PATIENT] + patient_rows,
-                        "meta_resource_patient.txt",
-                        [("cancer_study_identifier", study_id), ("resource_type", "PATIENT")]))
-    if by_sample:
-        outputs.append((SAMPLE_COUNTS_FILE,
-                        _clinical_header_rows(
-                            [("Patient Identifier", "Patient identifier", "PATIENT_ID"),
-                             ("Sample Identifier", "Sample identifier", "SAMPLE_ID")],
-                            SAMPLE_COUNT_ATTRIBUTES)
-                        + [[patient, sample] + [str(count) for count in counts]
-                           for (patient, sample), counts in by_sample.items()],
-                        "meta_clinical_sample_wsi_counts.txt",
-                        [("cancer_study_identifier", study_id),
-                         ("genetic_alteration_type", "CLINICAL"),
-                         ("datatype", "SAMPLE_ATTRIBUTES")]))
-    outputs.append((PATIENT_COUNTS_FILE,
-                    _clinical_header_rows(
-                        [("Patient Identifier", "Patient identifier", "PATIENT_ID")],
-                        PATIENT_COUNT_ATTRIBUTES)
-                    + [[patient] + [str(count) for count in counts]
-                       for patient, counts in by_patient.items()],
-                    "meta_clinical_patient_wsi_counts.txt",
-                    [("cancer_study_identifier", study_id),
-                     ("genetic_alteration_type", "CLINICAL"),
-                     ("datatype", "PATIENT_ATTRIBUTES")]))
+        add_pair(PATIENT_RESOURCE_FILE, [RESOURCE_HEADER_PATIENT] + patient_rows,
+                 "meta_resource_patient.txt",
+                 [("cancer_study_identifier", study_id), ("resource_type", "PATIENT")])
 
-    own_outputs = {(output_dir / name).resolve()
-                   for data_file, _, meta_file, _ in outputs for name in (data_file, meta_file)}
-    if study_dir is not None:
-        check_study_conflicts(study_dir, own_outputs)
+    if study_dir is None:
+        if by_sample:
+            add_pair(SAMPLE_COUNTS_FILE,
+                     _clinical_header_rows(
+                         [("Patient Identifier", "Patient identifier", "PATIENT_ID"),
+                          ("Sample Identifier", "Sample identifier", "SAMPLE_ID")],
+                         SAMPLE_COUNT_ATTRIBUTES)
+                     + [[patient, sample] + [str(count) for count in counts]
+                        for (patient, sample), counts in by_sample.items()],
+                     "meta_clinical_sample_wsi_counts.txt",
+                     [("cancer_study_identifier", study_id),
+                      ("genetic_alteration_type", "CLINICAL"),
+                      ("datatype", "SAMPLE_ATTRIBUTES")])
+        add_pair(PATIENT_COUNTS_FILE,
+                 _clinical_header_rows(
+                     [("Patient Identifier", "Patient identifier", "PATIENT_ID")],
+                     PATIENT_COUNT_ATTRIBUTES)
+                 + [[patient] + [str(count) for count in counts]
+                    for patient, counts in by_patient.items()],
+                 "meta_clinical_patient_wsi_counts.txt",
+                 [("cancer_study_identifier", study_id),
+                  ("genetic_alteration_type", "CLINICAL"),
+                  ("datatype", "PATIENT_ATTRIBUTES")])
+    else:
+        study_dir = Path(study_dir)
+        if not study_dir.is_dir():
+            raise ConversionError(f"--study-dir is not a directory: {study_dir}")
+        if output_dir.resolve() == study_dir.resolve():
+            raise ConversionError("--output-dir must differ from --study-dir; the merged clinical "
+                                  "files are written under the study's own file names")
+        check_study_conflicts(study_dir)
+        merges = (
+            ("SAMPLE_ATTRIBUTES", by_sample, ("PATIENT_ID", "SAMPLE_ID"), SAMPLE_COUNT_ATTRIBUTES),
+            ("PATIENT_ATTRIBUTES", {(patient,): counts for patient, counts in by_patient.items()},
+             ("PATIENT_ID",), PATIENT_COUNT_ATTRIBUTES),
+        )
+        for datatype, counts, key_columns, attributes in merges:
+            clinical = _find_clinical_meta(study_dir, datatype)
+            if clinical is None:
+                if counts:
+                    raise ConversionError(
+                        f"the study directory has no {datatype} clinical file to merge the WSI "
+                        f"slide counts into; add one that lists "
+                        f"{'the samples' if datatype == 'SAMPLE_ATTRIBUTES' else 'the patients'} "
+                        f"with slides")
+                continue
+            meta_path, clinical_data = clinical
+            if clinical_data.name in files or meta_path.name in files:
+                raise ConversionError(
+                    f"{meta_path.name}: its file names collide with a converted resource file")
+            files[meta_path.name] = meta_path.read_bytes()
+            files[clinical_data.name] = merge_clinical_counts(
+                clinical_data, attributes, key_columns, counts)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     written = []
-    for data_file, rows, meta_file, meta_entries in outputs:
-        write_tsv(output_dir / data_file, rows)
-        write_meta(output_dir / meta_file, meta_entries + [("data_filename", data_file)])
-        written.extend([output_dir / meta_file, output_dir / data_file])
+    for name, content in files.items():
+        path = output_dir / name
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            with open(path, "w", encoding="utf-8", newline="") as stream:
+                stream.write(content)
+        written.append(path)
     return written
 
 
@@ -572,8 +722,9 @@ def interface(args=None):
                         help="absolute http(s) URL of the portal, including any context path "
                              "(e.g. https://example.org/cbioportal); used for viewer links")
     parser.add_argument("--study-dir", type=Path,
-                        help="study directory to check for clinical or resource files the output "
-                             "would duplicate")
+                        help="study directory the output joins: its clinical sample/patient files "
+                             "are copied to --output-dir with the WSI count columns appended, and "
+                             "it is checked for files the output would duplicate")
     return parser.parse_args(args)
 
 

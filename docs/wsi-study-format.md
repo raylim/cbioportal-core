@@ -111,10 +111,9 @@ python scripts/importer/convertWsiToResources.py \
 - `--portal-base-url` (required): absolute `http`/`https` URL of the portal,
   optionally with a context path; a trailing slash is ignored. It builds the
   viewer links shown above.
-- `--study-dir` (optional): the study the output will join. The converter
-  fails without writing anything if a clinical file there already defines any
-  of the six `WSI_*` count attributes, or if the study already has a resource
-  definition, sample resource, or patient resource file.
+- `--study-dir` (optional, recommended): the study the output will join. The
+  converter merges the slide counts into copies of the study's clinical files
+  (see [Slide counts](#slide-counts)). It must differ from `--output-dir`.
 
 Rows are parsed like the retired native importer: leading `#` rows are
 skipped, the header must match format v3 exactly, `MATCH_LEVEL` must agree
@@ -125,19 +124,44 @@ are dropped when `CAN_SERVE_TILES=FALSE`. Run `validateData.py` on the study
 afterwards; the converter does not re-implement URL allowlists or the tile
 metadata contract.
 
-The converter writes these meta/data pairs, each only when it has rows:
+The converter always writes the resource files; each pair is only written
+when it has rows:
 
 | Files | Content |
 | --- | --- |
 | `meta_resource_definition.txt`, `data_resource_definition.txt` | `WSI_SAMPLE` and/or `WSI_PATIENT` definitions |
 | `meta_resource_sample.txt`, `data_resource_sample.txt` | matched slides |
 | `meta_resource_patient.txt`, `data_resource_patient.txt` | unmatched slides |
-| `meta_clinical_sample_wsi_counts.txt`, `data_clinical_sample_wsi_counts.txt` | sample slide counts |
+
+With `--study-dir`, it also writes merged copies of the study's clinical sample
+and patient files, under the study's own meta and data file names (for example
+`meta_clinical_samples.txt`/`data_clinical_samples.txt`). The files are found
+through their meta files (`datatype: SAMPLE_ATTRIBUTES` or
+`PATIENT_ATTRIBUTES`); the meta files are copied unchanged. Copy the output
+directory over the study to use them.
+
+Without `--study-dir`, it writes the counts as standalone pairs instead:
+
+| Files | Content |
+| --- | --- |
+| `meta_clinical_sample_wsi_counts.txt`, `data_clinical_sample_wsi_counts.txt` | sample slide counts (only when a slide is matched) |
 | `meta_clinical_patient_wsi_counts.txt`, `data_clinical_patient_wsi_counts.txt` | patient slide counts |
 
-A study may contain only one clinical sample file, one clinical patient file,
-and one file of each resource type. If the study already has one, merge the
-converted rows or columns into it instead of adding the converted pair.
+A study may contain only one clinical sample file and one clinical patient
+file, so the standalone pairs are only for studies without clinical files of
+their own, or as input for merging by hand.
+
+With `--study-dir`, the converter fails without writing anything if:
+
+- a clinical file in the study already has any of the six `WSI_*` columns;
+- a sample or patient with slides is missing from the clinical sample or
+  patient file, or a sample belongs to a different patient there;
+- the study has more than one clinical sample or clinical patient meta file;
+- the study has no clinical patient file (every slide needs a patient count),
+  or no clinical sample file while some slide is matched to a sample;
+- a clinical file to merge lacks the four `#` attribute header rows;
+- the study already has a resource definition, sample resource, or patient
+  resource file.
 
 ### Slide counts
 
@@ -154,9 +178,14 @@ The count files carry the attributes the native importer used to write, as
 | `WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT` | WSI Slides per Patient, Block-matched |
 
 Each `IMAGE_ID` counts once. Sample counts cover matched slides only, so only
-samples with a matched slide get a row. Patient counts include unmatched
-slides, so every patient with a slide gets a row. Part and block counts follow
-`MATCH_LEVEL`, and zero is written for an entity that has a row. Slides that
+samples with a matched slide get values. Patient counts include unmatched
+slides, so every patient with a slide gets values. Part and block counts
+follow `MATCH_LEVEL`, and zero is written for an entity that has values. In a
+merged clinical file, the rows of samples or patients without slides get `NA`,
+matching the native importer, which wrote no value for them. The merge appends
+the six columns and their four header rows (display name, description,
+`NUMBER`, priority `1`); every existing line, value and line ending is kept,
+including comment and blank lines. Slides that
 cannot serve tiles are counted. Study View uses the patient-level values so
 pagination cannot produce partial totals. Because the counts are ordinary
 clinical data, re-importing corrected files replaces them.
