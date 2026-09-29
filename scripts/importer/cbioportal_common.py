@@ -83,6 +83,14 @@ class MetaFileTypes(object):
     PATIENT_RESOURCES = 'meta_resource_patient'
     STUDY_RESOURCES = 'meta_resource_study'
     RESOURCES_DEFINITION = 'meta_resource_definition'
+    WSI = 'meta_wsi'
+
+# Legacy format-v3 WSI files are no longer imported directly; both the importer and the
+# validator reject a study that still contains them with this message.
+LEGACY_WSI_IMPORT_MESSAGE = (
+    'Legacy meta_wsi input is no longer imported. Convert it with '
+    'scripts/importer/convertWsiToResources.py and import the generated '
+    'resource definition and resource data files instead.')
 
 # class to hold information about a failed java process execution
 class JavaRunException(Exception):
@@ -368,6 +376,13 @@ META_FIELD_MAP = {
         'resource_type': True,
         'data_filename': True
     },
+    MetaFileTypes.WSI: {
+        'cancer_study_identifier': True,
+        'genetic_alteration_type': True,
+        'datatype': True,
+        'data_filename': True,
+        'format_version': True,
+    },
 }
 
 # order is important! This is the order in which they should be loaded:
@@ -422,6 +437,7 @@ IMPORTER_CLASSNAME_BY_META_TYPE = {
     MetaFileTypes.PATIENT_RESOURCES: "org.mskcc.cbio.portal.scripts.ImportResourceData",
     MetaFileTypes.STUDY_RESOURCES: "org.mskcc.cbio.portal.scripts.ImportResourceData",
     MetaFileTypes.RESOURCES_DEFINITION: "org.mskcc.cbio.portal.scripts.ImportResourceDefinition",
+    MetaFileTypes.WSI: "org.mskcc.cbio.portal.scripts.ImportWsiData",
 }
 
 IMPORTER_REQUIRES_METADATA = {
@@ -433,7 +449,8 @@ IMPORTER_REQUIRES_METADATA = {
     "org.mskcc.cbio.portal.scripts.ImportTimelineData" : True,
     "org.mskcc.cbio.portal.scripts.ImportGenePanelProfileMap" : False,
     "org.mskcc.cbio.portal.scripts.ImportResourceData" : True,
-    "org.mskcc.cbio.portal.scripts.ImportResourceDefinition" : True
+    "org.mskcc.cbio.portal.scripts.ImportResourceDefinition" : True,
+    "org.mskcc.cbio.portal.scripts.ImportWsiData" : True
 }
 
 # ------------------------------------------------------------------------------
@@ -656,6 +673,8 @@ def get_meta_file_type(meta_dictionary, logger, filename):
         ("CLINICAL", "PATIENT_ATTRIBUTES"): MetaFileTypes.PATIENT_ATTRIBUTES,
         ("CLINICAL", "SAMPLE_ATTRIBUTES"): MetaFileTypes.SAMPLE_ATTRIBUTES,
         ("CLINICAL", "TIMELINE"): MetaFileTypes.TIMELINE,
+        # whole-slide images
+        ("PATHOLOGY_SLIDES", "WSI"): MetaFileTypes.WSI,
         # rppa and mass spectrometry
         ("PROTEIN_LEVEL", "LOG2-VALUE"): MetaFileTypes.PROTEIN,
         ("PROTEIN_LEVEL", "Z-SCORE"): MetaFileTypes.PROTEIN,
@@ -975,6 +994,20 @@ def parse_metadata_file(filename,
                 ' or '.join(valid_segment_reference_genomes),
                 extra={'filename_': filename,
                        'cause': meta_dictionary['reference_genome_id']})
+            meta_dictionary['meta_file_type'] = None
+
+    if meta_file_type == MetaFileTypes.WSI:
+        if meta_dictionary.get('genetic_alteration_type') != 'PATHOLOGY_SLIDES' or \
+                meta_dictionary.get('datatype') != 'WSI':
+            logger.error(
+                'WSI metadata must use genetic_alteration_type PATHOLOGY_SLIDES and datatype WSI',
+                extra={'filename_': filename})
+            meta_dictionary['meta_file_type'] = None
+        elif meta_dictionary.get('format_version') != '3':
+            logger.error(
+                "Unsupported WSI format_version; expected '3'",
+                extra={'filename_': filename,
+                       'cause': meta_dictionary.get('format_version')})
             meta_dictionary['meta_file_type'] = None
 
     if meta_file_type in [MetaFileTypes.MUTATION, MetaFileTypes.MUTATION_UNCALLED]:
