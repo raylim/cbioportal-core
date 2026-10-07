@@ -252,7 +252,8 @@ public final class DaoResourceData {
 
     /**
      * Rebuilds one study's rows of wsi_slide_table_derived from its WSI_SAMPLE resource_data rows,
-     * with metadata reduced to the slide table's public keys. Run after WSI_SAMPLE is imported so the
+     * with metadata reduced to the slide table's public keys and no display_name (the caption repeats
+     * the stain, part and block columns). Run after WSI_SAMPLE is imported so the
      * portal's study slide table matches the import without a full derived-table rebuild.
      */
     public static void refreshStudySlideTable(int cancerStudyId) throws DaoException {
@@ -266,7 +267,7 @@ public final class DaoResourceData {
             try (PreparedStatement insert = con.prepareStatement(
                     "INSERT INTO wsi_slide_table_derived "
                     + "SELECT resource_data_id, resource_id, cancer_study_id, entity_type, patient_id, "
-                    + "sample_id, url, display_name, type, "
+                    + "sample_id, url, CAST(NULL, 'Nullable(String)') AS display_name, type, "
                     + "concat('{', arrayStringConcat(arrayMap(kv -> concat(toJSONString(kv.1), ':', kv.2), "
                     + "arrayFilter(kv -> has([" + keys + "], kv.1), "
                     + "JSONExtractKeysAndValuesRaw(ifNull(metadata, '{}')))), ','), '}') "
