@@ -563,6 +563,7 @@ public final class DaoCancerStudy {
             deleteByStudyId("DELETE FROM resource_definition WHERE cancer_study_id=?", internalCancerStudyId);
             // resource_data declares its columns in upper case; ClickHouse identifiers are case-sensitive.
             deleteByStudyId("DELETE FROM resource_data WHERE cancer_study_id=?", internalCancerStudyId);
+            DaoResourceData.deleteStudySlideTable(internalCancerStudyId);
             deleteByStudyId("DELETE FROM cancer_study_tags WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM copy_number_seg WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM copy_number_seg_file WHERE cancer_study_id=?", internalCancerStudyId);

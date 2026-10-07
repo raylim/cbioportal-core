@@ -120,6 +120,18 @@ public class TestImportResourceData extends IntegrationTestBase {
         assertNull(rows.get("IMG-4").sampleId());
 
         assertUniquePositiveIds(rows.values());
+        assertStudySlideTableMatches(study);
+
+        // The study slide table keeps only the public keys, with values (including escaped text)
+        // intact.
+        JsonNode derived = JSON.readTree(singleString(
+            "SELECT metadata FROM wsi_slide_table_derived WHERE cancer_study_id = ? AND url LIKE ?",
+            study.getInternalId(), "%slideKey=2c96f13783250ad2c6bcfcd5b7c3ef22"));
+        assertEquals("Left \"upper\" lobe \\ wedge", derived.get("part_description").textValue());
+        assertEquals(0, derived.get("timeline_start_days").intValue());
+        assertTrue(derived.get("can_serve_tiles").isBoolean());
+        derived.fieldNames().forEachRemaining(key -> assertTrue(key,
+            DaoResourceData.STUDY_SLIDE_TABLE_METADATA_KEYS.contains(key)));
     }
 
     @Test
@@ -137,6 +149,7 @@ public class TestImportResourceData extends IntegrationTestBase {
         assertEquals("reimport leaves exactly one row per slide", 6L, singleLong(
             "SELECT count() FROM resource_data WHERE cancer_study_id = ? AND type = 'WHOLE_SLIDE_IMAGE'",
             study.getInternalId()));
+        assertStudySlideTableMatches(study);
         Set<Long> secondIds = ids(reimported.values());
         assertUniquePositiveIds(reimported.values());
         assertTrue("reimported IDs must not reuse earlier IDs: " + firstIds + " / " + secondIds,
@@ -156,6 +169,8 @@ public class TestImportResourceData extends IntegrationTestBase {
         assertEquals(0L, singleLong("SELECT count() FROM resource_data WHERE cancer_study_id = ?",
             study.getInternalId()));
         assertEquals(0L, singleLong("SELECT count() FROM resource_definition WHERE cancer_study_id = ?",
+            study.getInternalId()));
+        assertEquals(0L, singleLong("SELECT count() FROM wsi_slide_table_derived WHERE cancer_study_id = ?",
             study.getInternalId()));
         assertNull(DaoCancerStudy.getCancerStudyByStableId(STUDY_ID));
 
@@ -214,6 +229,43 @@ public class TestImportResourceData extends IntegrationTestBase {
             }
         }
         return rows;
+    }
+
+    /**
+     * The study slide table holds exactly the study's WSI_SAMPLE rows, by id, and none of the
+     * private or non-allowlisted slide fields.
+     */
+    private static void assertStudySlideTableMatches(CancerStudy study) throws Exception {
+        long slideRows = singleLong(
+            "SELECT count() FROM resource_data WHERE cancer_study_id = ? AND resource_id = 'WSI_SAMPLE'",
+            study.getInternalId());
+        assertTrue(slideRows > 0);
+        assertEquals(slideRows, singleLong(
+            "SELECT count() FROM wsi_slide_table_derived d INNER JOIN resource_data r "
+                + "ON r.resource_data_id = d.resource_data_id WHERE d.cancer_study_id = ? "
+                + "AND r.resource_id = 'WSI_SAMPLE'",
+            study.getInternalId()));
+        assertEquals(slideRows, singleLong(
+            "SELECT count() FROM wsi_slide_table_derived WHERE cancer_study_id = ?",
+            study.getInternalId()));
+        assertEquals(0L, singleLong(
+            "SELECT countIf(position(metadata, 'wsi_serving') > 0 OR position(metadata, 'slide_key') > 0 "
+                + "OR position(metadata, 'file_size_bytes') > 0 OR resource_id != 'WSI_SAMPLE') "
+                + "FROM wsi_slide_table_derived WHERE cancer_study_id = ?",
+            study.getInternalId()));
+    }
+
+    private static String singleString(String sql, Object... parameters) throws Exception {
+        try (Connection connection = JdbcUtil.getDbConnection(TestImportResourceData.class);
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            for (int i = 0; i < parameters.length; i++) {
+                statement.setObject(i + 1, parameters[i]);
+            }
+            try (ResultSet result = statement.executeQuery()) {
+                assertTrue(result.next());
+                return result.getString(1);
+            }
+        }
     }
 
     private static long singleLong(String sql, Object... parameters) throws Exception {
