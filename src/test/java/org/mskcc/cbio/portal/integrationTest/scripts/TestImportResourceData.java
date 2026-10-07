@@ -122,12 +122,15 @@ public class TestImportResourceData extends IntegrationTestBase {
         assertUniquePositiveIds(rows.values());
         assertStudySlideTableMatches(study);
 
-        // The study slide table keeps only the public keys, with values (including escaped text)
-        // intact.
+        // The study slide table keeps only the public keys, with values intact: part and block as
+        // numbers, not the hierarchy's labels.
         JsonNode derived = JSON.readTree(singleString(
             "SELECT metadata FROM wsi_slide_table_derived WHERE cancer_study_id = ? AND url LIKE ?",
             study.getInternalId(), "%slideKey=2c96f13783250ad2c6bcfcd5b7c3ef22"));
-        assertEquals("Left \"upper\" lobe \\ wedge", derived.get("part_description").textValue());
+        assertEquals("1", derived.get("part_number").textValue());
+        assertEquals("1", derived.get("block_number").textValue());
+        assertFalse(derived.has("part_description"));
+        assertFalse(derived.has("block_label"));
         assertEquals(0, derived.get("timeline_start_days").intValue());
         assertTrue(derived.get("can_serve_tiles").isBoolean());
         derived.fieldNames().forEachRemaining(key -> assertTrue(key,
