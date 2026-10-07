@@ -135,7 +135,6 @@ public class TestImportResourceData extends IntegrationTestBase {
         assertFalse(derived.has("part_description"));
         assertFalse(derived.has("block_label"));
         assertEquals(0, derived.get("timeline_start_days").intValue());
-        assertTrue(derived.get("can_serve_tiles").isBoolean());
         derived.fieldNames().forEachRemaining(key -> assertTrue(key,
             DaoResourceData.STUDY_SLIDE_TABLE_METADATA_KEYS.contains(key)));
     }
@@ -242,10 +241,15 @@ public class TestImportResourceData extends IntegrationTestBase {
      * private or non-allowlisted slide fields.
      */
     private static void assertStudySlideTableMatches(CancerStudy study) throws Exception {
+        // Only slides the viewer can open; the fixtures include one it cannot.
         long slideRows = singleLong(
-            "SELECT count() FROM resource_data WHERE cancer_study_id = ? AND resource_id = 'WSI_SAMPLE'",
+            "SELECT count() FROM resource_data WHERE cancer_study_id = ? AND resource_id = 'WSI_SAMPLE' "
+                + "AND JSONExtractBool(ifNull(metadata, '{}'), 'can_serve_tiles')",
             study.getInternalId());
         assertTrue(slideRows > 0);
+        assertTrue(slideRows < singleLong(
+            "SELECT count() FROM resource_data WHERE cancer_study_id = ? AND resource_id = 'WSI_SAMPLE'",
+            study.getInternalId()));
         assertEquals(slideRows, singleLong(
             "SELECT count() FROM wsi_slide_table_derived d INNER JOIN resource_data r "
                 + "ON r.resource_data_id = d.resource_data_id WHERE d.cancer_study_id = ? "

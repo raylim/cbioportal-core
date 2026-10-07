@@ -227,7 +227,7 @@ public final class DaoResourceData {
      */
     public static final java.util.List<String> STUDY_SLIDE_TABLE_METADATA_KEYS = java.util.List.of(
         "stain_name", "stain_group", "magnification", "part_number", "block_number",
-        "match_level", "timepoint_source", "timeline_start_days", "can_serve_tiles");
+        "match_level", "timepoint_source", "timeline_start_days");
 
     /** Removes one study's rows from wsi_slide_table_derived, e.g. when the study is deleted. */
     public static void deleteStudySlideTable(int cancerStudyId) throws DaoException {
@@ -253,7 +253,7 @@ public final class DaoResourceData {
     /**
      * Rebuilds one study's rows of wsi_slide_table_derived from its WSI_SAMPLE resource_data rows,
      * with metadata reduced to the slide table's public keys and no display_name (the caption repeats
-     * the stain, part and block columns). Run after WSI_SAMPLE is imported so the
+     * the stain, part and block columns), listing only slides the viewer can open (can_serve_tiles). Run after WSI_SAMPLE is imported so the
      * portal's study slide table matches the import without a full derived-table rebuild.
      */
     public static void refreshStudySlideTable(int cancerStudyId) throws DaoException {
@@ -272,7 +272,8 @@ public final class DaoResourceData {
                     + "arrayFilter(kv -> has([" + keys + "], kv.1), "
                     + "JSONExtractKeysAndValuesRaw(ifNull(metadata, '{}')))), ','), '}') "
                     + "FROM " + RESOURCE_DATA_TABLE + " "
-                    + "WHERE resource_id = '" + STUDY_SLIDE_TABLE_RESOURCE_ID + "' AND cancer_study_id = ?")) {
+                    + "WHERE resource_id = '" + STUDY_SLIDE_TABLE_RESOURCE_ID + "' AND cancer_study_id = ? "
+                    + "AND JSONExtractBool(ifNull(metadata, '{}'), 'can_serve_tiles')")) {
                 insert.setInt(1, cancerStudyId);
                 insert.executeUpdate();
             }
