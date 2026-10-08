@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Convert a legacy WSI file pair (format v3) into standard cBioPortal study files.
+"""Convert a legacy WSI file pair (format v4) into standard cBioPortal study files.
 
 The converter is deliberately offline: it never connects to cBioPortal, a
 database, or an artifact store. It reads ``meta_wsi.txt``/``data_wsi.txt``,
-applies the same row parsing and normalization as the retired native importer
-(``ImportWsiData``), and writes:
+applies the row parsing and normalization of the retired native importer, and
+writes:
 
 * ``data_resource_definition.txt`` with the ``WSI_SAMPLE``/``WSI_PATIENT``
   definitions that have rows;
@@ -13,8 +13,9 @@ applies the same row parsing and normalization as the retired native importer
   links to the standalone viewer by its opaque ``slide_key`` and carries the
   slide metadata as JSON;
 * the six ``WSI_*`` slide-count attributes the native importer used to
-  generate: with ``--study-dir``, merged into copies of the study's clinical
-  sample and patient files (same file names); without it, as standalone
+  generate, counting only viewable (``CAN_SERVE_TILES``) slides: with
+  ``--study-dir``, merged into copies of the study's clinical sample and
+  patient files (same file names); without it, as standalone
   ``data_clinical_sample_wsi_counts.txt``/``data_clinical_patient_wsi_counts.txt``
   pairs for studies without clinical files of their own or for hand merging;
 
@@ -22,11 +23,18 @@ each with its meta file. A generated data/meta pair is only written when it has 
 Timeline files are not produced: existing clinical timeline files stay in the
 study and are imported unchanged.
 
-Only format v3 is accepted: 39 columns, the slide timing on every row and the
-opaque ``SLIDE_KEY`` (32 lowercase hex characters, unique per study) last.
-De-identification (contract wsi-serving-v5, resource-data variant): the real
-``IMAGE_ID`` is kept only in the private ``wsi_serving`` metadata, the URL and
-``DISPLAY_NAME`` never contain it, ``BARCODE``/``PART_DESIGNATOR``/
+Only format v4 is accepted: 30 columns ending with the opaque ``SLIDE_KEY``
+(32 lowercase hex characters, unique per study) and ``SEALED_SOURCE``. Files
+that also carry the seven slide-timing columns before ``SLIDE_KEY`` (37
+columns) are accepted, but those columns are ignored: they are neither
+validated nor written. Files with an ``IMAGE_ID``, ``SOURCE_URL`` or
+``THUMBNAIL_URL`` column (format v3 and older) are rejected.
+De-identification (contract wsi-serving-v6, sealed source): the pathology
+image ID and the object URIs that embed it never reach the study files. The
+upstream pipeline seals them into ``SEALED_SOURCE``, an opaque value only the
+tile server can open; it is copied verbatim into the private ``wsi_serving``
+metadata of servable slides. The URL and ``DISPLAY_NAME`` carry only the
+slide key and non-identifying labels, and ``BARCODE``/``PART_DESIGNATOR``/
 ``PATH_DX_TITLE`` are not written. The data provider is responsible for
 de-identifying the remaining free-text cells. Error messages name columns,
 never values.
@@ -39,6 +47,8 @@ files.
 """
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import re
@@ -53,37 +63,40 @@ SAMPLE_RESOURCE_ID = "WSI_SAMPLE"
 PATIENT_RESOURCE_ID = "WSI_PATIENT"
 RESOURCE_TYPE = "WHOLE_SLIDE_IMAGE"
 
-# The seven slide-timing columns of format v3.
-TIMING_COLUMNS = (
+# Slide-timing columns that some files still carry before SLIDE_KEY.
+# They are accepted but ignored: neither validated nor written to the metadata.
+IGNORED_TIMING_COLUMNS = (
     "TIMELINE_START_DAYS", "TIMELINE_DATE_STATUS", "TIMELINE_DATE_KIND",
     "TIMELINE_DATE_SOURCE", "TIMELINE_DATE_REASON", "TIMELINE_COORDINATE_SYSTEM",
     "TIMEPOINT_SOURCE",
 )
-# Format version 3 (39 columns): ImportWsiData.COLUMNS followed by SLIDE_KEY.
+# Format version 4 (30 columns).
 COLUMNS = [
-    "PATIENT_ID", "REFERENCE_SAMPLE_ID", "SAMPLE_ID", "IMAGE_ID",
+    "PATIENT_ID", "REFERENCE_SAMPLE_ID", "SAMPLE_ID",
     "PART_KEY", "PART_NUMBER", "PART_DESIGNATOR", "PART_TYPE",
     "PART_DESCRIPTION", "SUBSPECIALTY", "PATH_DX_TITLE", "BLOCK_KEY",
     "BLOCK_NUMBER", "BLOCK_LABEL", "MATCH_LEVEL", "SPECIMEN_KEY",
     "STAIN_NAME", "STAIN_GROUP", "IS_HNE", "IS_IHC", "MAGNIFICATION",
-    "FILE_SIZE_BYTES", "BARCODE", "SLIDE_TYPE", "CAN_SERVE_TILES", "SOURCE_URL",
-    "TILE_METADATA_JSON", "THUMBNAIL_URL", "THUMBNAIL_WIDTH",
+    "FILE_SIZE_BYTES", "BARCODE", "SLIDE_TYPE", "CAN_SERVE_TILES",
+    "TILE_METADATA_JSON", "THUMBNAIL_WIDTH",
     "THUMBNAIL_HEIGHT", "THUMBNAIL_CONTENT_TYPE",
-    *TIMING_COLUMNS,
-    "SLIDE_KEY",
+    "SLIDE_KEY", "SEALED_SOURCE",
 ]
-FORMAT_VERSION = "3"
+# The same with the ignored timing columns before SLIDE_KEY (37 columns).
+COLUMNS_WITH_IGNORED_TIMING = COLUMNS[:-2] + list(IGNORED_TIMING_COLUMNS) + COLUMNS[-2:]
+# Format-v3 columns that carry the image ID or an object URI embedding it. A header
+# with any of them is rejected outright.
+REMOVED_COLUMNS = ("IMAGE_ID", "SOURCE_URL", "THUMBNAIL_URL")
+FORMAT_VERSION = "4"
 
 # Public metadata keys, emitted in lower case. Values the backend reads with
-# JSONExtractString stay strings (e.g. PART_NUMBER, MAGNIFICATION). IMAGE_ID,
-# BARCODE, PART_DESIGNATOR and PATH_DX_TITLE are never public.
+# JSONExtractString stay strings (e.g. PART_NUMBER, MAGNIFICATION). BARCODE,
+# PART_DESIGNATOR and PATH_DX_TITLE are never written; SEALED_SOURCE is private.
 PUBLIC_STRING_FIELDS = [
     "SLIDE_KEY", "PART_KEY", "PART_NUMBER", "PART_TYPE",
     "PART_DESCRIPTION", "SUBSPECIALTY", "BLOCK_KEY",
     "BLOCK_NUMBER", "BLOCK_LABEL", "MATCH_LEVEL", "SPECIMEN_KEY", "STAIN_NAME",
     "STAIN_GROUP", "MAGNIFICATION", "SLIDE_TYPE",
-    "TIMELINE_DATE_STATUS", "TIMELINE_DATE_KIND", "TIMELINE_DATE_SOURCE",
-    "TIMELINE_DATE_REASON", "TIMELINE_COORDINATE_SYSTEM",
 ]
 SERVING_KEY = "wsi_serving"
 # Public keys that identify a single slide or specimen, so nearly every row has its own value.
@@ -98,32 +111,32 @@ CUSTOM_METADATA = json.dumps(
 
 # Opaque per-slide key computed upstream from a salted hash of image_id.
 SLIDE_KEY_PATTERN = re.compile(r"[0-9a-f]{32}")
+# SEALED_SOURCE is unpadded base64url of nonce(12) || ciphertext || tag(16), so it
+# decodes to at least 29 bytes.
+SEALED_SOURCE_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+SEALED_SOURCE_MIN_BYTES = 12 + 1 + 16
+SEALED_SOURCE_MAX_LENGTH = 4096
 
 MATCH_LEVELS = ("BLOCK", "PART", "UNMATCHED")
-TIMELINE_STATUSES = ("AVAILABLE", "MISSING_PROCEDURE_DATE", "MISSING_REFERENCE_SEQUENCING_DATE")
-TIMELINE_KINDS = ("RECORDED", "ESTIMATED", "UNDATED")
-TIMELINE_COORDINATE_SYSTEM = "patient_first_tumor_sequencing_day_zero"
 SLIDE_TYPES = ("H&E", "IHC", "Other", "Unknown")
 
-# Names and descriptions must stay identical to ImportWsiData.insertSampleSlideCounts,
-# except WSI_PATIENT_UNDATED_SLIDE_COUNT, which only resource-data studies carry.
+# The count attributes (the retired native importer wrote the same IDs). They count only
+# slides the viewer can open.
 SAMPLE_COUNT_ATTRIBUTES = [
-    ("WSI_SAMPLE_SLIDE_COUNT", "WSI Slides per Sample",
-     "Associated pathology slide count for the sample."),
-    ("WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT", "WSI Slides per Sample, Part-matched",
-     "Associated pathology slides matched to a specimen part."),
-    ("WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT", "WSI Slides per Sample, Block-matched",
-     "Associated pathology slides matched to a specimen block."),
+    ("WSI_SAMPLE_SLIDE_COUNT", "WSI Viewable Slides per Sample",
+     "Pathology slides the slide viewer can open, for the sample."),
+    ("WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT", "WSI Viewable Slides per Sample, Part-matched",
+     "Pathology slides the slide viewer can open, for the sample, matched to a specimen part."),
+    ("WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT", "WSI Viewable Slides per Sample, Block-matched",
+     "Pathology slides the slide viewer can open, for the sample, matched to a specimen block."),
 ]
 PATIENT_COUNT_ATTRIBUTES = [
-    ("WSI_PATIENT_SLIDE_COUNT", "WSI Slides per Patient",
-     "Associated pathology slide count for the patient."),
-    ("WSI_PATIENT_PART_MATCHED_SLIDE_COUNT", "WSI Slides per Patient, Part-matched",
-     "Associated pathology slides matched to a specimen part for the patient."),
-    ("WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT", "WSI Slides per Patient, Block-matched",
-     "Associated pathology slides matched to a specimen block for the patient."),
-    ("WSI_PATIENT_UNDATED_SLIDE_COUNT", "WSI Undated Viewable Slides per Patient",
-     "Viewable pathology slides without a procedure date, which the timeline does not show."),
+    ("WSI_PATIENT_SLIDE_COUNT", "WSI Viewable Slides per Patient",
+     "Pathology slides the slide viewer can open, for the patient."),
+    ("WSI_PATIENT_PART_MATCHED_SLIDE_COUNT", "WSI Viewable Slides per Patient, Part-matched",
+     "Pathology slides the slide viewer can open, for the patient, matched to a specimen part."),
+    ("WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT", "WSI Viewable Slides per Patient, Block-matched",
+     "Pathology slides the slide viewer can open, for the patient, matched to a specimen block."),
 ]
 COUNT_ATTRIBUTE_IDS = frozenset(
     attribute[0] for attribute in SAMPLE_COUNT_ATTRIBUTES + PATIENT_COUNT_ATTRIBUTES)
@@ -164,8 +177,9 @@ def read_wsi_meta(path):
         raise ConversionError(f"{path}: WSI metadata must use PATHOLOGY_SLIDES / WSI")
     if meta.get("format_version") != FORMAT_VERSION:
         raise ConversionError(
-            f"{path}: unsupported WSI format_version; expected {FORMAT_VERSION} (format v2 is no "
-            f"longer converted: re-export data_wsi.txt as format v3 with SLIDE_KEY)")
+            f"{path}: unsupported WSI format_version; expected {FORMAT_VERSION} (older formats are "
+            f"no longer converted: re-export data_wsi.txt as format v4 with SLIDE_KEY and "
+            f"SEALED_SOURCE)")
     for field in ("cancer_study_identifier", "data_filename"):
         if not meta.get(field):
             raise ConversionError(f"{path}: {field} is required")
@@ -225,20 +239,30 @@ def _iter_lines(path, what):
         raise ConversionError(f"{path}: cannot read {what}: {error}") from error
 
 
-def iter_rows(data_path, columns=COLUMNS):
+def iter_rows(data_path, columns=None):
     """Stream the legacy data file: leading '#' rows, the exact header, then slide rows.
 
-    Yields (line number, row dict with stripped values) and raises if the file
-    has no slide rows.
+    The header must be ``columns`` or, by default, ``COLUMNS`` or
+    ``COLUMNS_WITH_IGNORED_TIMING``. Yields (line number, row dict with stripped
+    values) and raises if the file has no slide rows. Ignored timing columns
+    stay in the row dict; nothing reads them.
     """
+    accepted = [columns] if columns is not None else [COLUMNS, COLUMNS_WITH_IGNORED_TIMING]
     lines = _iter_lines(data_path, "WSI data file")
     header = None
     for line_number, line in lines:
         if not line.startswith("#"):
             header = line
             break
-    if header is None or header.split("\t") != columns:
+    removed = [column for column in REMOVED_COLUMNS
+               if header is not None and column in header.split("\t")]
+    if removed:
+        raise ConversionError(
+            f"{data_path}: WSI data has {', '.join(removed)} column(s) of format v3 or older; "
+            f"format v4 replaces them with SEALED_SOURCE: re-export data_wsi.txt")
+    if header is None or header.split("\t") not in accepted:
         raise ConversionError(f"{data_path}: WSI data has an invalid header or column order")
+    columns = header.split("\t")
     width = len(columns)
     found = False
     for line_number, line in lines:
@@ -257,7 +281,7 @@ def iter_rows(data_path, columns=COLUMNS):
         raise ConversionError(f"{data_path}: WSI data file contains no slide rows")
 
 
-def read_rows(data_path, columns=COLUMNS):
+def read_rows(data_path, columns=None):
     """Read every row of a legacy data file into a list (see iter_rows)."""
     return list(iter_rows(data_path, columns))
 
@@ -287,26 +311,15 @@ def _optional_int(row, field, line):
         _fail(line, f"invalid {field}")
 
 
-def _validate_timing(start_days, status, kind, source, reason, coordinate_system, line):
-    # Mirrors ImportWsiData.validateTiming.
-    if status not in TIMELINE_STATUSES:
-        _fail(line, "invalid TIMELINE_DATE_STATUS")
-    if kind not in TIMELINE_KINDS:
-        _fail(line, "invalid TIMELINE_DATE_KIND")
-    if not source:
-        _fail(line, "TIMELINE_DATE_SOURCE is required")
-    if coordinate_system != TIMELINE_COORDINATE_SYSTEM:
-        _fail(line, "unsupported TIMELINE_COORDINATE_SYSTEM")
-    if status == "AVAILABLE":
-        if start_days is None or kind == "UNDATED" or reason:
-            _fail(line, "AVAILABLE timing is inconsistent")
-        return
-    if start_days is not None:
-        _fail(line, "non-AVAILABLE timing cannot have TIMELINE_START_DAYS")
-    if status == "MISSING_PROCEDURE_DATE" and kind != "UNDATED":
-        _fail(line, "missing procedure date must be UNDATED")
-    if status == "MISSING_REFERENCE_SEQUENCING_DATE" and kind == "UNDATED":
-        _fail(line, "missing reference date cannot be UNDATED")
+def sealed_source_valid(value):
+    """Whether a non-empty SEALED_SOURCE has the sealed-source shape (contract wsi-serving-v6)."""
+    if len(value) > SEALED_SOURCE_MAX_LENGTH or not SEALED_SOURCE_PATTERN.fullmatch(value):
+        return False
+    try:
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (binascii.Error, ValueError):
+        return False
+    return len(decoded) >= SEALED_SOURCE_MIN_BYTES
 
 
 def stain_flags_valid(slide_type, is_hne, is_ihc):
@@ -317,17 +330,8 @@ def stain_flags_valid(slide_type, is_hne, is_ihc):
             and (slide_type not in ("Other", "Unknown") or (not is_hne and not is_ihc)))
 
 
-def derive_timepoint_source(kind, reason, source, status):
-    # Mirrors ImportWsiData.deriveTimepointSource.
-    if kind == "ESTIMATED":
-        return "Verified estimated procedure date relative to first tumor sequencing"
-    if kind == "RECORDED":
-        return "Recorded procedure date relative to first tumor sequencing"
-    return reason or source or status
-
-
 def normalize_row(row, line):
-    """Parse one row like ImportWsiData.normalize and return its metadata object."""
+    """Parse one row and return its metadata object."""
     metadata = {}
     for field in PUBLIC_STRING_FIELDS:
         if row[field]:
@@ -366,42 +370,35 @@ def normalize_row(row, line):
         if not isinstance(tile_metadata, dict):
             _fail(line, "TILE_METADATA_JSON must be a JSON object")
 
-    # The real image ID is server-side only: it lives in the private serving object.
-    serving = {"image_id": row["IMAGE_ID"]}
-    if can_serve:
-        for field in ("SOURCE_URL", "TILE_METADATA_JSON", "THUMBNAIL_URL", "THUMBNAIL_CONTENT_TYPE"):
-            _require(row, field, line)
-        for value in (thumbnail_width, thumbnail_height):
-            if value is None or not 1 <= value <= 8192:
-                _fail(line, "servable thumbnail dimensions must be between 1 and 8192")
-        serving.update({
-            "source_url": row["SOURCE_URL"],
-            "tile_metadata_json": tile_metadata,
-            "thumbnail_url": row["THUMBNAIL_URL"],
-            "thumbnail_width": thumbnail_width,
-            "thumbnail_height": thumbnail_height,
-            "thumbnail_content_type": row["THUMBNAIL_CONTENT_TYPE"],
-        })
-    # Non-servable rows carry only the image ID, as the native importer stored the rest as null.
-    metadata[SERVING_KEY] = serving
-
-    start_days = _optional_int(row, "TIMELINE_START_DAYS", line)
-    _validate_timing(start_days, row["TIMELINE_DATE_STATUS"], row["TIMELINE_DATE_KIND"],
-                     row["TIMELINE_DATE_SOURCE"], row["TIMELINE_DATE_REASON"],
-                     row["TIMELINE_COORDINATE_SYSTEM"], line)
-    if start_days is not None:
-        metadata["timeline_start_days"] = start_days
-    metadata["timepoint_source"] = row["TIMEPOINT_SOURCE"] or derive_timepoint_source(
-        row["TIMELINE_DATE_KIND"], row["TIMELINE_DATE_REASON"],
-        row["TIMELINE_DATE_SOURCE"], row["TIMELINE_DATE_STATUS"])
+    # SEALED_SOURCE is opaque and may only be opened by the tile server; never echo it.
+    sealed_source = row["SEALED_SOURCE"]
+    if sealed_source and not sealed_source_valid(sealed_source):
+        _fail(line, "SEALED_SOURCE must be unpadded base64url of at least "
+                    f"{SEALED_SOURCE_MIN_BYTES} bytes and at most {SEALED_SOURCE_MAX_LENGTH} characters")
+    if not can_serve:
+        if sealed_source:
+            _fail(line, "SEALED_SOURCE must be empty when CAN_SERVE_TILES is FALSE")
+        # Non-servable rows have no private serving object.
+        return metadata
+    for field in ("SEALED_SOURCE", "TILE_METADATA_JSON", "THUMBNAIL_CONTENT_TYPE"):
+        _require(row, field, line)
+    for value in (thumbnail_width, thumbnail_height):
+        if value is None or not 1 <= value <= 8192:
+            _fail(line, "servable thumbnail dimensions must be between 1 and 8192")
+    metadata[SERVING_KEY] = {
+        "sealed_source": sealed_source,
+        "tile_metadata_json": tile_metadata,
+        "thumbnail_width": thumbnail_width,
+        "thumbnail_height": thumbnail_height,
+        "thumbnail_content_type": row["THUMBNAIL_CONTENT_TYPE"],
+    }
     return metadata
 
 
 class SlideParser:
-    """Normalize rows one at a time, applying the cross-row checks of ImportWsiData.normalize."""
+    """Normalize rows one at a time, applying the cross-row consistency checks."""
 
     def __init__(self):
-        self.image_ids = set()
         self.slide_keys = set()
         self.patient_references = {}
         self.parts = {}
@@ -409,11 +406,6 @@ class SlideParser:
 
     def parse(self, line, row):
         patient_id = _require(row, "PATIENT_ID", line)
-        image_id = _require(row, "IMAGE_ID", line)
-        if image_id in self.image_ids:
-            # image_id is server-side only; never echo it.
-            _fail(line, "IMAGE_ID is not unique")
-        self.image_ids.add(image_id)
         slide_key = _require(row, "SLIDE_KEY", line)
         if not SLIDE_KEY_PATTERN.fullmatch(slide_key):
             _fail(line, "SLIDE_KEY must be 32 lowercase hex characters")
@@ -449,7 +441,6 @@ class SlideParser:
         return {
             "patient_id": patient_id,
             "sample_id": sample_id or None,
-            "image_id": image_id,
             "slide_key": slide_key,
             "display_name": display_name(row),
             "match_level": match_level,
@@ -464,28 +455,36 @@ def parse_slides(rows):
 
 
 class SlideCounter:
-    """Per-entity counts with the semantics of ImportWsiData.insertSampleSlideCounts.
+    """Per-entity counts of the slides the viewer can open.
 
-    One count per IMAGE_ID. Sample counts cover matched slides only, so samples
-    without a matched slide get no row; patient counts include unmatched slides,
-    so every patient with a slide gets a row. Part/block counts follow
-    MATCH_LEVEL and zeros are written for entities that have a row. Slides that
-    cannot serve tiles are counted, except in the patient's undated count, which
-    covers viewable slides without a procedure day.
+    Only viewable slides (CAN_SERVE_TILES=TRUE) are counted, one count per
+    slide (SLIDE_KEY, unique per study as SlideParser enforces). Sample counts
+    cover matched slides only, so samples without a viewable matched slide get
+    no row; patient counts include unmatched slides, so every patient with a
+    viewable slide gets a row. Part/block counts follow MATCH_LEVEL and zeros
+    are written for entities that have a row.
+
+    ``sample_keys`` and ``patient_keys`` record every entity with any slide,
+    viewable or not, since the resource rows reference all of them.
     """
 
     def __init__(self):
         self.by_sample = {}
         self.by_patient = {}
+        self.sample_keys = {}
+        self.patient_keys = {}
 
     def add(self, slide):
-        patient_counts = self.by_patient.setdefault(slide["patient_id"], [0, 0, 0, 0])
-        metadata = slide["metadata"]
-        if metadata["can_serve_tiles"] and "timeline_start_days" not in metadata:
-            patient_counts[3] += 1
-        targets = [patient_counts]
+        sample_key = None
+        self.patient_keys.setdefault((slide["patient_id"],), None)
         if slide["sample_id"] is not None:
-            targets.append(self.by_sample.setdefault((slide["patient_id"], slide["sample_id"]), [0, 0, 0]))
+            sample_key = (slide["patient_id"], slide["sample_id"])
+            self.sample_keys.setdefault(sample_key, None)
+        if not slide["metadata"]["can_serve_tiles"]:
+            return
+        targets = [self.by_patient.setdefault(slide["patient_id"], [0, 0, 0])]
+        if sample_key is not None:
+            targets.append(self.by_sample.setdefault(sample_key, [0, 0, 0]))
         for counts in targets:
             counts[0] += 1
             if slide["match_level"] == "PART":
@@ -621,12 +620,14 @@ def _split_lines(text):
     return lines
 
 
-def merge_clinical_counts(data_path, attributes, key_columns, counts):
+def merge_clinical_counts(data_path, attributes, key_columns, counts, slide_keys=None):
     """Return the clinical file text with the count attributes appended.
 
     ``key_columns`` names the identifier columns that key ``counts`` (a dict from
-    identifier tuples to one count per attribute). Rows of entities without slides get NA,
-    as the native importer wrote no value for them. Every existing line, value and
+    identifier tuples to one count per attribute). ``slide_keys`` lists every entity
+    with a slide, viewable or not (default: the keys of ``counts``); each must be in
+    the clinical file. Rows of entities without a viewable slide get NA, as the native
+    importer wrote no value for them. Every existing line, value and
     line ending is kept; comment and blank lines after the header are unchanged.
     """
     name = data_path.name
@@ -664,7 +665,9 @@ def merge_clinical_counts(data_path, attributes, key_columns, counts):
     content, ending = lines[preamble]
     out.append(content + "\t" + "\t".join(attribute[0] for attribute in attributes) + ending)
 
-    counts_by_id = {key[-1]: (key, value) for key, value in counts.items()}
+    if slide_keys is None:
+        slide_keys = counts
+    counts_by_id = {key[-1]: (key, counts.get(key)) for key in slide_keys}
     seen = {}
     for line_number, (content, ending) in enumerate(lines[preamble + 1:], start=preamble + 2):
         if content.startswith("#") or not content.strip():
@@ -685,7 +688,8 @@ def merge_clinical_counts(data_path, attributes, key_columns, counts):
                 raise ConversionError(
                     f"{name}: line {line_number}: {key_columns[-1]} {identifier} belongs to "
                     f"{row_key[0]} here but to {key[0]} in the WSI file")
-            values = [str(count) for count in value]
+            values = (["NA"] * len(attributes) if value is None
+                      else [str(count) for count in value])
             seen[identifier] = True
         out.append(content + "\t" + "\t".join(values) + ending)
     absent = [identifier for identifier in counts_by_id if identifier not in seen]
@@ -721,7 +725,7 @@ class _TsvWriter:
 
 
 def convert(meta_wsi, output_dir, portal_base_url, study_dir=None):
-    """Convert a legacy format-v3 WSI pair; return the list of files written.
+    """Convert a legacy format-v4 WSI pair; return the list of files written.
 
     Without ``study_dir`` the slide counts are written as standalone clinical file
     pairs. With it, the study's clinical sample and patient files are copied to
@@ -826,40 +830,47 @@ def _convert_into(staging, data_path, study_id, base_url, study_dir):
         write_text(meta_file, meta_entries(entries, data_file))
         write_text(data_file, render_tsv(data_file, rows))
 
+    def count_values(counts):
+        # NA (no value) for an entity whose slides are all non-viewable: its row
+        # still defines the sample or patient its resource rows refer to.
+        return ["NA"] * 3 if counts is None else [str(count) for count in counts]
+
     if study_dir is None:
-        if by_sample:
+        if counter.sample_keys:
             add_pair(SAMPLE_COUNTS_FILE,
                      _clinical_header_rows(
                          [("Patient Identifier", "Patient identifier", "PATIENT_ID"),
                           ("Sample Identifier", "Sample identifier", "SAMPLE_ID")],
                          SAMPLE_COUNT_ATTRIBUTES)
-                     + [[patient, sample] + [str(count) for count in counts]
-                        for (patient, sample), counts in by_sample.items()],
+                     + [[patient, sample] + count_values(by_sample.get((patient, sample)))
+                        for patient, sample in counter.sample_keys],
                      "meta_clinical_sample_wsi_counts.txt",
                      [("cancer_study_identifier", study_id),
                       ("genetic_alteration_type", "CLINICAL"),
                       ("datatype", "SAMPLE_ATTRIBUTES")])
-        add_pair(PATIENT_COUNTS_FILE,
-                 _clinical_header_rows(
-                     [("Patient Identifier", "Patient identifier", "PATIENT_ID")],
-                     PATIENT_COUNT_ATTRIBUTES)
-                 + [[patient] + [str(count) for count in counts]
-                    for patient, counts in by_patient.items()],
-                 "meta_clinical_patient_wsi_counts.txt",
-                 [("cancer_study_identifier", study_id),
-                  ("genetic_alteration_type", "CLINICAL"),
-                  ("datatype", "PATIENT_ATTRIBUTES")])
+        if counter.patient_keys:
+            add_pair(PATIENT_COUNTS_FILE,
+                     _clinical_header_rows(
+                         [("Patient Identifier", "Patient identifier", "PATIENT_ID")],
+                         PATIENT_COUNT_ATTRIBUTES)
+                     + [[patient] + count_values(by_patient.get(patient))
+                        for (patient,) in counter.patient_keys],
+                     "meta_clinical_patient_wsi_counts.txt",
+                     [("cancer_study_identifier", study_id),
+                      ("genetic_alteration_type", "CLINICAL"),
+                      ("datatype", "PATIENT_ATTRIBUTES")])
         return files
 
     merges = (
-        ("SAMPLE_ATTRIBUTES", by_sample, ("PATIENT_ID", "SAMPLE_ID"), SAMPLE_COUNT_ATTRIBUTES),
+        ("SAMPLE_ATTRIBUTES", by_sample, counter.sample_keys, ("PATIENT_ID", "SAMPLE_ID"),
+         SAMPLE_COUNT_ATTRIBUTES),
         ("PATIENT_ATTRIBUTES", {(patient,): counts for patient, counts in by_patient.items()},
-         ("PATIENT_ID",), PATIENT_COUNT_ATTRIBUTES),
+         counter.patient_keys, ("PATIENT_ID",), PATIENT_COUNT_ATTRIBUTES),
     )
-    for datatype, counts, key_columns, attributes in merges:
+    for datatype, counts, slide_keys, key_columns, attributes in merges:
         clinical = _find_clinical_meta(study_dir, datatype)
         if clinical is None:
-            if counts:
+            if slide_keys:
                 raise ConversionError(
                     f"the study directory has no {datatype} clinical file to merge the WSI "
                     f"slide counts into; add one that lists "
@@ -873,13 +884,14 @@ def _convert_into(staging, data_path, study_id, base_url, study_dir):
         (staging / meta_path.name).write_bytes(meta_path.read_bytes())
         files.append(meta_path.name)
         write_text(clinical_data.name, merge_clinical_counts(
-            clinical_data, attributes, key_columns, counts))
+            clinical_data, attributes, key_columns, counts, slide_keys))
     return files
 
 
 def interface(args=None):
     parser = argparse.ArgumentParser(
-        description="Convert a legacy meta_wsi/data_wsi pair (format_version 3, with SLIDE_KEY) into "
+        description="Convert a legacy meta_wsi/data_wsi pair (format_version 4, with SLIDE_KEY and "
+                    "SEALED_SOURCE) into "
                     "standard resource and clinical slide-count files. Runs offline.")
     parser.add_argument("--meta-wsi", type=Path, required=True,
                         help="path to the legacy meta_wsi.txt (its data_filename is read next to it)")

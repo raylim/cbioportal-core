@@ -7,6 +7,7 @@ committed Java integration-test fixture is checked to be current converter
 output.
 """
 
+import base64
 import json
 import logging.handlers
 import shutil
@@ -56,7 +57,19 @@ EXPECTED_FILES = [
     'meta_resource_patient.txt',
     'meta_resource_sample.txt',
 ]
-NO_ALLOWLIST = {'WSI_ALLOWED_SOURCE_PREFIXES': '', 'WSI_ALLOWED_THUMBNAIL_PREFIXES': ''}
+# Fixture slides by their opaque slide key.
+SLIDE_LABELS = {
+    '2c96f13783250ad2c6bcfcd5b7c3ef22': 'slide-1',
+    '90f033ed369247b19bd7a252e7ae86c8': 'slide-2',
+    'f9bce50b1498c94fa0fa6cce809f64f2': 'slide-3',
+    'c66ee336f70e8b59e48bd7afbf0e606d': 'slide-4',
+    'a72487fd68ef59b99fcee054e738f893': 'slide-5',
+    '3474b861eb683902b420f4ee95dfe0fa': 'slide-6',
+}
+# SEALED_SOURCE of slide-1: the contract wsi-serving-v6 test vector.
+SEALED_SOURCE_VECTOR = (
+    'AAECAwQFBgcICQoLNpOTYnY8HVb-KcPzu1F5HPykr7D0YY_UhVbbyjOFRlxC63fxCt09YO1aYC-phb85wDhN5PPPpC0X46RS'
+    'D0K0bRRgSptRb9wDiqMLtftFQ6VpBGfGILaddEV_s-Zsmpp28fG5Z3XTNWnyoBRa9qfr9t209wS7V-LhGl8i')
 
 
 def data_rows(path):
@@ -65,10 +78,11 @@ def data_rows(path):
             if not line.startswith('#')]
 
 
-def rows_by_image(path):
+def rows_by_slide(path):
+    """Return the resource rows of a file keyed by the fixture label of their slide key."""
     header, *rows = data_rows(path)
     records = [dict(zip(header, row)) for row in rows]
-    return {json.loads(record['METADATA'])['wsi_serving']['image_id']: record for record in records}
+    return {SLIDE_LABELS[json.loads(record['METADATA'])['slide_key']]: record for record in records}
 
 
 class ConverterTestCase(unittest.TestCase):
@@ -123,10 +137,10 @@ class ConvertedOutputTestCase(ConverterTestCase):
         sample_header = data_rows(self.out / 'data_resource_sample.txt')[0]
         self.assertEqual(['PATIENT_ID', 'SAMPLE_ID', 'RESOURCE_ID', 'URL', 'DISPLAY_NAME', 'TYPE',
                           'METADATA'], sample_header)
-        samples = rows_by_image(self.out / 'data_resource_sample.txt')
-        patients = rows_by_image(self.out / 'data_resource_patient.txt')
-        self.assertEqual(['IMG-1', 'IMG-2', 'IMG-3', 'IMG 7/A&B'], list(samples))
-        self.assertEqual(['IMG-4', 'IMG-6'], list(patients))
+        samples = rows_by_slide(self.out / 'data_resource_sample.txt')
+        patients = rows_by_slide(self.out / 'data_resource_patient.txt')
+        self.assertEqual(['slide-1', 'slide-2', 'slide-3', 'slide-5'], list(samples))
+        self.assertEqual(['slide-4', 'slide-6'], list(patients))
         self.assertEqual({(r['PATIENT_ID'], r['SAMPLE_ID'], r['RESOURCE_ID'], r['TYPE'])
                           for r in samples.values()},
                          {('WSI-P1', 'WSI-P1-S1', 'WSI_SAMPLE', 'WHOLE_SLIDE_IMAGE'),
@@ -138,16 +152,16 @@ class ConvertedOutputTestCase(ConverterTestCase):
 
     def test_viewer_urls_are_absolute_and_encoded(self):
         self.convert()
-        samples = rows_by_image(self.out / 'data_resource_sample.txt')
-        patients = rows_by_image(self.out / 'data_resource_patient.txt')
+        samples = rows_by_slide(self.out / 'data_resource_sample.txt')
+        patients = rows_by_slide(self.out / 'data_resource_patient.txt')
         self.assertEqual(
             'https://portal.example.org/cbioportal/wsi/patient/WSI-P2'
             '?studyId=wsi_convert_test&slideKey=a72487fd68ef59b99fcee054e738f893',
-            samples['IMG 7/A&B']['URL'])
+            samples['slide-5']['URL'])
         self.assertEqual(
             'https://portal.example.org/cbioportal/wsi/patient/WSI%2BP3'
             '?studyId=wsi_convert_test&slideKey=3474b861eb683902b420f4ee95dfe0fa',
-            patients['IMG-6']['URL'])
+            patients['slide-6']['URL'])
 
     def test_raw_tsv_metadata_round_trips(self):
         self.convert()
@@ -155,12 +169,11 @@ class ConvertedOutputTestCase(ConverterTestCase):
         self.assertNotIn('""', text, 'metadata must not be CSV-quoted')
         for line in text.splitlines()[1:]:
             self.assertTrue(line.split('\t')[-1].startswith('{'))
-        samples = rows_by_image(self.out / 'data_resource_sample.txt')
-        first = json.loads(samples['IMG-1']['METADATA'])
+        samples = rows_by_slide(self.out / 'data_resource_sample.txt')
+        first = json.loads(samples['slide-1']['METADATA'])
         self.assertIs(True, first['is_hne'])
         self.assertIs(False, first['is_ihc'])
         self.assertIs(True, first['can_serve_tiles'])
-        self.assertEqual(0, first['timeline_start_days'])
         self.assertEqual(716956681, first['file_size_bytes'])
         self.assertEqual('1', first['part_number'])
         self.assertEqual('Left "upper" lobe \\ wedge', first['part_description'])
@@ -168,68 +181,116 @@ class ConvertedOutputTestCase(ConverterTestCase):
         for removed in ('image_id', 'barcode', 'part_designator', 'path_dx_title'):
             self.assertNotIn(removed, first)
         self.assertEqual('WSI-P1-S1', first['reference_sample_id'])
-        self.assertEqual('Recorded procedure date relative to first tumor sequencing',
-                         first['timepoint_source'])
         serving = first['wsi_serving']
         self.assertEqual(256, serving['thumbnail_width'])
         self.assertEqual(192, serving['thumbnail_height'])
         self.assertEqual({'height': 768, 'width': 1024}, serving['tile_metadata_json']['dimensions'])
         self.assertEqual({'model': 'Scan "Q" \\ 40', 'objective_power': 40, 'calibrated': True},
                          serving['tile_metadata_json']['vendor']['scanner'])
-        second = json.loads(samples['IMG-2']['METADATA'])
-        self.assertEqual(-17, second['timeline_start_days'])
         # UNMATCHED reference samples are dropped, as the native importer stored null
-        self.assertNotIn('reference_sample_id', json.loads(samples['IMG 7/A&B']['METADATA']))
-        self.assertEqual(-365, json.loads(samples['IMG 7/A&B']['METADATA'])['timeline_start_days'])
-        self.assertEqual(0, json.loads(samples['IMG 7/A&B']['METADATA'])['file_size_bytes'])
+        self.assertNotIn('reference_sample_id', json.loads(samples['slide-5']['METADATA']))
+        self.assertEqual(0, json.loads(samples['slide-5']['METADATA'])['file_size_bytes'])
 
-    def test_unservable_slides_have_no_serving_fields(self):
+    def test_unservable_slides_have_no_serving_object(self):
         self.convert()
-        samples = rows_by_image(self.out / 'data_resource_sample.txt')
-        patients = rows_by_image(self.out / 'data_resource_patient.txt')
-        # IMG-2 has a SOURCE_URL and a thumbnail width in the legacy row but CAN_SERVE_TILES=FALSE
-        second = json.loads(samples['IMG-2']['METADATA'])
+        samples = rows_by_slide(self.out / 'data_resource_sample.txt')
+        patients = rows_by_slide(self.out / 'data_resource_patient.txt')
+        # slide-2 has a thumbnail width in the legacy row but CAN_SERVE_TILES=FALSE
+        second = json.loads(samples['slide-2']['METADATA'])
         self.assertIs(False, second['can_serve_tiles'])
-        self.assertEqual({'image_id': 'IMG-2'}, second['wsi_serving'])
-        self.assertEqual({'image_id': 'IMG-6'}, json.loads(patients['IMG-6']['METADATA'])['wsi_serving'])
+        self.assertNotIn('wsi_serving', second)
+        self.assertNotIn('wsi_serving', json.loads(patients['slide-6']['METADATA']))
 
     def test_count_rows_match_native_semantics(self):
         self.convert()
         self.assertEqual(
             [['PATIENT_ID', 'SAMPLE_ID', 'WSI_SAMPLE_SLIDE_COUNT', 'WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT',
               'WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT'],
-             ['WSI-P1', 'WSI-P1-S1', '2', '1', '1'],
+             ['WSI-P1', 'WSI-P1-S1', '1', '0', '1'],
              ['WSI-P1', 'WSI-P1-S2', '1', '0', '1'],
              ['WSI-P2', 'WSI-P2-S1', '1', '1', '0']],
             data_rows(self.out / 'data_clinical_sample_wsi_counts.txt'))
         self.assertEqual(
             [['PATIENT_ID', 'WSI_PATIENT_SLIDE_COUNT', 'WSI_PATIENT_PART_MATCHED_SLIDE_COUNT',
-              'WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT', 'WSI_PATIENT_UNDATED_SLIDE_COUNT'],
-             # IMG-3 and IMG-4 are viewable without a procedure day; IMG-2 is not viewable
-             ['WSI-P1', '4', '1', '2', '2'],
-             ['WSI-P2', '1', '1', '0', '0'],
-             ['WSI+P3', '1', '0', '0', '0']],
+              'WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT'],
+             ['WSI-P1', '3', '0', '2'],
+             ['WSI-P2', '1', '1', '0'],
+             ['WSI+P3', 'NA', 'NA', 'NA']],
             data_rows(self.out / 'data_clinical_patient_wsi_counts.txt'))
         header = (self.out / 'data_clinical_sample_wsi_counts.txt').read_text().splitlines()[:4]
         self.assertEqual(
-            ['#Patient Identifier\tSample Identifier\tWSI Slides per Sample\t'
-             'WSI Slides per Sample, Part-matched\tWSI Slides per Sample, Block-matched',
-             '#Patient identifier\tSample identifier\tAssociated pathology slide count for the sample.\t'
-             'Associated pathology slides matched to a specimen part.\t'
-             'Associated pathology slides matched to a specimen block.',
+            ['#Patient Identifier\tSample Identifier\tWSI Viewable Slides per Sample\t'
+             'WSI Viewable Slides per Sample, Part-matched\t'
+             'WSI Viewable Slides per Sample, Block-matched',
+             '#Patient identifier\tSample identifier\t'
+             'Pathology slides the slide viewer can open, for the sample.\t'
+             'Pathology slides the slide viewer can open, for the sample, matched to a specimen part.\t'
+             'Pathology slides the slide viewer can open, for the sample, matched to a specimen block.',
              '#STRING\tSTRING\tNUMBER\tNUMBER\tNUMBER',
              '#1\t1\t1\t1\t1'], header)
         header = (self.out / 'data_clinical_patient_wsi_counts.txt').read_text().splitlines()[:4]
         self.assertEqual(
-            ['#Patient Identifier\tWSI Slides per Patient\tWSI Slides per Patient, Part-matched\t'
-             'WSI Slides per Patient, Block-matched\tWSI Undated Viewable Slides per Patient',
-             '#Patient identifier\tAssociated pathology slide count for the patient.\t'
-             'Associated pathology slides matched to a specimen part for the patient.\t'
-             'Associated pathology slides matched to a specimen block for the patient.\t'
-             'Viewable pathology slides without a procedure date, which the timeline does not '
-             'show.',
-             '#STRING\tNUMBER\tNUMBER\tNUMBER\tNUMBER',
-             '#1\t1\t1\t1\t1'], header)
+            ['#Patient Identifier\tWSI Viewable Slides per Patient\t'
+             'WSI Viewable Slides per Patient, Part-matched\t'
+             'WSI Viewable Slides per Patient, Block-matched',
+             '#Patient identifier\t'
+             'Pathology slides the slide viewer can open, for the patient.\t'
+             'Pathology slides the slide viewer can open, for the patient, matched to a specimen part.\t'
+             'Pathology slides the slide viewer can open, for the patient, matched to a specimen block.',
+             '#STRING\tNUMBER\tNUMBER\tNUMBER',
+             '#1\t1\t1\t1'], header)
+
+    def test_only_viewable_slides_are_counted(self):
+        can_serve = converter.COLUMNS.index('CAN_SERVE_TILES')
+        sealed = converter.COLUMNS.index('SEALED_SOURCE')
+        only_s2_slide = 'f9bce50b1498c94fa0fa6cce809f64f2'  # the only slide of WSI-P1-S2
+        rows = self.fixture_rows()
+        for index, row in enumerate(rows):
+            fields = row.split('\t')
+            if fields[SLIDE_KEY] == only_s2_slide:
+                fields[can_serve] = 'FALSE'
+                fields[sealed] = ''
+                rows[index] = '\t'.join(fields)
+        self.convert(meta=self.write_legacy(rows))
+        # The fixture's non-viewable slide and WSI-P1-S2's only slide are not counted. WSI-P1-S2 and
+        # WSI+P3, whose only slides are non-viewable, get no count: NA, which the
+        # importer stores as no value, so the row only keeps the entity defined.
+        self.assertEqual(
+            [['WSI-P1', 'WSI-P1-S1', '1', '0', '1'],
+             ['WSI-P1', 'WSI-P1-S2', 'NA', 'NA', 'NA'],
+             ['WSI-P2', 'WSI-P2-S1', '1', '1', '0']],
+            data_rows(self.out / 'data_clinical_sample_wsi_counts.txt')[1:])
+        self.assertEqual(
+            [['WSI-P1', '2', '0', '1'],
+             ['WSI-P2', '1', '1', '0'],
+             ['WSI+P3', 'NA', 'NA', 'NA']],
+            data_rows(self.out / 'data_clinical_patient_wsi_counts.txt')[1:])
+        by_sample, by_patient = converter.count_slides(
+            converter.parse_slides(converter.iter_rows(self.write_legacy(rows).parent / 'data_wsi.txt')))
+        self.assertEqual({('WSI-P1', 'WSI-P1-S1'): [1, 0, 1], ('WSI-P2', 'WSI-P2-S1'): [1, 1, 0]},
+                         by_sample)
+        self.assertEqual({'WSI-P1': [2, 0, 1], 'WSI-P2': [1, 1, 0]}, by_patient)
+        # the non-viewable slides are still converted to resources
+        samples = rows_by_slide(self.out / 'data_resource_sample.txt')
+        self.assertIn('slide-3', samples)
+
+    def test_entities_without_viewable_slides_get_no_counts(self):
+        can_serve = converter.COLUMNS.index('CAN_SERVE_TILES')
+        rows = [row for row in self.fixture_rows() if row.split('\t')[can_serve] == 'FALSE']
+        self.assertEqual(2, len(rows))  # IMG-2 (WSI-P1-S1) and IMG-6 (WSI+P3, unmatched)
+        self.convert(meta=self.write_legacy(rows))
+        self.assertEqual([['WSI-P1', 'WSI-P1-S1', 'NA', 'NA', 'NA']],
+                         data_rows(self.out / 'data_clinical_sample_wsi_counts.txt')[1:])
+        self.assertEqual([['WSI-P1', 'NA', 'NA', 'NA'], ['WSI+P3', 'NA', 'NA', 'NA']],
+                         data_rows(self.out / 'data_clinical_patient_wsi_counts.txt')[1:])
+
+    def test_merge_requires_entities_with_only_non_viewable_slides(self):
+        # WSI+P3 has no counts, but its slide is still a resource, so the
+        # clinical file must still list it; its count columns are NA.
+        study = self.copy_study()
+        self.convert(study_dir=study)
+        patients = {row[0]: row[-3:] for row in data_rows(self.out / 'data_clinical_patients.txt')}
+        self.assertEqual(['NA', 'NA', 'NA'], patients['WSI+P3'])
 
     def test_only_pairs_with_rows_are_written(self):
         match_level = converter.COLUMNS.index('MATCH_LEVEL')
@@ -275,7 +336,7 @@ class ConverterInputTestCase(ConverterTestCase):
                       'https://portal.example.org/?x=1'):
             self.assertConversionError('--portal-base-url', base_url=value)
 
-    def test_header_must_match_format_v3(self):
+    def test_header_must_match_format_v4(self):
         header = (FIXTURE_DIR / 'data_wsi.txt').read_text().splitlines()[4]
         swapped = header.replace('PATIENT_ID\tREFERENCE_SAMPLE_ID', 'REFERENCE_SAMPLE_ID\tPATIENT_ID')
         self.assertConversionError('invalid header', meta=self.write_legacy(self.fixture_rows(), swapped))
@@ -300,14 +361,41 @@ class ConverterInputTestCase(ConverterTestCase):
             rows[0] = '\t'.join(fields)
             self.assertConversionError(message, meta=self.write_legacy(rows))
 
-    def test_duplicate_image_is_rejected(self):
+    def test_duplicate_slide_is_rejected(self):
         rows = self.fixture_rows()
-        self.assertConversionError('IMAGE_ID is not unique', meta=self.write_legacy(rows + rows[:1]))
+        self.assertConversionError('SLIDE_KEY is not unique', meta=self.write_legacy(rows + rows[:1]))
 
-    def test_inconsistent_timing_is_rejected(self):
-        rows = self.fixture_rows()
-        rows[1] = rows[1].replace('\t-17\tAVAILABLE\t', '\t\tAVAILABLE\t', 1)
-        self.assertConversionError('AVAILABLE timing is inconsistent', meta=self.write_legacy(rows))
+    def test_timing_columns_are_ignored(self):
+        # Some files carry seven slide-timing columns before SLIDE_KEY. They are accepted
+        # without being required or validated, and never reach the metadata.
+        reference = Path(self.tmp.name) / 'reference'
+        written = converter.convert(FIXTURE_DIR / 'meta_wsi.txt', reference, BASE_URL)
+        timing_values = [
+            ['0', 'AVAILABLE', 'RECORDED', 'PATHOLOGY_REPORT', '',
+             'patient_first_tumor_sequencing_day_zero', 'surgery 20210314'],
+            # values the removed timing checks rejected
+            ['not-a-day', 'BOGUS', '', '', 'reason', 'other_coordinates', ''],
+        ]
+        source = (FIXTURE_DIR / 'data_wsi.txt').read_text(encoding='utf-8').splitlines()
+
+        def with_timing(line, values):
+            fields = line.split('\t')
+            return '\t'.join(fields[:-2] + values + fields[-2:])
+
+        header = with_timing(source[4], list(converter.IGNORED_TIMING_COLUMNS))
+        self.assertEqual(converter.COLUMNS_WITH_IGNORED_TIMING, header.split('\t'))
+        rows = [with_timing(row, timing_values[index % 2])
+                for index, row in enumerate(self.fixture_rows())]
+        self.convert(meta=self.write_legacy(rows, header), base_url=BASE_URL)
+        for path in written:
+            self.assertEqual(path.read_bytes(), (self.out / path.name).read_bytes(), path.name)
+        for name in ('data_resource_sample.txt', 'data_resource_patient.txt'):
+            for record in rows_by_slide(self.out / name).values():
+                metadata = json.loads(record['METADATA'])
+                self.assertFalse([key for key in metadata
+                                  if key.startswith(('timeline_', 'timepoint_'))], metadata)
+        patients = data_rows(self.out / 'data_clinical_patient_wsi_counts.txt')[0]
+        self.assertNotIn('WSI_PATIENT_UNDATED_SLIDE_COUNT', patients)
 
     def test_line_break_in_output_cell_is_rejected(self):
         rows = self.fixture_rows()
@@ -376,7 +464,7 @@ class ClinicalMergeTestCase(ConverterTestCase):
         self.assertEqual(
             [['PATIENT_ID', 'SAMPLE_ID', 'CANCER_TYPE', 'TUMOR_PURITY', 'WSI_SAMPLE_SLIDE_COUNT',
               'WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT', 'WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT'],
-             ['WSI-P1', 'WSI-P1-S1', 'Breast Cancer', '0.45', '2', '1', '1'],
+             ['WSI-P1', 'WSI-P1-S1', 'Breast Cancer', '0.45', '1', '0', '1'],
              ['WSI-P1', 'WSI-P1-S2', 'Breast Cancer', 'NA', '1', '0', '1'],
              ['WSI-P2', 'WSI-P2-S1', 'Breast Cancer', '0.8', '1', '1', '0'],
              ['WSI+P3', 'WSI+P3-S1', 'Breast Cancer', '', 'NA', 'NA', 'NA'],
@@ -384,20 +472,19 @@ class ClinicalMergeTestCase(ConverterTestCase):
             data_rows(self.out / 'data_clinical_samples.txt'))
         patients = data_rows(self.out / 'data_clinical_patients.txt')
         self.assertEqual(['WSI_PATIENT_SLIDE_COUNT', 'WSI_PATIENT_PART_MATCHED_SLIDE_COUNT',
-                          'WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT',
-                          'WSI_PATIENT_UNDATED_SLIDE_COUNT'], patients[0][-4:])
-        self.assertEqual({'WSI-P1': ['4', '1', '2', '2'], 'WSI-P2': ['1', '1', '0', '0'],
-                          'WSI+P3': ['1', '0', '0', '0'], 'WSI-P4': ['NA', 'NA', 'NA', 'NA']},
-                         {row[0]: row[-4:] for row in patients[1:]})
+                          'WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT'], patients[0][-3:])
+        self.assertEqual({'WSI-P1': ['3', '0', '2'], 'WSI-P2': ['1', '1', '0'],
+                          'WSI+P3': ['NA', 'NA', 'NA'], 'WSI-P4': ['NA', 'NA', 'NA']},
+                         {row[0]: row[-3:] for row in patients[1:]})
         header = (self.out / 'data_clinical_samples.txt').read_text().splitlines()[:4]
         self.assertEqual(
             ['#Patient Identifier\tSample Identifier\tCancer Type\tTumor Purity\t'
-             'WSI Slides per Sample\tWSI Slides per Sample, Part-matched\t'
-             'WSI Slides per Sample, Block-matched',
+             'WSI Viewable Slides per Sample\tWSI Viewable Slides per Sample, Part-matched\t'
+             'WSI Viewable Slides per Sample, Block-matched',
              '#Patient identifier\tSample identifier\tCancer type\tEstimated tumor purity\t'
-             'Associated pathology slide count for the sample.\t'
-             'Associated pathology slides matched to a specimen part.\t'
-             'Associated pathology slides matched to a specimen block.',
+             'Pathology slides the slide viewer can open, for the sample.\t'
+             'Pathology slides the slide viewer can open, for the sample, matched to a specimen part.\t'
+             'Pathology slides the slide viewer can open, for the sample, matched to a specimen block.',
              '#STRING\tSTRING\tSTRING\tNUMBER\tNUMBER\tNUMBER\tNUMBER',
              '#1\t1\t1\t1\t1\t1\t1'], header)
 
@@ -483,9 +570,10 @@ class ClinicalMergeTestCase(ConverterTestCase):
         self.assertConversionError("expected the four '#' attribute header rows", study_dir=study)
 
 
-class V3OnlyTestCase(ConverterTestCase):
+class V4OnlyTestCase(ConverterTestCase):
 
-    """Only format v3 (39 columns, SLIDE_KEY last) is converted."""
+    """Only format v4 (30 columns ending with SLIDE_KEY and SEALED_SOURCE; 37 with ignored
+    timing columns) is converted."""
 
     def assertConversionError(self, text, meta):
         with self.assertRaises(converter.ConversionError) as context:
@@ -494,23 +582,49 @@ class V3OnlyTestCase(ConverterTestCase):
         self.assertFalse(self.out.exists())
 
     def test_columns(self):
-        self.assertEqual(39, len(converter.COLUMNS))
-        self.assertEqual('SLIDE_KEY', converter.COLUMNS[-1])
-        self.assertEqual('TIMEPOINT_SOURCE', converter.COLUMNS[-2])
-        self.assertEqual(list(converter.TIMING_COLUMNS), converter.COLUMNS[31:38])
+        self.assertEqual(30, len(converter.COLUMNS))
+        self.assertEqual(['THUMBNAIL_CONTENT_TYPE', 'SLIDE_KEY', 'SEALED_SOURCE'], converter.COLUMNS[-3:])
+        for name in ('IMAGE_ID', 'SOURCE_URL', 'THUMBNAIL_URL'):
+            self.assertNotIn(name, converter.COLUMNS)
+        self.assertEqual(37, len(converter.COLUMNS_WITH_IGNORED_TIMING))
+        self.assertEqual(list(converter.IGNORED_TIMING_COLUMNS),
+                         converter.COLUMNS_WITH_IGNORED_TIMING[28:35])
+        self.assertEqual(['SLIDE_KEY', 'SEALED_SOURCE'], converter.COLUMNS_WITH_IGNORED_TIMING[-2:])
         for name in ('V2_COLUMNS', 'FORMAT_COLUMNS', 'TIMELINE_REQUIRED_COLUMNS',
                      'find_pathology_timeline', 'read_timeline_index', '_parse_image_ids'):
             self.assertFalse(hasattr(converter, name), name)
 
-    def test_format_v2_is_rejected(self):
-        meta = self.write_legacy(self.fixture_rows())
-        meta.write_text(meta.read_text().replace('format_version: 3', 'format_version: 2'))
-        self.assertConversionError('unsupported WSI format_version; expected 3', meta)
+    def test_older_format_versions_are_rejected(self):
+        for version in ('2', '3'):
+            meta = self.write_legacy(self.fixture_rows())
+            meta.write_text(meta.read_text().replace('format_version: 4', 'format_version: ' + version))
+            self.assertConversionError('unsupported WSI format_version; expected 4', meta)
 
-    def test_38_column_file_is_rejected(self):
+    def test_format_v3_columns_are_rejected_without_echoing_values(self):
         source = (FIXTURE_DIR / 'data_wsi.txt').read_text(encoding='utf-8').splitlines()
-        rows = ['\t'.join(row.split('\t')[:38]) for row in source[5:]]
-        header = '\t'.join(source[4].split('\t')[:38])
+        for names in (['IMAGE_ID'], ['SOURCE_URL'], ['THUMBNAIL_URL'],
+                      ['IMAGE_ID', 'SOURCE_URL', 'THUMBNAIL_URL']):
+            header = '\t'.join(source[4].split('\t') + names)
+            rows = [row + '\tS-SECRET-1' * len(names) for row in source[5:]]
+            with self.assertRaises(converter.ConversionError) as context:
+                converter.convert(self.write_legacy(rows, header), self.out, BASE_URL)
+            message = str(context.exception)
+            self.assertIn('%s column(s) of format v3 or older' % ', '.join(names), message)
+            self.assertIn('SEALED_SOURCE', message)
+            self.assertNotIn('S-SECRET', message)
+            self.assertFalse(self.out.exists())
+
+    def test_file_without_slide_key_or_sealed_source_is_rejected(self):
+        source = (FIXTURE_DIR / 'data_wsi.txt').read_text(encoding='utf-8').splitlines()
+        for drop in (-1, -2):
+            rows = ['\t'.join(cell for index, cell in enumerate(row.split('\t'))
+                              if index != len(converter.COLUMNS) + drop) for row in source[5:]]
+            header = '\t'.join(name for name in converter.COLUMNS if name != converter.COLUMNS[drop])
+            self.assertConversionError('invalid header', self.write_legacy(rows, header))
+        # nor with the ignored timing columns and neither key column
+        timing = ['' for _ in converter.IGNORED_TIMING_COLUMNS]
+        rows = ['\t'.join(row.split('\t')[:-2] + timing) for row in source[5:]]
+        header = '\t'.join(source[4].split('\t')[:-2] + list(converter.IGNORED_TIMING_COLUMNS))
         self.assertConversionError('invalid header', self.write_legacy(rows, header))
 
     def test_timeline_options_are_gone(self):
@@ -536,11 +650,12 @@ class V3OnlyTestCase(ConverterTestCase):
 
 
 SLIDE_KEY = converter.COLUMNS.index('SLIDE_KEY')
+SEALED_SOURCE = converter.COLUMNS.index('SEALED_SOURCE')
 
 
 class SlideKeyAndDeidTestCase(ConverterTestCase):
 
-    """Slide keys and the de-identification rules of contract wsi-serving-v5 (R1/R2)."""
+    """Slide keys, sealed sources and the de-identification rules of contract wsi-serving-v6."""
 
     def with_cell(self, column, value, row=0):
         rows = self.fixture_rows()
@@ -568,13 +683,30 @@ class SlideKeyAndDeidTestCase(ConverterTestCase):
         rows[1] = '\t'.join(duplicate)
         self.assertIn('line 7: SLIDE_KEY is not unique', self.conversion_error(self.write_legacy(rows)))
 
-    def test_duplicate_image_id_is_not_echoed(self):
-        rows = self.fixture_rows()
-        duplicate = rows[0].split('\t')
-        duplicate[SLIDE_KEY] = 'f' * 32
-        message = self.conversion_error(self.write_legacy(rows + ['\t'.join(duplicate)]))
-        self.assertIn('IMAGE_ID is not unique', message)
-        self.assertNotIn('IMG-1', message)
+    def test_sealed_source_shape(self):
+        def sealed(size):
+            return base64.urlsafe_b64encode(bytes(index % 256 for index in range(size))).decode().rstrip('=')
+        self.assertEqual(29, len(base64.urlsafe_b64decode(sealed(29) + '===')))
+        for value in (sealed(29), 'A' * 4096):
+            self.convert(meta=self.with_cell(SEALED_SOURCE, value))
+            shutil.rmtree(self.out)
+        for value in (sealed(28),                              # shorter than nonce, one byte and tag
+                      SEALED_SOURCE_VECTOR + '==',             # padded
+                      SEALED_SOURCE_VECTOR.replace('-', '+'),  # standard alphabet
+                      SEALED_SOURCE_VECTOR + '.x',             # not base64url
+                      'A' * 41,                                # not a whole number of bytes
+                      'A' * 4097):                             # too long
+            message = self.conversion_error(self.with_cell(SEALED_SOURCE, value))
+            self.assertIn('line 6: SEALED_SOURCE must be unpadded base64url', message)
+            self.assertNotIn(value[:20], message)
+
+    def test_sealed_source_is_required_iff_servable(self):
+        message = self.conversion_error(self.with_cell(SEALED_SOURCE, ''))
+        self.assertIn('line 6: SEALED_SOURCE is required', message)
+        # slide-2 (second row) cannot serve tiles
+        message = self.conversion_error(self.with_cell(SEALED_SOURCE, SEALED_SOURCE_VECTOR, row=1))
+        self.assertIn('line 7: SEALED_SOURCE must be empty when CAN_SERVE_TILES is FALSE', message)
+        self.assertNotIn(SEALED_SOURCE_VECTOR[:20], message)
 
     def test_url_display_name_and_metadata_shape(self):
         self.convert()
@@ -586,21 +718,27 @@ class SlideKeyAndDeidTestCase(ConverterTestCase):
                 self.assertRegex(metadata['slide_key'], '^[0-9a-f]{32}$')
                 self.assertTrue(row['URL'].endswith('&slideKey=' + metadata['slide_key']))
                 for field in ('URL', 'DISPLAY_NAME'):
-                    # the image ID only appears inside the private wsi_serving object
-                    for value in ('IMG', 'imageId', 'BC-0001'):
+                    for value in ('imageId', 'BC-0001', 'sealed'):
                         self.assertNotIn(value, row[field])
                 public = {key for key in metadata if key != 'wsi_serving'}
                 self.assertFalse(public & {'image_id', 'barcode', 'part_designator', 'path_dx_title',
-                                           'source_url', 'thumbnail_url'}, public)
+                                           'source_url', 'thumbnail_url', 'sealed_source'}, public)
                 self.assertLessEqual(public, PUBLIC_KEYS)
                 public_text = json.dumps({key: metadata[key] for key in public})
-                for value in (metadata['wsi_serving']['image_id'], 'BC-0001', 'Adenocarcinoma'):
+                for value in ('BC-0001', 'Adenocarcinoma'):
                     self.assertNotIn(value, public_text)
-        samples = rows_by_image(self.out / 'data_resource_sample.txt')
-        self.assertEqual('H&E \u00b7 Specimen 1 / Block 1', samples['IMG-1']['DISPLAY_NAME'])
-        self.assertEqual('PD-L1 (22C3) \u00b7 Specimen 2 / Block 1', samples['IMG-3']['DISPLAY_NAME'])
-        patients = rows_by_image(self.out / 'data_resource_patient.txt')
-        self.assertEqual('H&E \u00b7 Specimen 1', patients['IMG-6']['DISPLAY_NAME'])
+                if 'wsi_serving' in metadata:
+                    self.assertNotIn(metadata['wsi_serving']['sealed_source'], public_text)
+                    self.assertNotIn(metadata['wsi_serving']['sealed_source'], row['URL'])
+            # no image ID, object URI or barcode is written anywhere
+            text = (self.out / name).read_text(encoding='utf-8')
+            for value in ('IMG', 'image_id', 'source_url', 'thumbnail_url', '.svs', '.jpg', 'BC-0001'):
+                self.assertNotIn(value, text)
+        samples = rows_by_slide(self.out / 'data_resource_sample.txt')
+        self.assertEqual('H&E \u00b7 Specimen 1 / Block 1', samples['slide-1']['DISPLAY_NAME'])
+        self.assertEqual('PD-L1 (22C3) \u00b7 Specimen 2 / Block 1', samples['slide-3']['DISPLAY_NAME'])
+        patients = rows_by_slide(self.out / 'data_resource_patient.txt')
+        self.assertEqual('H&E \u00b7 Specimen 1', patients['slide-6']['DISPLAY_NAME'])
 
     def test_display_name_fallbacks(self):
         row = {name: '' for name in converter.COLUMNS}
@@ -608,30 +746,47 @@ class SlideKeyAndDeidTestCase(ConverterTestCase):
         row.update(SLIDE_TYPE='IHC', BLOCK_NUMBER='3')
         self.assertEqual('IHC \u00b7 Block 3', converter.display_name(row))
 
-    def test_wsi_serving_carries_image_id(self):
+    def test_wsi_serving_carries_sealed_source(self):
         self.convert()
-        samples = rows_by_image(self.out / 'data_resource_sample.txt')
-        serving = json.loads(samples['IMG-1']['METADATA'])['wsi_serving']
+        samples = rows_by_slide(self.out / 'data_resource_sample.txt')
+        serving = json.loads(samples['slide-1']['METADATA'])['wsi_serving']
         self.assertEqual(
-            {'image_id', 'source_url', 'tile_metadata_json', 'thumbnail_url', 'thumbnail_width',
-             'thumbnail_height', 'thumbnail_content_type'}, set(serving))
-        self.assertEqual('IMG-1', serving['image_id'])
-        # non-servable rows keep only the image ID
-        self.assertEqual({'image_id': 'IMG-2'}, json.loads(samples['IMG-2']['METADATA'])['wsi_serving'])
+            {'sealed_source', 'tile_metadata_json', 'thumbnail_width', 'thumbnail_height',
+             'thumbnail_content_type'}, set(serving))
+        self.assertEqual(SEALED_SOURCE_VECTOR, serving['sealed_source'])
+        self.assertEqual('image/jpeg', serving['thumbnail_content_type'])
+        # non-servable rows have no serving object
+        self.assertNotIn('wsi_serving', json.loads(samples['slide-2']['METADATA']))
 
     def test_tab_in_output_is_not_echoed(self):
         with self.assertRaises(converter.ConversionError) as context:
-            converter.write_tsv(Path(self.tmp.name) / 'x.txt', [['IMG\t1']])
-        self.assertNotIn('IMG', str(context.exception))
+            converter.write_tsv(Path(self.tmp.name) / 'x.txt', [['SECRET\t1']])
+        self.assertNotIn('SECRET', str(context.exception))
+
+    def test_each_slide_key_counts_once(self):
+        rows = self.fixture_rows()
+        # another viewable, block-matched slide on the first row's sample: a new slide key adds
+        # one to its counts (only viewable slides are counted)
+        extra = rows[0].split('\t')
+        extra[SLIDE_KEY] = 'e' * 32
+        self.convert(meta=self.write_legacy(rows + ['\t'.join(extra)]))
+        samples = {tuple(row[:2]): row[2:] for row in data_rows(
+            self.out / 'data_clinical_sample_wsi_counts.txt')[1:]}
+        self.assertEqual(['2', '0', '2'], samples[('WSI-P1', 'WSI-P1-S1')])
+        patients = {row[0]: row[1:] for row in data_rows(
+            self.out / 'data_clinical_patient_wsi_counts.txt')[1:]}
+        self.assertEqual(['4', '0', '3'], patients['WSI-P1'])
+        # the same slide key again is one slide listed twice, which is rejected
+        shutil.rmtree(self.out)
+        message = self.conversion_error(self.write_legacy(rows + rows[:1]))
+        self.assertIn('line 12: SLIDE_KEY is not unique', message)
 
 
 PUBLIC_KEYS = {
     'slide_key', 'reference_sample_id', 'part_key', 'part_number', 'part_type',
     'part_description', 'subspecialty', 'block_key', 'block_number', 'block_label', 'match_level',
     'specimen_key', 'stain_name', 'stain_group', 'magnification', 'slide_type', 'is_hne', 'is_ihc',
-    'can_serve_tiles', 'file_size_bytes', 'timeline_start_days', 'timeline_date_status',
-    'timeline_date_kind', 'timeline_date_source', 'timeline_date_reason',
-    'timeline_coordinate_system', 'timepoint_source',
+    'can_serve_tiles', 'file_size_bytes',
 }
 
 
@@ -658,9 +813,6 @@ class ConvertedFilesValidationTestCase(ConverterTestCase):
         validateData.SAMPLE_TO_PATIENT = dict(SAMPLE_TO_PATIENT)
         validateData.DEFINED_SAMPLE_ATTRIBUTES = {'PATIENT_ID', 'SAMPLE_ID'}
         validateData.reset_wsi_resource_state()
-        env = patch.dict(validateData.os.environ, NO_ALLOWLIST)
-        env.start()
-        self.addCleanup(env.stop)
 
     def tearDown(self):
         for name, value in self.saved.items():
@@ -700,16 +852,17 @@ class ConvertedFilesValidationTestCase(ConverterTestCase):
         self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems
                               if 'analysis feature will not be available' not in r.getMessage()])
 
-    def test_duplicate_image_across_resource_files_fails(self):
+    def test_duplicate_slide_key_across_resource_files_fails(self):
         self.convert()
         sample_file = self.out / 'data_resource_sample.txt'
         patient_file = self.out / 'data_resource_patient.txt'
-        # give an unmatched slide the image ID of a matched one
-        patient_file.write_text(patient_file.read_text().replace('"image_id":"IMG-4"', '"image_id":"IMG-1"'))
+        # give an unmatched slide the slide key of a matched one
+        patient_file.write_text(patient_file.read_text().replace(
+            'c66ee336f70e8b59e48bd7afbf0e606d', '2c96f13783250ad2c6bcfcd5b7c3ef22'))
         validateData.RESOURCE_DEFINITION_DICTIONARY = {'WSI_SAMPLE': ['SAMPLE'], 'WSI_PATIENT': ['PATIENT']}
         self.run_validator(validateData.SampleResourceValidator, sample_file.name)
         _, problems = self.run_validator(validateData.PatientResourceValidator, patient_file.name)
-        self.assertIn('IMAGE_ID must be unique within a study', [r.getMessage() for r in problems])
+        self.assertIn('SLIDE_KEY must be unique within a study', [r.getMessage() for r in problems])
 
     def test_merged_study_passes_and_meta_wsi_is_rejected(self):
         study = self.copy_study()
