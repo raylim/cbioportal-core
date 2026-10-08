@@ -135,7 +135,6 @@ public class TestImportResourceData extends IntegrationTestBase {
         assertEquals("1", derived.get("block_number").textValue());
         assertFalse(derived.has("part_description"));
         assertFalse(derived.has("block_label"));
-        assertEquals(0, derived.get("timeline_start_days").intValue());
         derived.fieldNames().forEachRemaining(key -> assertTrue(key,
             DaoResourceData.STUDY_SLIDE_TABLE_METADATA_KEYS.contains(key)));
     }

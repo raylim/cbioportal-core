@@ -230,7 +230,7 @@ public final class DaoResourceData {
      */
     public static final java.util.List<String> STUDY_SLIDE_TABLE_METADATA_KEYS = java.util.List.of(
         "stain_name", "stain_group", "magnification", "part_number", "block_number",
-        "match_level", "timepoint_source", "timeline_start_days");
+        "match_level");
 
     /** Removes one study's rows from wsi_slide_table_derived, e.g. when the study is deleted. */
     public static void deleteStudySlideTable(int cancerStudyId) throws DaoException {
