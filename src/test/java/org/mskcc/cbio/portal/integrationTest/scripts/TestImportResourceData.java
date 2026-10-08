@@ -241,22 +241,26 @@ public class TestImportResourceData extends IntegrationTestBase {
      * private or non-allowlisted slide fields.
      */
     private static void assertStudySlideTableMatches(CancerStudy study) throws Exception {
-        // Only slides the viewer can open; the fixtures include one it cannot.
+        // Every slide the viewer can open, matched (WSI_SAMPLE) or not (WSI_PATIENT); the fixtures
+        // include slides it cannot open.
+        String slides = "FROM resource_data WHERE cancer_study_id = ? "
+            + "AND resource_id IN ('WSI_SAMPLE', 'WSI_PATIENT')";
         long slideRows = singleLong(
-            "SELECT count() FROM resource_data WHERE cancer_study_id = ? AND resource_id = 'WSI_SAMPLE' "
-                + "AND JSONExtractBool(ifNull(metadata, '{}'), 'can_serve_tiles')",
+            "SELECT count() " + slides + " AND JSONExtractBool(ifNull(metadata, '{}'), 'can_serve_tiles')",
             study.getInternalId());
         assertTrue(slideRows > 0);
-        assertTrue(slideRows < singleLong(
-            "SELECT count() FROM resource_data WHERE cancer_study_id = ? AND resource_id = 'WSI_SAMPLE'",
-            study.getInternalId()));
+        assertTrue(slideRows < singleLong("SELECT count() " + slides, study.getInternalId()));
         assertEquals(slideRows, singleLong(
             "SELECT count() FROM wsi_slide_table_derived d INNER JOIN resource_data r "
                 + "ON r.resource_data_id = d.resource_data_id WHERE d.cancer_study_id = ? "
-                + "AND r.resource_id = 'WSI_SAMPLE'",
+                + "AND r.resource_id IN ('WSI_SAMPLE', 'WSI_PATIENT')",
             study.getInternalId()));
         assertEquals(slideRows, singleLong(
             "SELECT count() FROM wsi_slide_table_derived WHERE cancer_study_id = ?",
+            study.getInternalId()));
+        // The viewable unmatched slide is listed with no sample.
+        assertEquals(1L, singleLong(
+            "SELECT count() FROM wsi_slide_table_derived WHERE cancer_study_id = ? AND sample_id IS NULL",
             study.getInternalId()));
         assertEquals(0L, singleLong(
             "SELECT countIf(position(metadata, 'wsi_serving') > 0 OR position(metadata, 'slide_key') > 0 "

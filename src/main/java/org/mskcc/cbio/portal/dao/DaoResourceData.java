@@ -220,6 +220,9 @@ public final class DaoResourceData {
     /** The resource the portal serves as the study slide table. */
     public static final String STUDY_SLIDE_TABLE_RESOURCE_ID = "WSI_SAMPLE";
 
+    /** Slides with no matched sample; the slide table lists them too, with no sample. */
+    public static final String UNMATCHED_SLIDE_RESOURCE_ID = "WSI_PATIENT";
+
     /**
      * The study slide table's public metadata keys. Must match WsiDeidentification.STUDY_TABLE_SCHEMA
      * in cBioPortal/cbioportal and the wsi_slide_table_derived INSERT in its
@@ -251,10 +254,12 @@ public final class DaoResourceData {
     }
 
     /**
-     * Rebuilds one study's rows of wsi_slide_table_derived from its WSI_SAMPLE resource_data rows,
-     * with metadata reduced to the slide table's public keys and no display_name (the caption repeats
-     * the stain, part and block columns), listing only slides the viewer can open (can_serve_tiles). Run after WSI_SAMPLE is imported so the
-     * portal's study slide table matches the import without a full derived-table rebuild.
+     * Rebuilds one study's rows of wsi_slide_table_derived: every slide the viewer can open
+     * (can_serve_tiles), from WSI_SAMPLE and, with no sample, WSI_PATIENT's unmatched slides, all filed
+     * under WSI_SAMPLE. Metadata is reduced to the slide table's public keys, and display_name is left
+     * empty (the caption repeats the stain, part and block columns). Run after either resource is
+     * imported so the portal's study slide table matches the import without a full derived-table
+     * rebuild.
      */
     public static void refreshStudySlideTable(int cancerStudyId) throws DaoException {
         String keys = STUDY_SLIDE_TABLE_METADATA_KEYS.stream()
@@ -266,13 +271,17 @@ public final class DaoResourceData {
             deleteStudySlideTable(con, cancerStudyId);
             try (PreparedStatement insert = con.prepareStatement(
                     "INSERT INTO wsi_slide_table_derived "
-                    + "SELECT resource_data_id, resource_id, cancer_study_id, entity_type, patient_id, "
+                    + "SELECT resource_data_id, '" + STUDY_SLIDE_TABLE_RESOURCE_ID + "', cancer_study_id, "
+                    + "entity_type, patient_id, "
                     + "sample_id, url, CAST(NULL, 'Nullable(String)') AS display_name, type, "
                     + "concat('{', arrayStringConcat(arrayMap(kv -> concat(toJSONString(kv.1), ':', kv.2), "
                     + "arrayFilter(kv -> has([" + keys + "], kv.1), "
                     + "JSONExtractKeysAndValuesRaw(ifNull(metadata, '{}')))), ','), '}') "
                     + "FROM " + RESOURCE_DATA_TABLE + " "
-                    + "WHERE resource_id = '" + STUDY_SLIDE_TABLE_RESOURCE_ID + "' AND cancer_study_id = ? "
+                    + "WHERE resource_id IN ('" + STUDY_SLIDE_TABLE_RESOURCE_ID + "', '"
+                    + UNMATCHED_SLIDE_RESOURCE_ID + "') AND cancer_study_id = ? "
+                    + "AND type = 'WHOLE_SLIDE_IMAGE' AND patient_id IS NOT NULL "
+                    + "AND match(JSONExtractString(ifNull(metadata, '{}'), 'slide_key'), '^[0-9a-f]{32}$') "
                     + "AND JSONExtractBool(ifNull(metadata, '{}'), 'can_serve_tiles')")) {
                 insert.setInt(1, cancerStudyId);
                 insert.executeUpdate();
