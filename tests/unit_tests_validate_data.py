@@ -3816,6 +3816,11 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
         self.assertIn(('WSI timeline date source is required', 'METADATA.timeline_date_source'),
                       errors)
         self.assertNotIn('2021', repr(errors))
+        # the portal requires a timepoint source on every timed slide
+        errors = self.validate_resource(validateData.SampleResourceValidator,
+                                        [self.sample_row(self.timed_metadata(timepoint_source=None))])
+        self.assertEqual([('WSI timepoint source is required', 'METADATA.timepoint_source')],
+                         errors)
 
     def test_slide_key_unique_across_resource_files(self):
         errors = self.validate_resource(validateData.SampleResourceValidator,

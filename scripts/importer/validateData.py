@@ -4153,6 +4153,10 @@ class WsiRowChecks(object):
         `label(name)` names a field in messages. Rows with the timing fields
         (TIMELINE_DATE_STATUS present as a key) also get the timing checks.
         """
+        # Resource rows (label given) carry the converted metadata, where the
+        # converter has already derived timepoint_source; the legacy file may leave
+        # TIMEPOINT_SOURCE blank for the converter to derive.
+        is_resource_row = label is not None
         if label is None:
             label = lambda name: name
 
@@ -4249,6 +4253,10 @@ class WsiRowChecks(object):
 
         if 'TIMELINE_DATE_STATUS' in row:
             self._check_wsi_timing(row, line_number, column, label)
+            # The portal's hierarchy rejects timed slides without a timepoint source.
+            if is_resource_row and not row['TIMEPOINT_SOURCE']:
+                self._error('WSI timepoint source is required', line_number,
+                            column('TIMEPOINT_SOURCE'), label('TIMEPOINT_SOURCE'))
 
         # SEALED_SOURCE is opaque and only the tile server can open it; report the field only.
         sealed_source = row['SEALED_SOURCE']
