@@ -1,6 +1,7 @@
 package org.mskcc.cbio.portal.scripts;
 
 import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -9,21 +10,51 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import org.junit.Test;
 
 public class ImportWsiDataTest {
 
     @Test
     public void patientTotalsIncludeUnmatchedSlides() {
-        String[] blockMatched = placement("101", "BLOCK");
-        String[] unmatched = placement("101", "UNMATCHED");
-        String[] otherPatient = placement("202", "PART");
+        String[] blockMatched = placement("101", "IMG-1", "BLOCK");
+        String[] unmatched = placement("101", "IMG-2", "UNMATCHED");
+        String[] otherPatient = placement("202", "IMG-3", "PART");
 
         var counts = ImportWsiData.countPatientSlidePlacements(
-            List.of(blockMatched, unmatched, otherPatient));
+            List.of(blockMatched, unmatched, otherPatient), Set.of("IMG-1", "IMG-2", "IMG-3"));
 
         assertArrayEquals(new int[] {2, 0, 1}, counts.get(101L));
         assertArrayEquals(new int[] {1, 1, 0}, counts.get(202L));
+    }
+
+    @Test
+    public void countsSkipSlidesTheViewerCannotOpen() {
+        String[] viewable = slide(true);
+        String[] notViewable = slide(false);
+        Set<String> viewableImageIds = ImportWsiData.viewableImageIds(
+            Map.of("IMG-1", viewable, "IMG-2", notViewable, "IMG-3", notViewable));
+        assertEquals(Set.of("IMG-1"), viewableImageIds);
+
+        // Patient 101 has one viewable and one non-viewable slide; patient 202 only a
+        // non-viewable one, so it gets no counts at all.
+        List<String[]> placements = List.of(
+            placement("101", "IMG-1", "BLOCK"),
+            placement("101", "IMG-2", "PART"),
+            placement("202", "IMG-3", "PART"));
+
+        var patients = ImportWsiData.countPatientSlidePlacements(placements, viewableImageIds);
+        assertArrayEquals(new int[] {1, 0, 1}, patients.get(101L));
+        assertFalse(patients.containsKey(202L));
+
+        var samples = ImportWsiData.countSampleSlidePlacements(placements, viewableImageIds);
+        assertEquals(Set.of(7L), samples.keySet());
+        assertArrayEquals(new int[] {1, 0, 1}, samples.get(7L));
+
+        var noneViewable = ImportWsiData.countSampleSlidePlacements(
+            List.<String[]>of(placement("202", "IMG-3", "PART")), viewableImageIds);
+        assertTrue(noneViewable.isEmpty());
     }
 
     @Test
@@ -128,11 +159,18 @@ public class ImportWsiDataTest {
         assertTrue(ImportWsiData.validTileMetadata(new ObjectMapper().readTree(metadata)));
     }
 
-    private static String[] placement(String patientId, String matchLevel) {
-        String[] placement = new String[9];
+    private static String[] placement(String patientId, String imageId, String matchLevel) {
+        String[] placement = new String[8];
         placement[1] = patientId;
+        placement[2] = imageId;
         placement[5] = "UNMATCHED".equals(matchLevel) ? null : "7";
         placement[6] = matchLevel;
         return placement;
+    }
+
+    private static String[] slide(boolean canServeTiles) {
+        String[] slide = new String[18];
+        slide[9] = canServeTiles ? "1" : "0";
+        return slide;
     }
 }

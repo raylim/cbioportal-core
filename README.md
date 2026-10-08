@@ -23,10 +23,11 @@ them offline with `scripts/importer/convertWsiToResources.py`, which accepts
 only format v3 (32 columns, ending with the opaque `SLIDE_KEY`; slide-timing
 columns, if present, are ignored for now). Given
 `--study-dir`, it also merges the six `WSI_*` slide-count clinical
-attributes into copies of the study's clinical sample and patient files. Viewer
-links and public metadata identify slides only by `slide_key`; the real image
-ID stays in the private `wsi_serving` metadata. The data provider is
-responsible for de-identifying free-text values before export. The native WSI
+attributes, which count only slides the viewer can open (`CAN_SERVE_TILES`),
+into copies of the study's clinical sample and patient files. Viewer links and
+public metadata identify slides only by `slide_key`; the real image ID stays in
+the private `wsi_serving` metadata. The data provider is responsible for
+de-identifying free-text values before export. The native WSI
 tables and the `ImportWsiData` Java entry point are deprecated but retained.
 Thumbnail artifacts and slide metadata must still be prepared by an upstream
 artifact-generation/export pipeline; core does not generate thumbnails or write

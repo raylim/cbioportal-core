@@ -608,41 +608,31 @@ public class ImportWsiData extends ConsoleRunnable {
      * Adds the sample- and patient-level WSI attributes consumed by Study View.
      * Patient totals are written directly so pagination cannot produce partial
      * values; the frontend still supports sample aggregation for older studies.
-     * Counts intentionally include all associations, including slides that are
-     * not currently tile-servable, matching the WSI study-file contract and the
-     * standalone count-file generator.
+     * Counts include only viewable slides (CAN_SERVE_TILES), matching
+     * scripts/importer/convertWsiToResources.py; a sample or patient without a
+     * viewable slide gets no values.
      */
     private static void insertSampleSlideCounts(ImportRows rows, long studyId)
         throws DaoException {
-        Map<Long, int[]> countsBySample = new LinkedHashMap<>();
-        Map<Long, int[]> countsByPatient = countPatientSlidePlacements(rows.placements.values());
-        for (String[] placement : rows.placements.values()) {
-            if (placement[5] == null || placement[5].isBlank()) {
-                continue; // unmatched slides have no sample-level count
-            }
-            long sampleId = Long.parseLong(placement[5]);
-            int[] counts = countsBySample.computeIfAbsent(sampleId, ignored -> new int[3]);
-            counts[0]++;
-            if ("PART".equals(placement[6])) {
-                counts[1]++;
-            } else if ("BLOCK".equals(placement[6])) {
-                counts[2]++;
-            }
-        }
+        Set<String> viewableImageIds = viewableImageIds(rows.slides);
+        Map<Long, int[]> countsBySample =
+            countSampleSlidePlacements(rows.placements.values(), viewableImageIds);
+        Map<Long, int[]> countsByPatient =
+            countPatientSlidePlacements(rows.placements.values(), viewableImageIds);
 
         String[][] attributes = {
-            {WSI_SAMPLE_SLIDE_COUNT, "WSI Slides per Sample",
-                "Associated pathology slide count for the sample."},
-            {WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT, "WSI Slides per Sample, Part-matched",
-                "Associated pathology slides matched to a specimen part."},
-            {WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT, "WSI Slides per Sample, Block-matched",
-                "Associated pathology slides matched to a specimen block."},
-            {WSI_PATIENT_SLIDE_COUNT, "WSI Slides per Patient",
-                "Associated pathology slide count for the patient."},
-            {WSI_PATIENT_PART_MATCHED_SLIDE_COUNT, "WSI Slides per Patient, Part-matched",
-                "Associated pathology slides matched to a specimen part for the patient."},
-            {WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT, "WSI Slides per Patient, Block-matched",
-                "Associated pathology slides matched to a specimen block for the patient."}
+            {WSI_SAMPLE_SLIDE_COUNT, "WSI Viewable Slides per Sample",
+                "Pathology slides the slide viewer can open, for the sample."},
+            {WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT, "WSI Viewable Slides per Sample, Part-matched",
+                "Pathology slides the slide viewer can open, for the sample, matched to a specimen part."},
+            {WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT, "WSI Viewable Slides per Sample, Block-matched",
+                "Pathology slides the slide viewer can open, for the sample, matched to a specimen block."},
+            {WSI_PATIENT_SLIDE_COUNT, "WSI Viewable Slides per Patient",
+                "Pathology slides the slide viewer can open, for the patient."},
+            {WSI_PATIENT_PART_MATCHED_SLIDE_COUNT, "WSI Viewable Slides per Patient, Part-matched",
+                "Pathology slides the slide viewer can open, for the patient, matched to a specimen part."},
+            {WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT, "WSI Viewable Slides per Patient, Block-matched",
+                "Pathology slides the slide viewer can open, for the patient, matched to a specimen block."}
         };
         for (String[] attribute : attributes) {
             if (DaoClinicalAttributeMeta.getDatum(attribute[0], Math.toIntExact(studyId)) == null) {
@@ -694,19 +684,52 @@ public class ImportWsiData extends ConsoleRunnable {
         }
     }
 
-    static Map<Long, int[]> countPatientSlidePlacements(Iterable<String[]> placements) {
+    /** Image IDs of the slides the viewer can open (CAN_SERVE_TILES, slide column 9). */
+    static Set<String> viewableImageIds(Map<String, String[]> slides) {
+        Set<String> viewable = new HashSet<>();
+        for (Map.Entry<String, String[]> slide : slides.entrySet()) {
+            if ("1".equals(slide.getValue()[9])) {
+                viewable.add(slide.getKey());
+            }
+        }
+        return viewable;
+    }
+
+    /** Viewable-slide counts per matched sample; unmatched and non-viewable slides are skipped. */
+    static Map<Long, int[]> countSampleSlidePlacements(Iterable<String[]> placements,
+                                                       Set<String> viewableImageIds) {
+        Map<Long, int[]> countsBySample = new LinkedHashMap<>();
+        for (String[] placement : placements) {
+            if (placement[5] == null || placement[5].isBlank()) {
+                continue; // unmatched slides have no sample-level count
+            }
+            if (viewableImageIds.contains(placement[2])) {
+                addPlacement(countsBySample, Long.parseLong(placement[5]), placement);
+            }
+        }
+        return countsBySample;
+    }
+
+    /** Viewable-slide counts per patient, including unmatched slides. */
+    static Map<Long, int[]> countPatientSlidePlacements(Iterable<String[]> placements,
+                                                        Set<String> viewableImageIds) {
         Map<Long, int[]> countsByPatient = new LinkedHashMap<>();
         for (String[] placement : placements) {
-            int[] counts = countsByPatient.computeIfAbsent(
-                Long.parseLong(placement[1]), ignored -> new int[3]);
-            counts[0]++;
-            if ("PART".equals(placement[6])) {
-                counts[1]++;
-            } else if ("BLOCK".equals(placement[6])) {
-                counts[2]++;
+            if (viewableImageIds.contains(placement[2])) {
+                addPlacement(countsByPatient, Long.parseLong(placement[1]), placement);
             }
         }
         return countsByPatient;
+    }
+
+    private static void addPlacement(Map<Long, int[]> countsByEntity, long entityId, String[] placement) {
+        int[] counts = countsByEntity.computeIfAbsent(entityId, ignored -> new int[3]);
+        counts[0]++;
+        if ("PART".equals(placement[6])) {
+            counts[1]++;
+        } else if ("BLOCK".equals(placement[6])) {
+            counts[2]++;
+        }
     }
 
     private static Set<String> existingSlideCountKeys(String tableName, Set<Long> entityIds)
