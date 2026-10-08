@@ -365,37 +365,17 @@ class ConverterInputTestCase(ConverterTestCase):
         rows = self.fixture_rows()
         self.assertConversionError('SLIDE_KEY is not unique', meta=self.write_legacy(rows + rows[:1]))
 
-    def test_timing_columns_are_ignored(self):
-        # Some files carry seven slide-timing columns before SLIDE_KEY. They are accepted
-        # without being required or validated, and never reach the metadata.
-        reference = Path(self.tmp.name) / 'reference'
-        written = converter.convert(FIXTURE_DIR / 'meta_wsi.txt', reference, BASE_URL)
-        timing_values = [
-            ['0', 'AVAILABLE', 'RECORDED', 'PATHOLOGY_REPORT', '',
-             'patient_first_tumor_sequencing_day_zero', 'surgery 20210314'],
-            # values the removed timing checks rejected
-            ['not-a-day', 'BOGUS', '', '', 'reason', 'other_coordinates', ''],
-        ]
-        source = (FIXTURE_DIR / 'data_wsi.txt').read_text(encoding='utf-8').splitlines()
-
-        def with_timing(line, values):
-            fields = line.split('\t')
-            return '\t'.join(fields[:-2] + values + fields[-2:])
-
-        header = with_timing(source[4], list(converter.IGNORED_TIMING_COLUMNS))
-        self.assertEqual(converter.COLUMNS_WITH_IGNORED_TIMING, header.split('\t'))
-        rows = [with_timing(row, timing_values[index % 2])
-                for index, row in enumerate(self.fixture_rows())]
-        self.convert(meta=self.write_legacy(rows, header), base_url=BASE_URL)
-        for path in written:
-            self.assertEqual(path.read_bytes(), (self.out / path.name).read_bytes(), path.name)
+    def test_file_without_timing_has_no_timing_keys(self):
+        # The timing columns are optional: without them no timing key and no undated count is written.
+        self.convert()
         for name in ('data_resource_sample.txt', 'data_resource_patient.txt'):
             for record in rows_by_slide(self.out / name).values():
                 metadata = json.loads(record['METADATA'])
                 self.assertFalse([key for key in metadata
                                   if key.startswith(('timeline_', 'timepoint_'))], metadata)
-        patients = data_rows(self.out / 'data_clinical_patient_wsi_counts.txt')[0]
-        self.assertNotIn('WSI_PATIENT_UNDATED_SLIDE_COUNT', patients)
+        text = (self.out / 'data_clinical_patient_wsi_counts.txt').read_text()
+        self.assertNotIn('WSI_PATIENT_UNDATED_SLIDE_COUNT', text)
+        self.assertNotIn('Undated', text)
 
     def test_line_break_in_output_cell_is_rejected(self):
         rows = self.fixture_rows()
@@ -570,9 +550,214 @@ class ClinicalMergeTestCase(ConverterTestCase):
         self.assertConversionError("expected the four '#' attribute header rows", study_dir=study)
 
 
+TIMING_META = FIXTURE_DIR / 'meta_wsi_timing.txt'
+TIMING_KEYS = ('timeline_start_days', 'timeline_date_status', 'timeline_date_kind',
+               'timeline_date_source', 'timeline_date_reason', 'timeline_coordinate_system',
+               'timepoint_source')
+
+
+class TimingTestCase(ConverterTestCase):
+
+    """Files with the seven optional timing columns (data_wsi_timing.txt: data_wsi.txt plus timing)."""
+
+    def timing_rows(self):
+        return (FIXTURE_DIR / 'data_wsi_timing.txt').read_text(encoding='utf-8').splitlines()[5:]
+
+    def write_timed(self, rows):
+        source = (FIXTURE_DIR / 'data_wsi_timing.txt').read_text(encoding='utf-8').splitlines()
+        legacy = Path(self.tmp.name) / 'timed'
+        legacy.mkdir(exist_ok=True)
+        shutil.copy(TIMING_META, legacy / 'meta_wsi_timing.txt')
+        (legacy / 'data_wsi_timing.txt').write_text('\n'.join(source[:5] + rows) + '\n',
+                                                    encoding='utf-8')
+        return legacy / 'meta_wsi_timing.txt'
+
+    @staticmethod
+    def with_timing_cells(row, **changes):
+        fields = row.split('\t')
+        for name, value in changes.items():
+            fields[converter.COLUMNS_WITH_TIMING.index(name)] = value
+        return '\t'.join(fields)
+
+    def metadata_by_slide(self):
+        found = {}
+        for name in ('data_resource_sample.txt', 'data_resource_patient.txt'):
+            for label, record in rows_by_slide(self.out / name).items():
+                found[label] = json.loads(record['METADATA'])
+        return found
+
+    def test_fixture_is_the_base_fixture_plus_timing(self):
+        base = (FIXTURE_DIR / 'data_wsi.txt').read_text(encoding='utf-8').splitlines()
+        timed = (FIXTURE_DIR / 'data_wsi_timing.txt').read_text(encoding='utf-8').splitlines()
+        self.assertEqual(converter.COLUMNS_WITH_TIMING, timed[4].split('\t'))
+        self.assertEqual(base, ['\t'.join(line.split('\t')[:28] + line.split('\t')[35:])
+                                for line in timed])
+
+    def test_timing_metadata(self):
+        self.convert(meta=TIMING_META)
+        metadata = self.metadata_by_slide()
+        recorded = 'Recorded procedure date relative to first tumor sequencing'
+        coordinates = 'patient_first_tumor_sequencing_day_zero'
+        self.assertEqual(
+            {'timeline_start_days': 0, 'timeline_date_status': 'AVAILABLE',
+             'timeline_date_kind': 'RECORDED', 'timeline_date_source': 'PATHOLOGY_REPORT',
+             'timeline_coordinate_system': coordinates, 'timepoint_source': recorded},
+            {key: metadata['slide-1'][key] for key in TIMING_KEYS if key in metadata['slide-1']})
+        self.assertIs(type(metadata['slide-1']['timeline_start_days']), int)
+        self.assertEqual(-17, metadata['slide-2']['timeline_start_days'])
+        self.assertEqual('Verified estimated procedure date relative to first tumor sequencing',
+                         metadata['slide-2']['timepoint_source'])
+        # undated: no day offset; the reason is kept and the timepoint source derived from it
+        self.assertEqual(
+            {'timeline_date_status': 'MISSING_PROCEDURE_DATE', 'timeline_date_kind': 'UNDATED',
+             'timeline_date_source': 'NO_VERIFIED_PROCEDURE_DATE',
+             'timeline_date_reason': 'MISSING_PROCEDURE_DATE',
+             'timeline_coordinate_system': coordinates,
+             'timepoint_source': 'MISSING_PROCEDURE_DATE'},
+            {key: metadata['slide-3'][key] for key in TIMING_KEYS if key in metadata['slide-3']})
+        # an explicit TIMEPOINT_SOURCE is kept as given
+        self.assertEqual('Curated consult date', metadata['slide-4']['timepoint_source'])
+        self.assertNotIn('timeline_start_days', metadata['slide-4'])
+        self.assertEqual(-365, metadata['slide-5']['timeline_start_days'])
+        self.assertEqual(12, metadata['slide-6']['timeline_start_days'])
+        for label in ('slide-1', 'slide-2', 'slide-5', 'slide-6'):
+            self.assertNotIn('timeline_date_reason', metadata[label])
+
+    def test_everything_but_timing_matches_the_file_without_timing(self):
+        reference = Path(self.tmp.name) / 'reference'
+        converter.convert(FIXTURE_DIR / 'meta_wsi.txt', reference, BASE_URL)
+        self.convert(meta=TIMING_META, base_url=BASE_URL)
+        for name in ('data_resource_sample.txt', 'data_resource_patient.txt'):
+            expected = rows_by_slide(reference / name)
+            for label, record in rows_by_slide(self.out / name).items():
+                metadata = json.loads(record.pop('METADATA'))
+                stripped = {key: value for key, value in metadata.items() if key not in TIMING_KEYS}
+                self.assertEqual(json.loads(expected[label].pop('METADATA')), stripped, label)
+                self.assertEqual(expected[label], record, label)
+        for name in ('data_resource_definition.txt', 'data_clinical_sample_wsi_counts.txt'):
+            self.assertEqual((reference / name).read_bytes(), (self.out / name).read_bytes(), name)
+
+    def test_undated_count(self):
+        self.convert(meta=TIMING_META)
+        self.assertEqual(
+            [['PATIENT_ID', 'WSI_PATIENT_SLIDE_COUNT', 'WSI_PATIENT_PART_MATCHED_SLIDE_COUNT',
+              'WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT', 'WSI_PATIENT_UNDATED_SLIDE_COUNT'],
+             # slide-3 and slide-4 are viewable without a procedure day
+             ['WSI-P1', '3', '0', '2', '2'],
+             ['WSI-P2', '1', '1', '0', '0'],
+             ['WSI+P3', 'NA', 'NA', 'NA', 'NA']],
+            data_rows(self.out / 'data_clinical_patient_wsi_counts.txt'))
+        header = (self.out / 'data_clinical_patient_wsi_counts.txt').read_text().splitlines()[:4]
+        self.assertEqual(
+            ['#Patient Identifier\tWSI Viewable Slides per Patient\t'
+             'WSI Viewable Slides per Patient, Part-matched\t'
+             'WSI Viewable Slides per Patient, Block-matched\t'
+             'WSI Undated Viewable Slides per Patient',
+             '#Patient identifier\t'
+             'Pathology slides the slide viewer can open, for the patient.\t'
+             'Pathology slides the slide viewer can open, for the patient, matched to a specimen part.\t'
+             'Pathology slides the slide viewer can open, for the patient, matched to a specimen block.\t'
+             'Viewable pathology slides without a procedure date, which the timeline does not show.',
+             '#STRING\tNUMBER\tNUMBER\tNUMBER\tNUMBER',
+             '#1\t1\t1\t1\t1'], header)
+        # the sample counts have no undated attribute
+        self.assertEqual(
+            ['PATIENT_ID', 'SAMPLE_ID', 'WSI_SAMPLE_SLIDE_COUNT', 'WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT',
+             'WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT'],
+            data_rows(self.out / 'data_clinical_sample_wsi_counts.txt')[0])
+
+    def test_undated_count_ignores_non_viewable_slides(self):
+        undated = dict(TIMELINE_START_DAYS='', TIMELINE_DATE_STATUS='MISSING_PROCEDURE_DATE',
+                       TIMELINE_DATE_KIND='UNDATED', TIMELINE_DATE_REASON='MISSING_PROCEDURE_DATE')
+        rows = self.timing_rows()
+        # slide-2 (WSI-P1) and slide-6 (WSI+P3) cannot serve tiles; make them undated too
+        rows[1] = self.with_timing_cells(rows[1], **undated)
+        rows[5] = self.with_timing_cells(rows[5], **undated)
+        meta = self.write_timed(rows)
+        self.convert(meta=meta)
+        self.assertEqual(
+            [['WSI-P1', '3', '0', '2', '2'],
+             ['WSI-P2', '1', '1', '0', '0'],
+             ['WSI+P3', 'NA', 'NA', 'NA', 'NA']],
+            data_rows(self.out / 'data_clinical_patient_wsi_counts.txt')[1:])
+        by_sample, by_patient = converter.count_slides(
+            converter.parse_slides(converter.iter_rows(meta.parent / 'data_wsi_timing.txt')))
+        self.assertEqual({'WSI-P1': [3, 0, 2, 2], 'WSI-P2': [1, 1, 0, 0]}, by_patient)
+        self.assertEqual({('WSI-P1', 'WSI-P1-S1'): [1, 0, 1], ('WSI-P1', 'WSI-P1-S2'): [1, 0, 1],
+                          ('WSI-P2', 'WSI-P2-S1'): [1, 1, 0]}, by_sample)
+        # a viewable slide that becomes undated is counted
+        rows[4] = self.with_timing_cells(rows[4], **undated)
+        shutil.rmtree(self.out)
+        self.convert(meta=self.write_timed(rows))
+        patients = {row[0]: row[1:] for row in data_rows(
+            self.out / 'data_clinical_patient_wsi_counts.txt')[1:]}
+        self.assertEqual(['1', '1', '0', '1'], patients['WSI-P2'])
+
+    def test_merged_clinical_file_gets_the_undated_count(self):
+        study = self.copy_study()
+        self.convert(meta=TIMING_META, study_dir=study)
+        patients = data_rows(self.out / 'data_clinical_patients.txt')
+        self.assertEqual(['WSI_PATIENT_SLIDE_COUNT', 'WSI_PATIENT_PART_MATCHED_SLIDE_COUNT',
+                          'WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT',
+                          'WSI_PATIENT_UNDATED_SLIDE_COUNT'], patients[0][-4:])
+        self.assertEqual({'WSI-P1': ['3', '0', '2', '2'], 'WSI-P2': ['1', '1', '0', '0'],
+                          'WSI+P3': ['NA', 'NA', 'NA', 'NA'], 'WSI-P4': ['NA', 'NA', 'NA', 'NA']},
+                         {row[0]: row[-4:] for row in patients[1:]})
+
+    def test_existing_undated_count_conflicts(self):
+        study = self.copy_study()
+        path = study / 'data_clinical_patients.txt'
+        lines = path.read_text().splitlines()
+        lines = [line + '\t' + ('WSI_PATIENT_UNDATED_SLIDE_COUNT' if index == 4 else
+                                 ('#NUMBER' if index == 2 else ('#1' if index == 3 else
+                                  ('#x' if index < 4 else '0'))))
+                 for index, line in enumerate(lines)]
+        path.write_text('\n'.join(lines) + '\n')
+        with self.assertRaises(converter.ConversionError) as context:
+            self.convert(meta=TIMING_META, study_dir=study)
+        self.assertIn('already defines WSI_PATIENT_UNDATED_SLIDE_COUNT', str(context.exception))
+
+    def test_inconsistent_timing_is_rejected_without_echoing_values(self):
+        cases = (
+            # row index, changes, message
+            (0, dict(TIMELINE_START_DAYS=''), 'AVAILABLE timing is inconsistent'),
+            (0, dict(TIMELINE_DATE_REASON='late 2021-03-14'), 'AVAILABLE timing is inconsistent'),
+            (0, dict(TIMELINE_DATE_KIND='UNDATED'), 'AVAILABLE timing is inconsistent'),
+            (0, dict(TIMELINE_START_DAYS='2021-03-14'), 'invalid TIMELINE_START_DAYS'),
+            (0, dict(TIMELINE_DATE_STATUS='DATE 2021-03-14'), 'invalid TIMELINE_DATE_STATUS'),
+            (0, dict(TIMELINE_DATE_KIND='DATE 2021-03-14'), 'invalid TIMELINE_DATE_KIND'),
+            (0, dict(TIMELINE_DATE_SOURCE=''), 'TIMELINE_DATE_SOURCE is required'),
+            (0, dict(TIMELINE_COORDINATE_SYSTEM='DATE 2021-03-14'),
+             'unsupported TIMELINE_COORDINATE_SYSTEM'),
+            (2, dict(TIMELINE_START_DAYS='4'), 'non-AVAILABLE timing cannot have TIMELINE_START_DAYS'),
+            (2, dict(TIMELINE_DATE_KIND='RECORDED'), 'missing procedure date must be UNDATED'),
+            (3, dict(TIMELINE_DATE_KIND='UNDATED'), 'missing reference date cannot be UNDATED'),
+        )
+        for index, changes, message in cases:
+            rows = self.timing_rows()
+            rows[index] = self.with_timing_cells(rows[index], **changes)
+            with self.assertRaises(converter.ConversionError) as context:
+                self.convert(meta=self.write_timed(rows))
+            text = str(context.exception)
+            self.assertIn('line %d: %s' % (index + 6, message), text)
+            self.assertNotIn('2021', text)
+            self.assertFalse(self.out.exists())
+
+    def test_derive_timepoint_source(self):
+        derive = converter.derive_timepoint_source
+        self.assertEqual('Verified estimated procedure date relative to first tumor sequencing',
+                         derive('ESTIMATED', 'reason', 'source', 'AVAILABLE'))
+        self.assertEqual('Recorded procedure date relative to first tumor sequencing',
+                         derive('RECORDED', '', 'source', 'AVAILABLE'))
+        self.assertEqual('reason', derive('UNDATED', 'reason', 'source', 'MISSING_PROCEDURE_DATE'))
+        self.assertEqual('source', derive('UNDATED', '', 'source', 'MISSING_PROCEDURE_DATE'))
+        self.assertEqual('MISSING_PROCEDURE_DATE',
+                         derive('UNDATED', '', '', 'MISSING_PROCEDURE_DATE'))
+
+
 class V4OnlyTestCase(ConverterTestCase):
 
-    """Only format v4 (30 columns ending with SLIDE_KEY and SEALED_SOURCE; 37 with ignored
+    """Only format v4 (30 columns ending with SLIDE_KEY and SEALED_SOURCE; 37 with the optional
     timing columns) is converted."""
 
     def assertConversionError(self, text, meta):
@@ -586,10 +771,13 @@ class V4OnlyTestCase(ConverterTestCase):
         self.assertEqual(['THUMBNAIL_CONTENT_TYPE', 'SLIDE_KEY', 'SEALED_SOURCE'], converter.COLUMNS[-3:])
         for name in ('IMAGE_ID', 'SOURCE_URL', 'THUMBNAIL_URL'):
             self.assertNotIn(name, converter.COLUMNS)
-        self.assertEqual(37, len(converter.COLUMNS_WITH_IGNORED_TIMING))
-        self.assertEqual(list(converter.IGNORED_TIMING_COLUMNS),
-                         converter.COLUMNS_WITH_IGNORED_TIMING[28:35])
-        self.assertEqual(['SLIDE_KEY', 'SEALED_SOURCE'], converter.COLUMNS_WITH_IGNORED_TIMING[-2:])
+        self.assertEqual(37, len(converter.COLUMNS_WITH_TIMING))
+        self.assertEqual(['TIMELINE_START_DAYS', 'TIMELINE_DATE_STATUS', 'TIMELINE_DATE_KIND',
+                          'TIMELINE_DATE_SOURCE', 'TIMELINE_DATE_REASON',
+                          'TIMELINE_COORDINATE_SYSTEM', 'TIMEPOINT_SOURCE'],
+                         converter.COLUMNS_WITH_TIMING[28:35])
+        self.assertEqual(list(converter.TIMING_COLUMNS), converter.COLUMNS_WITH_TIMING[28:35])
+        self.assertEqual(['SLIDE_KEY', 'SEALED_SOURCE'], converter.COLUMNS_WITH_TIMING[-2:])
         for name in ('V2_COLUMNS', 'FORMAT_COLUMNS', 'TIMELINE_REQUIRED_COLUMNS',
                      'find_pathology_timeline', 'read_timeline_index', '_parse_image_ids'):
             self.assertFalse(hasattr(converter, name), name)
@@ -621,10 +809,10 @@ class V4OnlyTestCase(ConverterTestCase):
                               if index != len(converter.COLUMNS) + drop) for row in source[5:]]
             header = '\t'.join(name for name in converter.COLUMNS if name != converter.COLUMNS[drop])
             self.assertConversionError('invalid header', self.write_legacy(rows, header))
-        # nor with the ignored timing columns and neither key column
-        timing = ['' for _ in converter.IGNORED_TIMING_COLUMNS]
+        # nor with the timing columns and neither key column
+        timing = ['' for _ in converter.TIMING_COLUMNS]
         rows = ['\t'.join(row.split('\t')[:-2] + timing) for row in source[5:]]
-        header = '\t'.join(source[4].split('\t')[:-2] + list(converter.IGNORED_TIMING_COLUMNS))
+        header = '\t'.join(source[4].split('\t')[:-2] + list(converter.TIMING_COLUMNS))
         self.assertConversionError('invalid header', self.write_legacy(rows, header))
 
     def test_timeline_options_are_gone(self):
@@ -786,7 +974,9 @@ PUBLIC_KEYS = {
     'slide_key', 'reference_sample_id', 'part_key', 'part_number', 'part_type',
     'part_description', 'subspecialty', 'block_key', 'block_number', 'block_label', 'match_level',
     'specimen_key', 'stain_name', 'stain_group', 'magnification', 'slide_type', 'is_hne', 'is_ihc',
-    'can_serve_tiles', 'file_size_bytes',
+    'can_serve_tiles', 'file_size_bytes', 'timeline_start_days', 'timeline_date_status',
+    'timeline_date_kind', 'timeline_date_source', 'timeline_date_reason',
+    'timeline_coordinate_system', 'timepoint_source',
 }
 
 
@@ -837,6 +1027,25 @@ class ConvertedFilesValidationTestCase(ConverterTestCase):
         _, problems = self.run_validator(validateData.SampleResourceValidator, 'data_resource_sample.txt')
         self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
         _, problems = self.run_validator(validateData.PatientResourceValidator, 'data_resource_patient.txt')
+        self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
+
+    def test_timed_output_passes_validation(self):
+        self.convert(meta=FIXTURE_DIR / 'meta_wsi_timing.txt')
+        validator, problems = self.run_validator(validateData.ResourceDefinitionValidator,
+                                                 'data_resource_definition.txt')
+        self.assertEqual([], [r.getMessage() for r in problems])
+        validateData.RESOURCE_DEFINITION_DICTIONARY = validator.resource_definition_dictionary
+        _, problems = self.run_validator(validateData.SampleResourceValidator, 'data_resource_sample.txt')
+        self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
+        _, problems = self.run_validator(validateData.PatientResourceValidator, 'data_resource_patient.txt')
+        self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
+        _, problems = self.run_validator(validateData.PatientClinicalValidator,
+                                         'data_clinical_patient_wsi_counts.txt')
+        self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems
+                              if 'analysis feature will not be available' not in r.getMessage()])
+        # the legacy file itself passes the WSI validator
+        shutil.copy(FIXTURE_DIR / 'data_wsi_timing.txt', self.out / 'data_wsi_timing.txt')
+        _, problems = self.run_validator(validateData.WsiValidator, 'data_wsi_timing.txt')
         self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
 
     def test_count_files_pass_clinical_validation(self):

@@ -61,6 +61,10 @@ These public keys may be returned to the browser:
   `stain_group`, `magnification`, `slide_type`;
 - JSON booleans: `is_hne`, `is_ihc`, `can_serve_tiles`;
 - JSON integers: `file_size_bytes`;
+- optional [slide timing](#slide-timing): the JSON integer
+  `timeline_start_days` and the strings `timeline_date_status`,
+  `timeline_date_kind`, `timeline_date_source`, `timeline_date_reason`,
+  `timeline_coordinate_system` and `timepoint_source`;
 
 and one private key:
 
@@ -99,7 +103,8 @@ messages never echo it.
 
 For every `WHOLE_SLIDE_IMAGE` row, `validateData.py` applies the same checks
 as the legacy WSI validator described under [Legacy format](#legacy-format-v4):
-required hierarchy keys, typed values, `match_level`
+required hierarchy keys, typed values, consistent timing when a row has any
+timing key, `match_level`
 agreement with the file type (sample rows are matched, patient rows are
 unmatched), `slide_type` being `H&E`, `IHC`, `Other`, or `Unknown` with
 consistent stain flags (never both `is_hne` and `is_ihc`; `H&E` requires
@@ -212,7 +217,8 @@ their own, or as input for merging by hand.
 
 With `--study-dir`, the converter fails without writing anything if:
 
-- a clinical file in the study already has any of the six `WSI_*` columns;
+- a clinical file in the study already has any of the six `WSI_*` count
+  columns or `WSI_PATIENT_UNDATED_SLIDE_COUNT`;
 - a sample or patient with slides is missing from the clinical sample or
   patient file, or a sample belongs to a different patient there;
 - the study has more than one clinical sample or clinical patient meta file;
@@ -235,6 +241,7 @@ The count files carry the attributes the native importer used to write, as
 | `WSI_PATIENT_SLIDE_COUNT` | WSI Viewable Slides per Patient |
 | `WSI_PATIENT_PART_MATCHED_SLIDE_COUNT` | WSI Viewable Slides per Patient, Part-matched |
 | `WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT` | WSI Viewable Slides per Patient, Block-matched |
+| `WSI_PATIENT_UNDATED_SLIDE_COUNT` | WSI Undated Viewable Slides per Patient (only with [slide timing](#slide-timing)) |
 
 Only viewable slides, those with `CAN_SERVE_TILES=TRUE` that the slide viewer
 can open, are counted, and each slide (`SLIDE_KEY`, unique within the study)
@@ -244,10 +251,14 @@ every patient with a viewable slide gets values. A sample or patient whose
 slides are all non-viewable gets no values. Part and block counts follow
 `MATCH_LEVEL`, and zero is written for an entity that has values. In a merged
 clinical file, the rows of samples or patients without a viewable slide get
-`NA`. The standalone count files list every sample or patient with a slide,
+`NA`. When the legacy file has the [timing columns](#slide-timing), the
+patient counts also get `WSI_PATIENT_UNDATED_SLIDE_COUNT`: the patient's
+viewable slides without a `timeline_start_days`, which the timeline does not
+show. Non-viewable slides are not counted there either. Without the timing
+columns the attribute is not written at all. The standalone count files list every sample or patient with a slide,
 giving `NA` to those without a viewable slide, so the entities their resource
 rows refer to stay defined; `NA` is imported as no value. The merge appends
-the six columns and their four header rows (display name, description,
+the count columns and their four header rows (display name, description,
 `NUMBER`, priority `1`); every existing line, value and line ending is kept,
 including comment and blank lines. Study View uses the patient-level values so
 pagination cannot produce partial totals. Because the counts are ordinary
@@ -257,7 +268,8 @@ clinical data, re-importing corrected files replaces them.
 
 The converter does not produce timeline data. Pathology procedure events stay
 in the study's existing clinical timeline files, which are imported unchanged.
-Slides carry no timing in `METADATA`.
+Slide timing in `METADATA` (see [Slide timing](#slide-timing)) places slides on
+the patient Summary timeline; it does not create clinical events.
 
 `PATHOLOGY SLIDES` timeline events reach the browser through the clinical
 events API, so they must not carry real slide identifiers: `validateData.py`
@@ -291,12 +303,11 @@ PATIENT_ID  REFERENCE_SAMPLE_ID  SAMPLE_ID  PART_KEY  PART_NUMBER  PART_DESIGNAT
 
 Values are tab-delimited; a row has 30 columns. `SLIDE_KEY` is the opaque
 slide key described under [Resource files](#resource-files) and
-`SEALED_SOURCE` (last) the [sealed source](#sealed-source). Files that
-still carry the seven slide-timing columns (`TIMELINE_START_DAYS` through
-`TIMEPOINT_SOURCE`) between `THUMBNAIL_CONTENT_TYPE` and `SLIDE_KEY` (37
-columns) are accepted, but those columns are ignored for now: they are neither
-required, validated nor converted. A file with an `IMAGE_ID`, `SOURCE_URL`
-or `THUMBNAIL_URL` column (format v3 and older) is rejected.
+`SEALED_SOURCE` (last) the [sealed source](#sealed-source). A file may also
+carry the seven optional [slide-timing columns](#slide-timing) between
+`THUMBNAIL_CONTENT_TYPE` and `SLIDE_KEY` (37 columns). A file with an
+`IMAGE_ID`, `SOURCE_URL` or `THUMBNAIL_URL` column (format v3 and older) is
+rejected.
 Required values are `PATIENT_ID`,
 `PART_KEY`, `BLOCK_KEY`, `MATCH_LEVEL`, `SPECIMEN_KEY`, `IS_HNE`, `IS_IHC`,
 `CAN_SERVE_TILES` and `SLIDE_KEY`. `MATCH_LEVEL` is `BLOCK`, `PART`, or `UNMATCHED`;
@@ -319,6 +330,56 @@ The converter drops the artifact columns for non-servable rows. Core does
 not perform de-identification scanning of free text; the data provider
 (upstream publication pipeline) is responsible for removing protected health
 information and deployment-specific identifiers before export.
+
+### Slide timing
+
+The timing columns are optional: a file carries all seven, in this order
+between `THUMBNAIL_CONTENT_TYPE` and `SLIDE_KEY`, or none.
+
+```text
+TIMELINE_START_DAYS  TIMELINE_DATE_STATUS  TIMELINE_DATE_KIND  TIMELINE_DATE_SOURCE  TIMELINE_DATE_REASON  TIMELINE_COORDINATE_SYSTEM  TIMEPOINT_SOURCE
+```
+
+A file without them converts and validates as described above, and its
+slides carry no timing in `METADATA`. A file with them carries the
+de-identified relative timing contract on every row, which places slides on
+the patient Summary timeline:
+
+- `TIMELINE_START_DAYS` is an integer number of days relative to the
+  patient's first tumor-sequencing sample; day zero is valid. It is blank for
+  an undated slide.
+- `TIMELINE_DATE_STATUS` is `AVAILABLE`, `MISSING_PROCEDURE_DATE`, or
+  `MISSING_REFERENCE_SEQUENCING_DATE`.
+- `TIMELINE_DATE_KIND` is `RECORDED`, `ESTIMATED`, or `UNDATED`.
+- `TIMELINE_DATE_SOURCE` (required) and `TIMELINE_DATE_REASON` preserve the
+  date provenance.
+- `TIMELINE_COORDINATE_SYSTEM` must be
+  `patient_first_tumor_sequencing_day_zero`.
+- `AVAILABLE` requires `TIMELINE_START_DAYS`, a kind other than `UNDATED`, and
+  a blank reason. The other statuses must leave `TIMELINE_START_DAYS` blank;
+  `MISSING_PROCEDURE_DATE` must be `UNDATED`, and
+  `MISSING_REFERENCE_SEQUENCING_DATE` must not be.
+- `TIMEPOINT_SOURCE` is optional free text. When blank, the converter derives
+  it: "Recorded procedure date relative to first tumor sequencing" for
+  `RECORDED`, "Verified estimated procedure date relative to first tumor
+  sequencing" for `ESTIMATED`, otherwise the reason, the source, or the status
+  (the first that is set).
+
+The converter writes these to `METADATA` as `timeline_start_days` (a JSON
+integer, omitted for undated slides), `timeline_date_status`,
+`timeline_date_kind`, `timeline_date_source`, `timeline_date_reason` (only
+when set), `timeline_coordinate_system` and `timepoint_source`, and adds
+`WSI_PATIENT_UNDATED_SLIDE_COUNT` to the patient counts (see
+[Slide counts](#slide-counts)). Missing procedure dates remain in the WSI
+hierarchy and are represented by the undated section next to the timeline;
+they are not converted into dated clinical events. `validateData.py` applies the same
+rules to the legacy file and, for `WHOLE_SLIDE_IMAGE` resource rows that have
+any timing key, to the metadata, where it also checks that
+`timeline_start_days` is a JSON integer and the other timing keys are strings.
+Errors name the column or key, never its value. The timing free text
+(`TIMELINE_DATE_SOURCE`, `TIMELINE_DATE_REASON`, `TIMEPOINT_SOURCE`) is
+returned to the browser; de-identifying it is the data provider's
+responsibility.
 
 The converter and validator assume these values were already materialized by
 the upstream artifact-generation/export pipeline. They do not discover source

@@ -13,7 +13,8 @@ writes:
   links to the standalone viewer by its opaque ``slide_key`` and carries the
   slide metadata as JSON;
 * the six ``WSI_*`` slide-count attributes the native importer used to
-  generate, counting only viewable (``CAN_SERVE_TILES``) slides: with
+  generate, counting only viewable (``CAN_SERVE_TILES``) slides, plus
+  ``WSI_PATIENT_UNDATED_SLIDE_COUNT`` when the file has slide timing: with
   ``--study-dir``, merged into copies of the study's clinical sample and
   patient files (same file names); without it, as standalone
   ``data_clinical_sample_wsi_counts.txt``/``data_clinical_patient_wsi_counts.txt``
@@ -24,10 +25,12 @@ Timeline files are not produced: existing clinical timeline files stay in the
 study and are imported unchanged.
 
 Only format v4 is accepted: 30 columns ending with the opaque ``SLIDE_KEY``
-(32 lowercase hex characters, unique per study) and ``SEALED_SOURCE``. Files
-that also carry the seven slide-timing columns before ``SLIDE_KEY`` (37
-columns) are accepted, but those columns are ignored: they are neither
-validated nor written. Files with an ``IMAGE_ID``, ``SOURCE_URL`` or
+(32 lowercase hex characters, unique per study) and ``SEALED_SOURCE``. The
+seven slide-timing columns are optional: a file may carry all of them before
+``SLIDE_KEY`` (37 columns), and then they are validated and written to the
+metadata (``timeline_start_days``, ``timeline_date_*``,
+``timeline_coordinate_system``, ``timepoint_source``) for slides on the patient
+Summary timeline. Files with an ``IMAGE_ID``, ``SOURCE_URL`` or
 ``THUMBNAIL_URL`` column (format v3 and older) are rejected.
 De-identification (contract wsi-serving-v6, sealed source): the pathology
 image ID and the object URIs that embed it never reach the study files. The
@@ -63,9 +66,9 @@ SAMPLE_RESOURCE_ID = "WSI_SAMPLE"
 PATIENT_RESOURCE_ID = "WSI_PATIENT"
 RESOURCE_TYPE = "WHOLE_SLIDE_IMAGE"
 
-# Slide-timing columns that some files still carry before SLIDE_KEY.
-# They are accepted but ignored: neither validated nor written to the metadata.
-IGNORED_TIMING_COLUMNS = (
+# The optional slide-timing columns. A file carries all of them before SLIDE_KEY or none;
+# when present they are validated and written to the metadata.
+TIMING_COLUMNS = (
     "TIMELINE_START_DAYS", "TIMELINE_DATE_STATUS", "TIMELINE_DATE_KIND",
     "TIMELINE_DATE_SOURCE", "TIMELINE_DATE_REASON", "TIMELINE_COORDINATE_SYSTEM",
     "TIMEPOINT_SOURCE",
@@ -82,8 +85,8 @@ COLUMNS = [
     "THUMBNAIL_HEIGHT", "THUMBNAIL_CONTENT_TYPE",
     "SLIDE_KEY", "SEALED_SOURCE",
 ]
-# The same with the ignored timing columns before SLIDE_KEY (37 columns).
-COLUMNS_WITH_IGNORED_TIMING = COLUMNS[:-2] + list(IGNORED_TIMING_COLUMNS) + COLUMNS[-2:]
+# The same with the timing columns before SLIDE_KEY (37 columns).
+COLUMNS_WITH_TIMING = COLUMNS[:-2] + list(TIMING_COLUMNS) + COLUMNS[-2:]
 # Format-v3 columns that carry the image ID or an object URI embedding it. A header
 # with any of them is rejected outright.
 REMOVED_COLUMNS = ("IMAGE_ID", "SOURCE_URL", "THUMBNAIL_URL")
@@ -97,6 +100,11 @@ PUBLIC_STRING_FIELDS = [
     "PART_DESCRIPTION", "SUBSPECIALTY", "BLOCK_KEY",
     "BLOCK_NUMBER", "BLOCK_LABEL", "MATCH_LEVEL", "SPECIMEN_KEY", "STAIN_NAME",
     "STAIN_GROUP", "MAGNIFICATION", "SLIDE_TYPE",
+]
+# Timing metadata strings, written when the file has the timing columns and the value is set.
+TIMING_STRING_FIELDS = [
+    "TIMELINE_DATE_STATUS", "TIMELINE_DATE_KIND", "TIMELINE_DATE_SOURCE",
+    "TIMELINE_DATE_REASON", "TIMELINE_COORDINATE_SYSTEM",
 ]
 SERVING_KEY = "wsi_serving"
 # Public keys that identify a single slide or specimen, so nearly every row has its own value.
@@ -119,6 +127,9 @@ SEALED_SOURCE_MAX_LENGTH = 4096
 
 MATCH_LEVELS = ("BLOCK", "PART", "UNMATCHED")
 SLIDE_TYPES = ("H&E", "IHC", "Other", "Unknown")
+TIMELINE_STATUSES = ("AVAILABLE", "MISSING_PROCEDURE_DATE", "MISSING_REFERENCE_SEQUENCING_DATE")
+TIMELINE_KINDS = ("RECORDED", "ESTIMATED", "UNDATED")
+TIMELINE_COORDINATE_SYSTEM = "patient_first_tumor_sequencing_day_zero"
 
 # The count attributes (the retired native importer wrote the same IDs). They count only
 # slides the viewer can open.
@@ -138,8 +149,13 @@ PATIENT_COUNT_ATTRIBUTES = [
     ("WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT", "WSI Viewable Slides per Patient, Block-matched",
      "Pathology slides the slide viewer can open, for the patient, matched to a specimen block."),
 ]
+# Written only when the file has the timing columns: viewable slides without a procedure day.
+UNDATED_COUNT_ATTRIBUTE = (
+    "WSI_PATIENT_UNDATED_SLIDE_COUNT", "WSI Undated Viewable Slides per Patient",
+    "Viewable pathology slides without a procedure date, which the timeline does not show.")
 COUNT_ATTRIBUTE_IDS = frozenset(
-    attribute[0] for attribute in SAMPLE_COUNT_ATTRIBUTES + PATIENT_COUNT_ATTRIBUTES)
+    attribute[0] for attribute
+    in SAMPLE_COUNT_ATTRIBUTES + PATIENT_COUNT_ATTRIBUTES + [UNDATED_COUNT_ATTRIBUTE])
 
 DEFINITION_FILE = "data_resource_definition.txt"
 SAMPLE_RESOURCE_FILE = "data_resource_sample.txt"
@@ -243,11 +259,11 @@ def iter_rows(data_path, columns=None):
     """Stream the legacy data file: leading '#' rows, the exact header, then slide rows.
 
     The header must be ``columns`` or, by default, ``COLUMNS`` or
-    ``COLUMNS_WITH_IGNORED_TIMING``. Yields (line number, row dict with stripped
-    values) and raises if the file has no slide rows. Ignored timing columns
-    stay in the row dict; nothing reads them.
+    ``COLUMNS_WITH_TIMING``. Yields (line number, row dict with stripped
+    values) and raises if the file has no slide rows. Rows of a file with timing
+    columns carry them as keys (see ``has_timing``).
     """
-    accepted = [columns] if columns is not None else [COLUMNS, COLUMNS_WITH_IGNORED_TIMING]
+    accepted = [columns] if columns is not None else [COLUMNS, COLUMNS_WITH_TIMING]
     lines = _iter_lines(data_path, "WSI data file")
     header = None
     for line_number, line in lines:
@@ -311,6 +327,57 @@ def _optional_int(row, field, line):
         _fail(line, f"invalid {field}")
 
 
+def has_timing(row):
+    """Whether a row comes from a file with the (optional) slide-timing columns."""
+    return "TIMELINE_DATE_STATUS" in row
+
+
+def _validate_timing(start_days, status, kind, source, reason, coordinate_system, line):
+    # The rules of the retired ImportWsiData.validateTiming; messages name columns, never values.
+    if status not in TIMELINE_STATUSES:
+        _fail(line, "invalid TIMELINE_DATE_STATUS")
+    if kind not in TIMELINE_KINDS:
+        _fail(line, "invalid TIMELINE_DATE_KIND")
+    if not source:
+        _fail(line, "TIMELINE_DATE_SOURCE is required")
+    if coordinate_system != TIMELINE_COORDINATE_SYSTEM:
+        _fail(line, "unsupported TIMELINE_COORDINATE_SYSTEM")
+    if status == "AVAILABLE":
+        if start_days is None or kind == "UNDATED" or reason:
+            _fail(line, "AVAILABLE timing is inconsistent")
+        return
+    if start_days is not None:
+        _fail(line, "non-AVAILABLE timing cannot have TIMELINE_START_DAYS")
+    if status == "MISSING_PROCEDURE_DATE" and kind != "UNDATED":
+        _fail(line, "missing procedure date must be UNDATED")
+    if status == "MISSING_REFERENCE_SEQUENCING_DATE" and kind == "UNDATED":
+        _fail(line, "missing reference date cannot be UNDATED")
+
+
+def derive_timepoint_source(kind, reason, source, status):
+    """The timepoint source of a row whose TIMEPOINT_SOURCE is blank (as ImportWsiData derived it)."""
+    if kind == "ESTIMATED":
+        return "Verified estimated procedure date relative to first tumor sequencing"
+    if kind == "RECORDED":
+        return "Recorded procedure date relative to first tumor sequencing"
+    return reason or source or status
+
+
+def timing_metadata(row, line):
+    """Validate a row's timing columns and return its timing metadata keys."""
+    start_days = _optional_int(row, "TIMELINE_START_DAYS", line)
+    _validate_timing(start_days, row["TIMELINE_DATE_STATUS"], row["TIMELINE_DATE_KIND"],
+                     row["TIMELINE_DATE_SOURCE"], row["TIMELINE_DATE_REASON"],
+                     row["TIMELINE_COORDINATE_SYSTEM"], line)
+    metadata = {field.lower(): row[field] for field in TIMING_STRING_FIELDS if row[field]}
+    if start_days is not None:
+        metadata["timeline_start_days"] = start_days
+    metadata["timepoint_source"] = row["TIMEPOINT_SOURCE"] or derive_timepoint_source(
+        row["TIMELINE_DATE_KIND"], row["TIMELINE_DATE_REASON"],
+        row["TIMELINE_DATE_SOURCE"], row["TIMELINE_DATE_STATUS"])
+    return metadata
+
+
 def sealed_source_valid(value):
     """Whether a non-empty SEALED_SOURCE has the sealed-source shape (contract wsi-serving-v6)."""
     if len(value) > SEALED_SOURCE_MAX_LENGTH or not SEALED_SOURCE_PATTERN.fullmatch(value):
@@ -369,6 +436,9 @@ def normalize_row(row, line):
             tile_metadata = None
         if not isinstance(tile_metadata, dict):
             _fail(line, "TILE_METADATA_JSON must be a JSON object")
+
+    if has_timing(row):
+        metadata.update(timing_metadata(row, line))
 
     # SEALED_SOURCE is opaque and may only be opened by the tile server; never echo it.
     sealed_source = row["SEALED_SOURCE"]
@@ -444,6 +514,7 @@ class SlideParser:
             "slide_key": slide_key,
             "display_name": display_name(row),
             "match_level": match_level,
+            "timed": has_timing(row),
             "metadata": metadata,
         }
 
@@ -464,6 +535,11 @@ class SlideCounter:
     viewable slide gets a row. Part/block counts follow MATCH_LEVEL and zeros
     are written for entities that have a row.
 
+    When the file has the timing columns (``timed``), each patient with a
+    viewable slide also gets the count of its viewable slides without
+    ``timeline_start_days`` (``WSI_PATIENT_UNDATED_SLIDE_COUNT``); non-viewable
+    slides are not counted there either.
+
     ``sample_keys`` and ``patient_keys`` record every entity with any slide,
     viewable or not, since the resource rows reference all of them.
     """
@@ -471,10 +547,26 @@ class SlideCounter:
     def __init__(self):
         self.by_sample = {}
         self.by_patient = {}
+        self.undated_by_patient = {}
+        self.timed = False
         self.sample_keys = {}
         self.patient_keys = {}
 
+    @property
+    def patient_attributes(self):
+        """The patient count attributes: the undated count only for files with timing."""
+        return PATIENT_COUNT_ATTRIBUTES + ([UNDATED_COUNT_ATTRIBUTE] if self.timed else [])
+
+    def patient_counts(self):
+        """Per-patient counts, one per ``patient_attributes`` entry."""
+        if not self.timed:
+            return self.by_patient
+        return {patient: counts + [self.undated_by_patient[patient]]
+                for patient, counts in self.by_patient.items()}
+
     def add(self, slide):
+        if slide.get("timed"):
+            self.timed = True
         sample_key = None
         self.patient_keys.setdefault((slide["patient_id"],), None)
         if slide["sample_id"] is not None:
@@ -482,6 +574,9 @@ class SlideCounter:
             self.sample_keys.setdefault(sample_key, None)
         if not slide["metadata"]["can_serve_tiles"]:
             return
+        undated = self.undated_by_patient.setdefault(slide["patient_id"], 0)
+        if slide.get("timed") and "timeline_start_days" not in slide["metadata"]:
+            self.undated_by_patient[slide["patient_id"]] = undated + 1
         targets = [self.by_patient.setdefault(slide["patient_id"], [0, 0, 0])]
         if sample_key is not None:
             targets.append(self.by_sample.setdefault(sample_key, [0, 0, 0]))
@@ -494,11 +589,14 @@ class SlideCounter:
 
 
 def count_slides(slides):
-    """Return (by_sample, by_patient) counts for a list of parsed slides (see SlideCounter)."""
+    """Return (by_sample, by_patient) counts for a list of parsed slides (see SlideCounter).
+
+    Patient counts end with the undated count when the slides have timing.
+    """
     counter = SlideCounter()
     for slide in slides:
         counter.add(slide)
-    return counter.by_sample, counter.by_patient
+    return counter.by_sample, counter.patient_counts()
 
 
 def _check_cell(value, file_name):
@@ -801,7 +899,8 @@ def _convert_into(staging, data_path, study_id, base_url, study_dir):
     finally:
         sample_writer.close()
         patient_writer.close()
-    by_sample, by_patient = counter.by_sample, counter.by_patient
+    by_sample, by_patient = counter.by_sample, counter.patient_counts()
+    patient_attributes = counter.patient_attributes
 
     definitions = []
     if sample_writer.rows:
@@ -830,10 +929,10 @@ def _convert_into(staging, data_path, study_id, base_url, study_dir):
         write_text(meta_file, meta_entries(entries, data_file))
         write_text(data_file, render_tsv(data_file, rows))
 
-    def count_values(counts):
+    def count_values(counts, width):
         # NA (no value) for an entity whose slides are all non-viewable: its row
         # still defines the sample or patient its resource rows refer to.
-        return ["NA"] * 3 if counts is None else [str(count) for count in counts]
+        return ["NA"] * width if counts is None else [str(count) for count in counts]
 
     if study_dir is None:
         if counter.sample_keys:
@@ -842,7 +941,8 @@ def _convert_into(staging, data_path, study_id, base_url, study_dir):
                          [("Patient Identifier", "Patient identifier", "PATIENT_ID"),
                           ("Sample Identifier", "Sample identifier", "SAMPLE_ID")],
                          SAMPLE_COUNT_ATTRIBUTES)
-                     + [[patient, sample] + count_values(by_sample.get((patient, sample)))
+                     + [[patient, sample] + count_values(by_sample.get((patient, sample)),
+                                                         len(SAMPLE_COUNT_ATTRIBUTES))
                         for patient, sample in counter.sample_keys],
                      "meta_clinical_sample_wsi_counts.txt",
                      [("cancer_study_identifier", study_id),
@@ -852,8 +952,8 @@ def _convert_into(staging, data_path, study_id, base_url, study_dir):
             add_pair(PATIENT_COUNTS_FILE,
                      _clinical_header_rows(
                          [("Patient Identifier", "Patient identifier", "PATIENT_ID")],
-                         PATIENT_COUNT_ATTRIBUTES)
-                     + [[patient] + count_values(by_patient.get(patient))
+                         patient_attributes)
+                     + [[patient] + count_values(by_patient.get(patient), len(patient_attributes))
                         for (patient,) in counter.patient_keys],
                      "meta_clinical_patient_wsi_counts.txt",
                      [("cancer_study_identifier", study_id),
@@ -865,7 +965,7 @@ def _convert_into(staging, data_path, study_id, base_url, study_dir):
         ("SAMPLE_ATTRIBUTES", by_sample, counter.sample_keys, ("PATIENT_ID", "SAMPLE_ID"),
          SAMPLE_COUNT_ATTRIBUTES),
         ("PATIENT_ATTRIBUTES", {(patient,): counts for patient, counts in by_patient.items()},
-         counter.patient_keys, ("PATIENT_ID",), PATIENT_COUNT_ATTRIBUTES),
+         counter.patient_keys, ("PATIENT_ID",), patient_attributes),
     )
     for datatype, counts, slide_keys, key_columns, attributes in merges:
         clinical = _find_clinical_meta(study_dir, datatype)
