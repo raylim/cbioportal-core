@@ -123,6 +123,13 @@ public class ImportResourceData extends ConsoleRunnable {
             ClickHouseBulkLoader.flushAll();
             ClickHouseBulkLoader.relaxedModeOff();
         }
+
+        // The portal reads the study slide table from wsi_slide_table_derived; rebuild this study's
+        // rows now that its WSI_SAMPLE or WSI_PATIENT rows are written.
+        if (resourceIdsInFile.contains(DaoResourceData.STUDY_SLIDE_TABLE_RESOURCE_ID)
+                || resourceIdsInFile.contains(DaoResourceData.UNMATCHED_SLIDE_RESOURCE_ID)) {
+            DaoResourceData.refreshStudySlideTable(cancerStudy.getInternalId());
+        }
     }
 
     private void importData(BufferedReader buff, List<ResourceDefinition> resources, Map<String, Integer> headerIndexMap) throws Exception {
