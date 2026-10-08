@@ -3961,15 +3961,19 @@ class WsiRowChecks(object):
         'TILE_METADATA_JSON', 'THUMBNAIL_WIDTH',
         'THUMBNAIL_HEIGHT', 'THUMBNAIL_CONTENT_TYPE', 'SLIDE_KEY', 'SEALED_SOURCE',
     ]
-    # Slide-timing columns that some files still carry before SLIDE_KEY. They are
-    # accepted but ignored: neither required, validated nor imported.
-    IGNORED_TIMING_HEADERS = [
+    # The optional slide-timing columns: a file carries all of them before SLIDE_KEY
+    # or none. When present they are validated (see _check_wsi_timing).
+    TIMING_HEADERS = [
         'TIMELINE_START_DAYS', 'TIMELINE_DATE_STATUS', 'TIMELINE_DATE_KIND',
         'TIMELINE_DATE_SOURCE', 'TIMELINE_DATE_REASON', 'TIMELINE_COORDINATE_SYSTEM',
         'TIMEPOINT_SOURCE',
     ]
-    EXPECTED_HEADERS_WITH_IGNORED_TIMING = (
-        EXPECTED_HEADERS[:-2] + IGNORED_TIMING_HEADERS + EXPECTED_HEADERS[-2:])
+    EXPECTED_HEADERS_WITH_TIMING = (
+        EXPECTED_HEADERS[:-2] + TIMING_HEADERS + EXPECTED_HEADERS[-2:])
+    TIMELINE_STATUSES = ('AVAILABLE', 'MISSING_PROCEDURE_DATE',
+                         'MISSING_REFERENCE_SEQUENCING_DATE')
+    TIMELINE_KINDS = ('RECORDED', 'ESTIMATED', 'UNDATED')
+    TIMELINE_COORDINATE_SYSTEM = 'patient_first_tumor_sequencing_day_zero'
     # Format-v3 columns that carry the image ID or an object URI embedding it.
     REMOVED_HEADERS = ('IMAGE_ID', 'SOURCE_URL', 'THUMBNAIL_URL')
     SLIDE_TYPES = ('H&E', 'IHC', 'Other', 'Unknown')
@@ -4096,12 +4100,58 @@ class WsiRowChecks(object):
                     'patient %s: %s (%s) vs %s' % (
                         patient_id, first[0] or '<none>', first[1], reference or '<none>'))
 
+    def _check_wsi_timing(self, row, line_number, column, label):
+        """Check the slide-timing values of a row that has them.
+
+        The rules of the retired native importer: the status, kind and coordinate
+        system come from fixed vocabularies, the date source is required, and the
+        status agrees with the day offset, kind and reason. Messages name the
+        field, never its value.
+        """
+        timeline_start = row['TIMELINE_START_DAYS']
+        if timeline_start:
+            try:
+                int(timeline_start)
+            except ValueError:
+                self._error('WSI timeline offset is invalid', line_number,
+                            column('TIMELINE_START_DAYS'), label('TIMELINE_START_DAYS'))
+        timeline_status = row['TIMELINE_DATE_STATUS']
+        timeline_kind = row['TIMELINE_DATE_KIND']
+        timeline_reason = row['TIMELINE_DATE_REASON']
+        if timeline_status not in self.TIMELINE_STATUSES:
+            self._error('WSI timeline status must be %s' % ', '.join(self.TIMELINE_STATUSES),
+                        line_number, column('TIMELINE_DATE_STATUS'), label('TIMELINE_DATE_STATUS'))
+        if timeline_kind not in self.TIMELINE_KINDS:
+            self._error('WSI timeline date kind must be %s' % ', '.join(self.TIMELINE_KINDS),
+                        line_number, column('TIMELINE_DATE_KIND'), label('TIMELINE_DATE_KIND'))
+        if not row['TIMELINE_DATE_SOURCE']:
+            self._error('WSI timeline date source is required', line_number,
+                        column('TIMELINE_DATE_SOURCE'), label('TIMELINE_DATE_SOURCE'))
+        if row['TIMELINE_COORDINATE_SYSTEM'] != self.TIMELINE_COORDINATE_SYSTEM:
+            self._error('WSI timeline coordinate system must be %s'
+                        % self.TIMELINE_COORDINATE_SYSTEM, line_number,
+                        column('TIMELINE_COORDINATE_SYSTEM'), label('TIMELINE_COORDINATE_SYSTEM'))
+        if timeline_status == 'AVAILABLE' and (
+                not timeline_start or timeline_kind == 'UNDATED' or timeline_reason):
+            self._error('WSI AVAILABLE timing is inconsistent', line_number,
+                        column('TIMELINE_DATE_STATUS'), label('TIMELINE_DATE_STATUS'))
+        if timeline_status != 'AVAILABLE' and timeline_start:
+            self._error('WSI non-AVAILABLE timing cannot have an offset', line_number,
+                        column('TIMELINE_START_DAYS'), label('TIMELINE_START_DAYS'))
+        if timeline_status == 'MISSING_PROCEDURE_DATE' and timeline_kind != 'UNDATED':
+            self._error('WSI missing procedure dates must be UNDATED', line_number,
+                        column('TIMELINE_DATE_KIND'), label('TIMELINE_DATE_KIND'))
+        if timeline_status == 'MISSING_REFERENCE_SEQUENCING_DATE' and timeline_kind == 'UNDATED':
+            self._error('WSI missing reference dates cannot be UNDATED', line_number,
+                        column('TIMELINE_DATE_KIND'), label('TIMELINE_DATE_KIND'))
+
     def _check_wsi_row(self, row, line_number, column, state, label=None):
         """Check one normalized WSI row.
 
         `column(name)` returns the 0-based column to report for a field (or
         None), `state` carries study-wide uniqueness/consistency data and
-        `label(name)` names a field in messages.
+        `label(name)` names a field in messages. Rows with the timing fields
+        (TIMELINE_DATE_STATUS present as a key) also get the timing checks.
         """
         if label is None:
             label = lambda name: name
@@ -4197,6 +4247,9 @@ class WsiRowChecks(object):
 
         self._check_reference_sample(row, line_number, column, state, label)
 
+        if 'TIMELINE_DATE_STATUS' in row:
+            self._check_wsi_timing(row, line_number, column, label)
+
         # SEALED_SOURCE is opaque and only the tile server can open it; report the field only.
         sealed_source = row['SEALED_SOURCE']
         if sealed_source and not self._is_sealed_source(sealed_source):
@@ -4267,6 +4320,11 @@ class ResourceValidator(WsiRowChecks, Validator):
         'STAIN_GROUP', 'MAGNIFICATION', 'SLIDE_TYPE')
     WSI_BOOLEAN_KEYS = ('IS_HNE', 'IS_IHC', 'CAN_SERVE_TILES')
     WSI_INTEGER_KEYS = ('FILE_SIZE_BYTES',)
+    # optional slide-timing keys; a row with any of them gets the timing checks
+    WSI_TIMING_STRING_KEYS = (
+        'TIMELINE_DATE_STATUS', 'TIMELINE_DATE_KIND', 'TIMELINE_DATE_SOURCE',
+        'TIMELINE_DATE_REASON', 'TIMELINE_COORDINATE_SYSTEM', 'TIMEPOINT_SOURCE')
+    WSI_TIMING_INTEGER_KEYS = ('TIMELINE_START_DAYS',)
     # Keys that would carry the pathology image ID or an object URI embedding it.
     # They are rejected both in the public metadata and inside wsi_serving: those
     # values exist only inside the sealed source.
@@ -4309,6 +4367,13 @@ class ResourceValidator(WsiRowChecks, Validator):
             for name in keys:
                 row[name] = self._wsi_value(metadata.get(name.lower()), expected,
                                             name.lower(), metadata_column)
+        timing_keys = self.WSI_TIMING_STRING_KEYS + self.WSI_TIMING_INTEGER_KEYS
+        if any(name.lower() in metadata for name in timing_keys):
+            for keys, expected in ((self.WSI_TIMING_STRING_KEYS, 'string'),
+                                   (self.WSI_TIMING_INTEGER_KEYS, 'integer')):
+                for name in keys:
+                    row[name] = self._wsi_value(metadata.get(name.lower()), expected,
+                                                name.lower(), metadata_column)
         serving = metadata.get(self.WSI_SERVING_KEY)
         if serving is None:
             return row
@@ -5063,7 +5128,7 @@ class WsiValidator(WsiRowChecks, Validator):
             self._error('WSI file has columns of format v3 or older; format v4 replaces them with '
                         'SEALED_SOURCE, so re-export data_wsi.txt', 5, cause=', '.join(removed))
             return
-        if header not in (self.EXPECTED_HEADERS, self.EXPECTED_HEADERS_WITH_IGNORED_TIMING):
+        if header not in (self.EXPECTED_HEADERS, self.EXPECTED_HEADERS_WITH_TIMING):
             self._error('Invalid WSI column header or column order', 5,
                         cause=', '.join(header))
             return
@@ -5085,7 +5150,7 @@ class WsiValidator(WsiRowChecks, Validator):
                             cause=(len(header), len(values)))
                 continue
             rows += 1
-            # ignored timing columns stay in the row; no check reads them
+            # a file with the timing columns gets the timing checks on every row
             row = dict(zip(header, (value.strip() for value in values)))
             self._check_wsi_row(row, line_number, header.index, state)
 

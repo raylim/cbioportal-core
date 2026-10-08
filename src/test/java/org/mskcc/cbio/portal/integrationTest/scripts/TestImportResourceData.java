@@ -98,7 +98,7 @@ public class TestImportResourceData extends IntegrationTestBase {
                 "source_url", "thumbnail_url", "sealed_source")) {
             assertFalse(removed, metadata.has(removed));
         }
-        // slide timing is not part of the foundation metadata
+        // the fixture comes from a data_wsi.txt without the optional timing columns
         for (String timing : List.of("timeline_start_days", "timeline_date_status", "timepoint_source")) {
             assertFalse(timing, metadata.has(timing));
         }

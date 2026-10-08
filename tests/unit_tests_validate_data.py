@@ -3477,33 +3477,102 @@ class WsiValidatorTestCase(PostClinicalDataFileTestCase):
         self.assertEqual([('SLIDE_KEY must be unique within a study', 'SLIDE_KEY')],
                          [(record.getMessage(), getattr(record, 'cause', None)) for record in records])
 
-    def test_timing_columns_are_accepted_and_ignored(self):
-        """Some files carry seven slide-timing columns before SLIDE_KEY; they are not checked."""
-        timing = validateData.WsiValidator.IGNORED_TIMING_HEADERS
+    def with_timing(self, values_by_row):
+        """data_wsi_valid.txt with the seven timing columns before SLIDE_KEY.
+
+        ``values_by_row`` gives the seven timing values of each slide row in turn
+        (the last entry repeats).
+        """
+        timing = validateData.WsiValidator.TIMING_HEADERS
         lines = Path('test_data/data_wsi_valid.txt').read_text().splitlines()
 
-        def with_timing(line, values):
+        def add(line, values):
             fields = line.split('\t')
-            return '\t'.join(fields[:-2] + values + fields[-2:])
+            return '\t'.join(fields[:-2] + list(values) + fields[-2:])
 
-        # values the removed timing checks rejected, and blanks where they required values
-        values = ['not-a-day', 'BOGUS', '', '', 'reason', 'other_coordinates', 'surgery 20210314']
-        content = [with_timing(line, ['#' + name for name in timing]) for line in lines[:4]]
-        content.append(with_timing(lines[4], list(timing)))
-        content += [with_timing(line, values) for line in lines[5:]]
-        self.assertEqual([], self.validate_wsi_content('\n'.join(content) + '\n'))
+        content = [add(line, ['#' + name for name in timing]) for line in lines[:4]]
+        content.append(add(lines[4], timing))
+        content += [add(line, values_by_row[min(index, len(values_by_row) - 1)])
+                    for index, line in enumerate(lines[5:])]
+        return '\n'.join(content) + '\n'
+
+    DATED = ['0', 'AVAILABLE', 'RECORDED', 'PATHOLOGY_REPORT', '',
+             'patient_first_tumor_sequencing_day_zero', 'surgery 20210314']
+    UNDATED = ['', 'MISSING_PROCEDURE_DATE', 'UNDATED', 'NO_VERIFIED_PROCEDURE_DATE',
+               'MISSING_PROCEDURE_DATE', 'patient_first_tumor_sequencing_day_zero', '']
+
+    def timing_errors(self, *values_by_row):
+        return [(record.getMessage(), getattr(record, 'cause', None))
+                for record in self.validate_wsi_content(self.with_timing(values_by_row))]
+
+    def test_timing_columns_are_optional(self):
+        """The seven timing columns may be absent, or present before SLIDE_KEY."""
+        self.assertEqual([], self.validate_wsi_content(
+            Path('test_data/data_wsi_valid.txt').read_text()))
+        self.assertEqual([], self.timing_errors(self.DATED, self.UNDATED))
+        estimated = ['-17', 'AVAILABLE', 'ESTIMATED', 'SURGICAL_CASE_DATE', '',
+                     'patient_first_tumor_sequencing_day_zero', '']
+        no_reference = ['', 'MISSING_REFERENCE_SEQUENCING_DATE', 'ESTIMATED', 'SURGICAL_CASE_DATE',
+                        'NO_SEQUENCING_REFERENCE', 'patient_first_tumor_sequencing_day_zero',
+                        'Curated consult date']
+        self.assertEqual([], self.timing_errors(estimated, no_reference))
         # the timing columns must keep their place before SLIDE_KEY and SEALED_SOURCE
+        timing = validateData.WsiValidator.TIMING_HEADERS
+        lines = Path('test_data/data_wsi_valid.txt').read_text().splitlines()
         header = lines[4].split('\t') + list(timing)
         content = lines[:4] + ['\t'.join(header)] + [line + '\t' * len(timing) for line in lines[5:]]
         records = self.validate_wsi_content('\n'.join(content) + '\n')
         self.assertEqual(['Invalid WSI column header or column order'],
                          [record.getMessage() for record in records])
 
+    def test_timing_vocabularies_are_checked_without_echoing_values(self):
+        values = ['2021-03-14', 'DATE 2021-03-14', 'MRN 123', '', 'reason',
+                  'other_coordinates', 'surgery 20210314']
+        errors = self.timing_errors(values)
+        self.assertEqual(
+            [('WSI timeline offset is invalid', 'TIMELINE_START_DAYS'),
+             ('WSI timeline status must be AVAILABLE, MISSING_PROCEDURE_DATE, '
+              'MISSING_REFERENCE_SEQUENCING_DATE', 'TIMELINE_DATE_STATUS'),
+             ('WSI timeline date kind must be RECORDED, ESTIMATED, UNDATED', 'TIMELINE_DATE_KIND'),
+             ('WSI timeline date source is required', 'TIMELINE_DATE_SOURCE'),
+             ('WSI timeline coordinate system must be patient_first_tumor_sequencing_day_zero',
+              'TIMELINE_COORDINATE_SYSTEM'),
+             ('WSI non-AVAILABLE timing cannot have an offset', 'TIMELINE_START_DAYS')],
+            errors[:6])
+        for value in values:
+            if value:
+                self.assertNotIn(value, repr(errors))
+
+    def test_timing_consistency(self):
+        def changed(base, **changes):
+            values = list(base)
+            for name, value in changes.items():
+                values[validateData.WsiValidator.TIMING_HEADERS.index(name)] = value
+            return values
+
+        for values, expected in (
+                (changed(self.DATED, TIMELINE_START_DAYS=''),
+                 ('WSI AVAILABLE timing is inconsistent', 'TIMELINE_DATE_STATUS')),
+                (changed(self.DATED, TIMELINE_DATE_KIND='UNDATED'),
+                 ('WSI AVAILABLE timing is inconsistent', 'TIMELINE_DATE_STATUS')),
+                (changed(self.DATED, TIMELINE_DATE_REASON='late report'),
+                 ('WSI AVAILABLE timing is inconsistent', 'TIMELINE_DATE_STATUS')),
+                (changed(self.UNDATED, TIMELINE_START_DAYS='5'),
+                 ('WSI non-AVAILABLE timing cannot have an offset', 'TIMELINE_START_DAYS')),
+                (changed(self.UNDATED, TIMELINE_DATE_KIND='RECORDED'),
+                 ('WSI missing procedure dates must be UNDATED', 'TIMELINE_DATE_KIND')),
+                (changed(self.UNDATED, TIMELINE_DATE_STATUS='MISSING_REFERENCE_SEQUENCING_DATE'),
+                 ('WSI missing reference dates cannot be UNDATED', 'TIMELINE_DATE_KIND'))):
+            self.assertEqual([expected], self.timing_errors(values), values)
+
     def test_format_v4_columns(self):
         headers = validateData.WsiValidator.EXPECTED_HEADERS
         self.assertEqual(30, len(headers))
         self.assertEqual(['THUMBNAIL_CONTENT_TYPE', 'SLIDE_KEY', 'SEALED_SOURCE'], headers[-3:])
-        self.assertEqual(37, len(validateData.WsiValidator.EXPECTED_HEADERS_WITH_IGNORED_TIMING))
+        with_timing = validateData.WsiValidator.EXPECTED_HEADERS_WITH_TIMING
+        self.assertEqual(37, len(with_timing))
+        self.assertEqual(validateData.WsiValidator.TIMING_HEADERS, with_timing[28:35])
+        self.assertEqual(['SLIDE_KEY', 'SEALED_SOURCE'], with_timing[-2:])
         for name in ('IMAGE_ID', 'SOURCE_URL', 'THUMBNAIL_URL'):
             self.assertNotIn(name, headers)
 
@@ -3697,12 +3766,56 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
             self.metadata(slide_type='Unknown', is_hne=False))])
         self.assertEqual([], errors)
 
-    def test_timing_metadata_is_not_checked(self):
-        # slide timing is not part of the WSI metadata contract yet
+    TIMING = {
+        'timeline_start_days': -3, 'timeline_date_status': 'AVAILABLE',
+        'timeline_date_kind': 'RECORDED', 'timeline_date_source': 'PATHOLOGY_REPORT',
+        'timeline_coordinate_system': 'patient_first_tumor_sequencing_day_zero',
+        'timepoint_source': 'Recorded procedure date relative to first tumor sequencing',
+    }
+
+    def timed_metadata(self, **changes):
+        return self.metadata(**dict(self.TIMING, **changes))
+
+    def test_timing_metadata_is_optional_and_accepted(self):
+        self.assertEqual([], self.validate_resource(validateData.SampleResourceValidator,
+                                                    [self.sample_row(self.timed_metadata())]))
+        undated = self.timed_metadata(
+            slide='slide-9', match_level='UNMATCHED', timeline_start_days=None,
+            timeline_date_status='MISSING_PROCEDURE_DATE', timeline_date_kind='UNDATED',
+            timeline_date_reason='MISSING_PROCEDURE_DATE', timepoint_source='MISSING_PROCEDURE_DATE')
+        self.assertEqual([], self.validate_resource(validateData.PatientResourceValidator,
+                                                    [self.patient_row(undated)]))
+
+    def test_timing_metadata_types(self):
+        errors = self.validate_resource(validateData.SampleResourceValidator,
+                                        [self.sample_row(self.timed_metadata(timeline_start_days='-3'))])
+        self.assertEqual([('WHOLE_SLIDE_IMAGE metadata value must be a JSON integer',
+                           'timeline_start_days')], errors)
+        for key in ('timeline_date_status', 'timeline_date_kind', 'timeline_date_source',
+                    'timeline_date_reason', 'timeline_coordinate_system', 'timepoint_source'):
+            errors = self.validate_resource(validateData.SampleResourceValidator,
+                                            [self.sample_row(self.timed_metadata(**{key: 7}))])
+            self.assertIn(('WHOLE_SLIDE_IMAGE metadata value must be a JSON string', key), errors)
+
+    def test_consistent_timing(self):
+        errors = self.validate_resource(validateData.SampleResourceValidator,
+                                        [self.sample_row(self.timed_metadata(timeline_start_days=None))])
+        self.assertEqual([('WSI AVAILABLE timing is inconsistent', 'METADATA.timeline_date_status')],
+                         errors)
         errors = self.validate_resource(validateData.SampleResourceValidator, [self.sample_row(
-            self.metadata(timeline_start_days='-3', timeline_date_status='MISSING_PROCEDURE_DATE',
-                          timeline_date_kind='BOGUS'))])
-        self.assertEqual([], errors)
+            self.timed_metadata(timeline_date_status='MISSING_PROCEDURE_DATE'))])
+        self.assertIn(('WSI non-AVAILABLE timing cannot have an offset',
+                       'METADATA.timeline_start_days'), errors)
+        self.assertIn(('WSI missing procedure dates must be UNDATED',
+                       'METADATA.timeline_date_kind'), errors)
+        # any timing key brings in the timing checks, which then require the others
+        errors = self.validate_resource(validateData.SampleResourceValidator, [self.sample_row(
+            self.metadata(timeline_date_kind='DATE 2021-03-14'))])
+        self.assertIn(('WSI timeline date kind must be RECORDED, ESTIMATED, UNDATED',
+                       'METADATA.timeline_date_kind'), errors)
+        self.assertIn(('WSI timeline date source is required', 'METADATA.timeline_date_source'),
+                      errors)
+        self.assertNotIn('2021', repr(errors))
 
     def test_slide_key_unique_across_resource_files(self):
         errors = self.validate_resource(validateData.SampleResourceValidator,
