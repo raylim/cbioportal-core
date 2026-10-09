@@ -295,7 +295,6 @@ public final class DaoCancerStudy {
         CancerStudy existing = getCancerStudyByStableId(stableId);
         if (existing!=null) {
             if (overwrite) {
-                //setStatus(Status.UNAVAILABLE, stableId);
                 deleteCancerStudy(existing.getInternalId());
             } else {
                 throw new DaoException("Cancer study " + stableId + "is already imported.");
@@ -458,7 +457,6 @@ public final class DaoCancerStudy {
     public static void deleteCancerStudy(String cancerStudyStableId) throws DaoException {
         CancerStudy study = getCancerStudyByStableId(cancerStudyStableId);
         if (study != null){
-            //setStatus(Status.UNAVAILABLE, cancerStudyStableId);
             deleteCancerStudy(study.getInternalId());
         }
     }
@@ -505,6 +503,10 @@ public final class DaoCancerStudy {
         PreparedStatement pstmt = null;
         ResultSet rs = null;
         try {
+            // The cancer_study row is deleted last; hide the study first so the portal does not
+            // serve it while its data is partially deleted.
+            setStatus(Status.UNAVAILABLE, null, internalCancerStudyId);
+
             // check whether should delete generic assay meta profile by profile
             DaoGenericAssay.checkAndDeleteGenericAssayMetaInStudy(internalCancerStudyId);
             
@@ -539,17 +541,16 @@ public final class DaoCancerStudy {
             ClickHouseBulkDeleter.getBulkDeleter("sample_list_list", "list_id").addIds(sampleListIds);
 
             ClickHouseBulkDeleter.getBulkDeleter("clinical_sample", "internal_id").addIds(sampleIds);
-            ClickHouseBulkDeleter.getBulkDeleter("resource_sample", "internal_id").addIds(sampleIds);
 
             ClickHouseBulkDeleter.getBulkDeleter("sample", "internal_id").addIds(sampleIds);
             ClickHouseBulkDeleter.getBulkDeleter("clinical_patient", "internal_id").addIds(patientIds);
-            ClickHouseBulkDeleter.getBulkDeleter("resource_patient", "internal_id").addIds(patientIds);
 
             ClickHouseBulkDeleter.flushAll();
 
             deleteByStudyId("DELETE FROM clinical_attribute_meta WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM resource_definition WHERE cancer_study_id=?", internalCancerStudyId);
-            deleteByStudyId("DELETE FROM resource_study WHERE internal_id=?", internalCancerStudyId);
+            // resource_data declares its columns in upper case; ClickHouse identifiers are case-sensitive.
+            deleteByStudyId("DELETE FROM resource_data WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM cancer_study_tags WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM copy_number_seg WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM copy_number_seg_file WHERE cancer_study_id=?", internalCancerStudyId);
