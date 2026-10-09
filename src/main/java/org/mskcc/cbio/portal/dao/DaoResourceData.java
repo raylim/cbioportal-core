@@ -222,27 +222,6 @@ public final class DaoResourceData {
         "stain_name", "stain_group", "magnification", "part_number", "block_number",
         "match_level");
 
-    /** Removes one study's rows from wsi_slide_table_derived, e.g. when the study is deleted. */
-    public static void deleteStudySlideTable(int cancerStudyId) throws DaoException {
-        Connection con = null;
-        try {
-            con = JdbcUtil.getDbConnection(DaoResourceData.class);
-            deleteStudySlideTable(con, cancerStudyId);
-        } catch (SQLException e) {
-            throw new DaoException(e);
-        } finally {
-            JdbcUtil.closeAll(DaoResourceData.class, con, null, null);
-        }
-    }
-
-    private static void deleteStudySlideTable(Connection con, int cancerStudyId) throws SQLException {
-        try (PreparedStatement delete = con.prepareStatement(
-                "DELETE FROM wsi_slide_table_derived WHERE cancer_study_id = ?")) {
-            delete.setInt(1, cancerStudyId);
-            delete.executeUpdate();
-        }
-    }
-
     /**
      * Rebuilds one study's rows of wsi_slide_table_derived: every slide the viewer can open
      * (can_serve_tiles), from WSI_SAMPLE and, with no sample, WSI_PATIENT's unmatched slides, all filed
@@ -258,7 +237,11 @@ public final class DaoResourceData {
         Connection con = null;
         try {
             con = JdbcUtil.getDbConnection(DaoResourceData.class);
-            deleteStudySlideTable(con, cancerStudyId);
+            try (PreparedStatement delete = con.prepareStatement(
+                    "DELETE FROM wsi_slide_table_derived WHERE cancer_study_id = ?")) {
+                delete.setInt(1, cancerStudyId);
+                delete.executeUpdate();
+            }
             try (PreparedStatement insert = con.prepareStatement(
                     "INSERT INTO wsi_slide_table_derived "
                     + "SELECT resource_data_id, '" + STUDY_SLIDE_TABLE_RESOURCE_ID + "', cancer_study_id, "

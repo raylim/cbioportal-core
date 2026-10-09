@@ -553,7 +553,7 @@ public final class DaoCancerStudy {
             // resource_data carries cancer_study_id, where the three tables it replaced had to be
             // reached through the sample's and patient's internal ids and the study's own id.
             deleteByStudyId("DELETE FROM resource_data WHERE cancer_study_id=?", internalCancerStudyId);
-            DaoResourceData.deleteStudySlideTable(internalCancerStudyId);
+            deleteByStudyId("DELETE FROM wsi_slide_table_derived WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM cancer_study_tags WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM copy_number_seg WHERE cancer_study_id=?", internalCancerStudyId);
             deleteByStudyId("DELETE FROM copy_number_seg_file WHERE cancer_study_id=?", internalCancerStudyId);
