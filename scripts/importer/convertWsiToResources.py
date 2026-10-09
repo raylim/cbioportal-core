@@ -3,8 +3,7 @@
 
 The converter is deliberately offline: it never connects to cBioPortal, a
 database, or an artifact store. It reads ``meta_wsi.txt``/``data_wsi.txt``,
-applies the row parsing and normalization of the retired native importer, and
-writes:
+parses and normalizes the slide rows, and writes:
 
 * ``data_resource_definition.txt`` with the ``WSI_SAMPLE``/``WSI_PATIENT``
   definitions that have rows;
@@ -12,8 +11,7 @@ writes:
   ``BLOCK``) and ``data_resource_patient.txt`` for unmatched slides; each row
   links to the standalone viewer by its opaque ``slide_key`` and carries the
   slide metadata as JSON;
-* the six ``WSI_*`` slide-count attributes the native importer used to
-  generate, counting only viewable (``CAN_SERVE_TILES``) slides: with
+* six ``WSI_*`` slide-count attributes, counting only viewable (``CAN_SERVE_TILES``) slides: with
   ``--study-dir``, merged into copies of the study's clinical sample and
   patient files (same file names); without it, as standalone
   ``data_clinical_sample_wsi_counts.txt``/``data_clinical_patient_wsi_counts.txt``
@@ -41,9 +39,8 @@ never values.
 
 Rows are streamed, so large studies convert in bounded memory; output is
 staged next to ``--output-dir`` and only moved there when the conversion
-succeeds. The output is not validated here beyond what the native importer
-checked while parsing; run ``validateData.py`` on the study after adding the
-files.
+succeeds. The output is not validated here beyond the row contract checked
+while parsing; run ``validateData.py`` on the study after adding the files.
 """
 
 import argparse
@@ -59,6 +56,8 @@ from pathlib import Path
 from urllib.parse import quote, urlparse
 
 
+# The WSI row contract below (resource IDs, columns, slide key, sealed source, slide
+# types, stain rule) is also what validateData.py checks WHOLE_SLIDE_IMAGE rows against.
 SAMPLE_RESOURCE_ID = "WSI_SAMPLE"
 PATIENT_RESOURCE_ID = "WSI_PATIENT"
 RESOURCE_TYPE = "WHOLE_SLIDE_IMAGE"
@@ -99,14 +98,41 @@ PUBLIC_STRING_FIELDS = [
     "STAIN_GROUP", "MAGNIFICATION", "SLIDE_TYPE",
 ]
 SERVING_KEY = "wsi_serving"
-# Public keys that identify a single slide or specimen, so nearly every row has its own value.
-# The definitions declare them non-filterable in their CUSTOM_METADATA contract; otherwise the
-# portal's resource table lists every distinct value as a filter option (over a million for
-# slide_key on a large study). The columns stay visible, searchable and sortable.
-UNFILTERABLE_KEYS = ("slide_key", "part_key", "block_key", "specimen_key",
-                     "reference_sample_id")
+# The CUSTOM_METADATA contract of both WSI resource definitions: every public metadata key the
+# converter writes, so validateData.py's undeclared-key check holds for converted files. The
+# private wsi_serving object is not a column and is never declared. Keys that identify a single
+# slide or specimen (nearly every row has its own value) and free text are not filterable;
+# otherwise the portal's resource table would list every distinct value as a filter option (over
+# a million for slide_key on a large study). Keys, types and labels of the stain, magnification,
+# part, block and match-level columns follow the backend's study slide table.
+CONTRACT_FIELDS = [
+    # (key, type, label, filterable, visibleByDefault)
+    ("stain_name", "string", "Stain", True, True),
+    ("stain_group", "string", "Stain Group", True, True),
+    ("magnification", "string", "Magnification", True, True),
+    ("part_number", "number", "Part", True, True),
+    ("block_number", "number", "Block", True, True),
+    ("match_level", "string", "Matched At", True, False),
+    ("slide_type", "string", "Slide Type", True, True),
+    ("is_hne", None, "H&E", True, False),
+    ("is_ihc", None, "IHC", True, False),
+    ("can_serve_tiles", None, "Viewable", True, False),
+    ("part_type", "string", "Part Type", True, False),
+    ("part_description", "string", "Part Description", False, False),
+    ("subspecialty", "string", "Subspecialty", True, False),
+    ("block_label", "string", "Block Label", False, False),
+    ("file_size_bytes", "number", "File Size (bytes)", False, False),
+    ("slide_key", "string", "Slide Key", False, False),
+    ("part_key", "string", "Part Key", False, False),
+    ("block_key", "string", "Block Key", False, False),
+    ("specimen_key", "string", "Specimen Key", False, False),
+    ("reference_sample_id", "string", "Reference Sample", False, False),
+]
 CUSTOM_METADATA = json.dumps(
-    {"version": 1, "fields": [{"key": key, "filterable": False} for key in UNFILTERABLE_KEYS]},
+    {"version": 1, "fields": [
+        dict({"key": key}, **({"type": kind} if kind else {}),
+             label=label, filterable=filterable, visibleByDefault=visible)
+        for key, kind, label, filterable, visible in CONTRACT_FIELDS]},
     separators=(",", ":"))
 
 # Opaque per-slide key computed upstream from a salted hash of image_id.
@@ -120,8 +146,7 @@ SEALED_SOURCE_MAX_LENGTH = 4096
 MATCH_LEVELS = ("BLOCK", "PART", "UNMATCHED")
 SLIDE_TYPES = ("H&E", "IHC", "Other", "Unknown")
 
-# The count attributes (the retired native importer wrote the same IDs). They count only
-# slides the viewer can open.
+# The count attributes. They count only slides the viewer can open.
 SAMPLE_COUNT_ATTRIBUTES = [
     ("WSI_SAMPLE_SLIDE_COUNT", "WSI Viewable Slides per Sample",
      "Pathology slides the slide viewer can open, for the sample."),
@@ -221,8 +246,7 @@ def display_name(row):
 def _iter_lines(path, what):
     """Yield (line number, text) for each line of a UTF-8 file, split on LF only.
 
-    Splitting on LF alone (as the native importer did) keeps a stray CR inside a
-    value in its row, so it is reported instead of silently starting a new row.
+    Splitting on LF alone keeps a stray CR inside a value in its row, so it is reported instead of silently starting a new row.
     """
     try:
         with open(path, "rb") as stream:
@@ -239,15 +263,14 @@ def _iter_lines(path, what):
         raise ConversionError(f"{path}: cannot read {what}: {error}") from error
 
 
-def iter_rows(data_path, columns=None):
+def iter_rows(data_path):
     """Stream the legacy data file: leading '#' rows, the exact header, then slide rows.
 
-    The header must be ``columns`` or, by default, ``COLUMNS`` or
-    ``COLUMNS_WITH_IGNORED_TIMING``. Yields (line number, row dict with stripped
-    values) and raises if the file has no slide rows. Ignored timing columns
-    stay in the row dict; nothing reads them.
+    The header must be ``COLUMNS`` or ``COLUMNS_WITH_IGNORED_TIMING``. Yields
+    (line number, row dict with stripped values) and raises if the file has no
+    slide rows. Ignored timing columns stay in the row dict; nothing reads them.
     """
-    accepted = [columns] if columns is not None else [COLUMNS, COLUMNS_WITH_IGNORED_TIMING]
+    accepted = [COLUMNS, COLUMNS_WITH_IGNORED_TIMING]
     lines = _iter_lines(data_path, "WSI data file")
     header = None
     for line_number, line in lines:
@@ -279,11 +302,6 @@ def iter_rows(data_path, columns=None):
         yield line_number, dict(zip(columns, fields))
     if not found:
         raise ConversionError(f"{data_path}: WSI data file contains no slide rows")
-
-
-def read_rows(data_path, columns=None):
-    """Read every row of a legacy data file into a list (see iter_rows)."""
-    return list(iter_rows(data_path, columns))
 
 
 def _fail(line, message):
@@ -323,7 +341,7 @@ def sealed_source_valid(value):
 
 
 def stain_flags_valid(slide_type, is_hne, is_ihc):
-    """Mirror the native wsi_slide_stain_flags_valid CHECK constraint."""
+    """Whether IS_HNE/IS_IHC agree with SLIDE_TYPE (at most one is set, and only for its type)."""
     return (not (is_hne and is_ihc)
             and (slide_type != "H&E" or is_hne)
             and (slide_type != "IHC" or is_ihc)
@@ -343,8 +361,6 @@ def normalize_row(row, line):
     metadata["is_ihc"] = _boolean(row, "IS_IHC", line)
     can_serve = _boolean(row, "CAN_SERVE_TILES", line)
     metadata["can_serve_tiles"] = can_serve
-    # The native wsi_slide table enforced these as CHECK constraints
-    # (wsi_slide_type_valid and wsi_slide_stain_flags_valid).
     if row["SLIDE_TYPE"] not in SLIDE_TYPES:
         _fail(line, "SLIDE_TYPE must be one of " + ", ".join(SLIDE_TYPES))
     if not stain_flags_valid(row["SLIDE_TYPE"], metadata["is_hne"], metadata["is_ihc"]):
@@ -448,12 +464,6 @@ class SlideParser:
         }
 
 
-def parse_slides(rows):
-    """Normalize every row (see SlideParser)."""
-    parser = SlideParser()
-    return [parser.parse(line, row) for line, row in rows]
-
-
 class SlideCounter:
     """Per-entity counts of the slides the viewer can open.
 
@@ -493,14 +503,6 @@ class SlideCounter:
                 counts[2] += 1
 
 
-def count_slides(slides):
-    """Return (by_sample, by_patient) counts for a list of parsed slides (see SlideCounter)."""
-    counter = SlideCounter()
-    for slide in slides:
-        counter.add(slide)
-    return counter.by_sample, counter.by_patient
-
-
 def _check_cell(value, file_name):
     text = "" if value is None else str(value)
     if any(character in text for character in "\t\n\r"):
@@ -513,10 +515,6 @@ def _check_cell(value, file_name):
 def render_tsv(file_name, rows):
     """Render raw tab-separated rows; no quoting, one physical line per record."""
     return "\n".join("\t".join(_check_cell(value, file_name) for value in row) for row in rows) + "\n"
-
-
-def write_tsv(path, rows):
-    path.write_text(render_tsv(path.name, rows), encoding="utf-8")
 
 
 def render_meta(entries):
@@ -626,8 +624,7 @@ def merge_clinical_counts(data_path, attributes, key_columns, counts, slide_keys
     ``key_columns`` names the identifier columns that key ``counts`` (a dict from
     identifier tuples to one count per attribute). ``slide_keys`` lists every entity
     with a slide, viewable or not (default: the keys of ``counts``); each must be in
-    the clinical file. Rows of entities without a viewable slide get NA, as the native
-    importer wrote no value for them. Every existing line, value and
+    the clinical file. Rows of entities without a viewable slide get NA (no value). Every existing line, value and
     line ending is kept; comment and blank lines after the header are unchanged.
     """
     name = data_path.name

@@ -43,8 +43,7 @@ import json
 import yaml
 import xml.etree.ElementTree as ET
 from pathlib import Path
-import binascii
-from base64 import urlsafe_b64decode, urlsafe_b64encode
+from base64 import urlsafe_b64encode
 import math
 from abc import ABCMeta, abstractmethod
 from urllib.parse import urlparse
@@ -52,15 +51,6 @@ from urllib.parse import urlparse
 WSI_TILE_METADATA_SCHEMA_VERSION = 2
 WSI_DECODE_POLICY_VERSION = 'geometry-v2;tile-max=16777216;thumbnail-max=16777216'
 WSI_MAX_DECODE_PIXELS = 16777216
-
-# Opaque per-slide key computed upstream (e.g. a salted hash of the pathology
-# image ID); it is the only slide identifier exposed in public metadata.
-WSI_SLIDE_KEY = re.compile(r'[0-9a-f]{32}')
-# Sealed slide source (contract wsi-serving-v6): unpadded base64url of
-# nonce(12) || ciphertext || tag(16), opened only by the tile server.
-WSI_SEALED_SOURCE = re.compile(r'[A-Za-z0-9_-]+')
-WSI_SEALED_SOURCE_MIN_BYTES = 12 + 1 + 16
-WSI_SEALED_SOURCE_MAX_LENGTH = 4096
 
 # Configure relative imports if running as a script; see PEP 366
 # it might passed as empty string by certain tooling to mark a top level module.
@@ -75,6 +65,8 @@ if __name__ == "__main__" and (__package__ is None or __package__ == ''):
     importlib.import_module(__package__)
 
 from . import cbioportal_common
+# The WSI row contract (columns, slide key, sealed source, stain rule) lives with the converter.
+from . import convertWsiToResources as wsi_contract
 
 
 # ------------------------------------------------------------------------------
@@ -91,6 +83,10 @@ sample_ids_panel_dict = {}
 
 # resource globals
 RESOURCE_DEFINITION_DICTIONARY = {}
+# resource_id -> set of metadata keys the resource's CUSTOM_METADATA contract declares. A resource
+# with no contract is absent from this map, which is what keeps resources that predate contracts
+# importing unchanged. Populated from the definition file before any resource data file is read.
+RESOURCE_CONTRACT_KEYS = {}
 RESOURCE_PATIENTS_WITH_SAMPLES = None
 # study-wide cross-row state for WHOLE_SLIDE_IMAGE resource rows (see WsiRowChecks);
 # shared by the sample and patient resource files so SLIDE_KEY stays unique per study
@@ -145,7 +141,6 @@ VALIDATOR_IDS = {
     cbioportal_common.MetaFileTypes.PATIENT_RESOURCES:'PatientResourceValidator',
     cbioportal_common.MetaFileTypes.STUDY_RESOURCES:'StudyResourceValidator',
     cbioportal_common.MetaFileTypes.RESOURCES_DEFINITION:'ResourceDefinitionValidator',
-    cbioportal_common.MetaFileTypes.WSI: 'WsiValidator',
 }
 
 
@@ -3754,6 +3749,7 @@ class ResourceDefinitionValidator(Validator):
         """Initialize a ResourceDefinitionValidator with the given parameters."""
         super(ResourceDefinitionValidator, self).__init__(*args, **kwargs)
         self.resource_definition_dictionary = {}
+        self.resource_contract_keys = {}
 
     # Keys the portal reads from the contract. Anything else is ignored downstream, so a
     # misspelling would otherwise be silently discarded: the portal treats a structurally
@@ -3761,6 +3757,19 @@ class ResourceDefinitionValidator(Validator):
     CONTRACT_FIELD_KEYS = {'key', 'type', 'label', 'description', 'filterable',
                            'visibleByDefault'}
     CONTRACT_FIELD_TYPES = {'string', 'number'}
+
+    @staticmethod
+    def declaredKeys(contract):
+        """The metadata keys a parsed contract declares, for checking data files against.
+
+        Returns None for a contract the portal cannot read. Such a contract is reported
+        separately and the portal falls back to deriving columns from the data, so the keys
+        a file carries are not undeclared - there is no contract to declare them against.
+        """
+        if not isinstance(contract, dict) or not isinstance(contract.get('fields'), list):
+            return None
+        return {field['key'] for field in contract['fields']
+                if isinstance(field, dict) and field.get('key')}
 
     def checkCustomMetadataContract(self, contract, col_index):
         """Check the shape of a parsed CUSTOM_METADATA contract.
@@ -3908,8 +3917,11 @@ class ResourceDefinitionValidator(Validator):
                 custom_metadata_value = value.strip()
                 if custom_metadata_value and custom_metadata_value.lower() not in self.NULL_VALUES:
                     try:
-                        self.checkCustomMetadataContract(
-                            json.loads(custom_metadata_value), col_index)
+                        contract = json.loads(custom_metadata_value)
+                        self.checkCustomMetadataContract(contract, col_index)
+                        declared = self.declaredKeys(contract)
+                        if declared is not None:
+                            self.resource_contract_keys[resource_id] = declared
                     except json.JSONDecodeError as e:
                         self.logger.error(
                             'Invalid JSON in CUSTOM_METADATA column.',
@@ -3944,35 +3956,15 @@ def wsi_resource_state():
 
 
 class WsiRowChecks(object):
-    """Whole-slide-image row contract shared by the legacy WSI file validator and
-    WHOLE_SLIDE_IMAGE rows in standard sample/patient resource files.
+    """Whole-slide-image row contract for WHOLE_SLIDE_IMAGE rows in sample/patient
+    resource files.
 
     Rows are dicts keyed by the format-v4 column names with stripped string
-    values ('' for missing), so both inputs go through the same checks.
+    values ('' for missing).
     """
 
-    EXPECTED_HEADERS = [
-        'PATIENT_ID', 'REFERENCE_SAMPLE_ID', 'SAMPLE_ID',
-        'PART_KEY', 'PART_NUMBER', 'PART_DESIGNATOR', 'PART_TYPE',
-        'PART_DESCRIPTION', 'SUBSPECIALTY', 'PATH_DX_TITLE', 'BLOCK_KEY',
-        'BLOCK_NUMBER', 'BLOCK_LABEL', 'MATCH_LEVEL', 'SPECIMEN_KEY',
-        'STAIN_NAME', 'STAIN_GROUP', 'IS_HNE', 'IS_IHC', 'MAGNIFICATION',
-        'FILE_SIZE_BYTES', 'BARCODE', 'SLIDE_TYPE', 'CAN_SERVE_TILES',
-        'TILE_METADATA_JSON', 'THUMBNAIL_WIDTH',
-        'THUMBNAIL_HEIGHT', 'THUMBNAIL_CONTENT_TYPE', 'SLIDE_KEY', 'SEALED_SOURCE',
-    ]
-    # Slide-timing columns that some files still carry before SLIDE_KEY. They are
-    # accepted but ignored: neither required, validated nor imported.
-    IGNORED_TIMING_HEADERS = [
-        'TIMELINE_START_DAYS', 'TIMELINE_DATE_STATUS', 'TIMELINE_DATE_KIND',
-        'TIMELINE_DATE_SOURCE', 'TIMELINE_DATE_REASON', 'TIMELINE_COORDINATE_SYSTEM',
-        'TIMEPOINT_SOURCE',
-    ]
-    EXPECTED_HEADERS_WITH_IGNORED_TIMING = (
-        EXPECTED_HEADERS[:-2] + IGNORED_TIMING_HEADERS + EXPECTED_HEADERS[-2:])
-    # Format-v3 columns that carry the image ID or an object URI embedding it.
-    REMOVED_HEADERS = ('IMAGE_ID', 'SOURCE_URL', 'THUMBNAIL_URL')
-    SLIDE_TYPES = ('H&E', 'IHC', 'Other', 'Unknown')
+    # format-v4 column names; rows are keyed by them
+    EXPECTED_HEADERS = wsi_contract.COLUMNS
     REQUIRED_VALUES = {
         'PATIENT_ID', 'PART_KEY', 'BLOCK_KEY', 'MATCH_LEVEL',
         'SPECIMEN_KEY', 'IS_HNE', 'IS_IHC', 'CAN_SERVE_TILES', 'SLIDE_KEY',
@@ -4059,17 +4051,6 @@ class WsiRowChecks(object):
             return False
         return WsiRowChecks._is_media_type_token(media_type[len('image/'):])
 
-    @staticmethod
-    def _is_sealed_source(value):
-        """Whether a non-empty SEALED_SOURCE has the sealed-source shape."""
-        if len(value) > WSI_SEALED_SOURCE_MAX_LENGTH or not WSI_SEALED_SOURCE.fullmatch(value):
-            return False
-        try:
-            decoded = urlsafe_b64decode(value + '=' * (-len(value) % 4))
-        except (binascii.Error, ValueError):
-            return False
-        return len(decoded) >= WSI_SEALED_SOURCE_MIN_BYTES
-
     def _check_reference_sample(self, row, line_number, column, state, label):
         """Require one reference sample per patient across all WSI rows of the study.
 
@@ -4126,25 +4107,19 @@ class WsiRowChecks(object):
                     self._error('WSI numeric value is invalid', line_number,
                                 column(name), row[name])
 
-        # The native wsi_slide table enforced these as CHECK constraints
-        # (wsi_slide_type_valid and wsi_slide_stain_flags_valid).
         slide_type = row['SLIDE_TYPE']
-        if slide_type not in self.SLIDE_TYPES:
+        if slide_type not in wsi_contract.SLIDE_TYPES:
             self._error('WSI SLIDE_TYPE must be H&E, IHC, Other, or Unknown', line_number,
                         column('SLIDE_TYPE'), slide_type)
         elif row['IS_HNE'] in ('TRUE', 'FALSE') and row['IS_IHC'] in ('TRUE', 'FALSE'):
-            is_hne = row['IS_HNE'] == 'TRUE'
-            is_ihc = row['IS_IHC'] == 'TRUE'
-            if ((is_hne and is_ihc)
-                    or (slide_type == 'H&E' and not is_hne)
-                    or (slide_type == 'IHC' and not is_ihc)
-                    or (slide_type in ('Other', 'Unknown') and (is_hne or is_ihc))):
+            if not wsi_contract.stain_flags_valid(
+                    slide_type, row['IS_HNE'] == 'TRUE', row['IS_IHC'] == 'TRUE'):
                 self._error('WSI IS_HNE/IS_IHC are inconsistent with SLIDE_TYPE', line_number,
                             column('SLIDE_TYPE'),
                             '%s: IS_HNE=%s, IS_IHC=%s' % (slide_type, row['IS_HNE'], row['IS_IHC']))
 
         slide_key = row['SLIDE_KEY']
-        if slide_key and not WSI_SLIDE_KEY.fullmatch(slide_key):
+        if slide_key and not wsi_contract.SLIDE_KEY_PATTERN.fullmatch(slide_key):
             self._error('SLIDE_KEY must be 32 lowercase hex characters', line_number,
                         column('SLIDE_KEY'), label('SLIDE_KEY'))
         elif slide_key and slide_key in state['slide_keys']:
@@ -4172,7 +4147,7 @@ class WsiRowChecks(object):
         state['blocks'][block_key] = block_value
 
         match_level = row['MATCH_LEVEL']
-        if match_level not in ('BLOCK', 'PART', 'UNMATCHED'):
+        if match_level not in wsi_contract.MATCH_LEVELS:
             self._error('WSI MATCH_LEVEL must be BLOCK, PART, or UNMATCHED', line_number,
                         column('MATCH_LEVEL'), match_level)
         if match_level == 'UNMATCHED' and row['SAMPLE_ID']:
@@ -4199,10 +4174,10 @@ class WsiRowChecks(object):
 
         # SEALED_SOURCE is opaque and only the tile server can open it; report the field only.
         sealed_source = row['SEALED_SOURCE']
-        if sealed_source and not self._is_sealed_source(sealed_source):
+        if sealed_source and not wsi_contract.sealed_source_valid(sealed_source):
             self._error('WSI SEALED_SOURCE must be unpadded base64url of at least %d bytes and '
                         'at most %d characters'
-                        % (WSI_SEALED_SOURCE_MIN_BYTES, WSI_SEALED_SOURCE_MAX_LENGTH),
+                        % (wsi_contract.SEALED_SOURCE_MIN_BYTES, wsi_contract.SEALED_SOURCE_MAX_LENGTH),
                         line_number, column('SEALED_SOURCE'), label('SEALED_SOURCE'))
         if sealed_source and row['CAN_SERVE_TILES'] == 'FALSE':
             self._error('WSI SEALED_SOURCE must be empty when CAN_SERVE_TILES is FALSE',
@@ -4256,9 +4231,10 @@ class ResourceValidator(WsiRowChecks, Validator):
     NULL_VALUES = ["[not applicable]", "[not available]", "[pending]", "[discrepancy]", "[completed]", "[null]", "", "na"]
     ALLOW_BLANKS = True
 
-    WSI_RESOURCE_TYPE = 'WHOLE_SLIDE_IMAGE'
+    WSI_RESOURCE_TYPE = wsi_contract.RESOURCE_TYPE
     # resource definition ID required for WSI rows in each resource file type
-    WSI_RESOURCE_IDS = {'SAMPLE': 'WSI_SAMPLE', 'PATIENT': 'WSI_PATIENT'}
+    WSI_RESOURCE_IDS = {'SAMPLE': wsi_contract.SAMPLE_RESOURCE_ID,
+                        'PATIENT': wsi_contract.PATIENT_RESOURCE_ID}
     # metadata keys (the lower-cased format-v4 column names) and their JSON types
     WSI_STRING_KEYS = (
         'SLIDE_KEY', 'REFERENCE_SAMPLE_ID', 'PART_KEY', 'PART_NUMBER',
@@ -4275,13 +4251,60 @@ class ResourceValidator(WsiRowChecks, Validator):
     # a free-text specimen label, a raw artifact location or the sealed source.
     WSI_FORBIDDEN_PUBLIC_KEYS = WSI_UNSEALED_SOURCE_KEYS + (
         'barcode', 'part_designator', 'path_dx_title', 'sealed_source')
-    WSI_SERVING_KEY = 'wsi_serving'
+    WSI_SERVING_KEY = wsi_contract.SERVING_KEY
     WSI_SERVING_STRING_KEYS = ('SEALED_SOURCE', 'THUMBNAIL_CONTENT_TYPE')
     WSI_SERVING_INTEGER_KEYS = ('THUMBNAIL_WIDTH', 'THUMBNAIL_HEIGHT')
 
     def __init__(self, *args, **kwargs):
         """Initialize the instance attributes of the data file validator."""
         super(ResourceValidator, self).__init__(*args, **kwargs)
+        # resource_id -> {metadata key: first line it appeared on}. Collected per row but reported
+        # once per file: a file where every row carries the same undeclared key would otherwise
+        # emit one message per row, and the HTML report buffers every record it is given.
+        self.observed_metadata_keys = {}
+
+    def recordMetadataKeys(self, resource_id, parsed):
+        """Remember which metadata keys a row carried, to check against the contract at the end."""
+        if not resource_id or not isinstance(parsed, dict):
+            return
+        seen = self.observed_metadata_keys.setdefault(resource_id, {})
+        for key in parsed:
+            # A WSI row's private wsi_serving object is never a column, so it is not declared.
+            if key == self.WSI_SERVING_KEY and resource_id in self.WSI_RESOURCE_IDS.values():
+                continue
+            seen.setdefault(key, self.line_number)
+
+    def onComplete(self):
+        self.checkMetadataAgainstContracts()
+        super(ResourceValidator, self).onComplete()
+
+    def checkMetadataAgainstContracts(self):
+        """Compare the metadata keys this file carried against each resource's contract.
+
+        A resource with no contract is skipped: its columns still come from the data, so an
+        undeclared key is not lost. Where a contract exists the portal builds columns from it, so
+        a key the contract omits would be imported and then never shown -- an error, since no
+        later message would tell the curator the data is invisible.
+        """
+        for resource_id, keys in sorted(self.observed_metadata_keys.items()):
+            declared = RESOURCE_CONTRACT_KEYS.get(resource_id)
+            if declared is None:
+                continue
+            undeclared = sorted(set(keys) - declared)
+            if undeclared:
+                self.logger.error(
+                    "METADATA carries keys that resource '%s' does not declare in "
+                    'CUSTOM_METADATA, so the portal would not show them. Declare them or '
+                    'remove them from the file.' % resource_id,
+                    extra={'line_number': min(keys[k] for k in undeclared),
+                           'cause': ', '.join(undeclared)})
+            unused = sorted(declared - set(keys))
+            if unused:
+                self.logger.warning(
+                    "CUSTOM_METADATA for resource '%s' declares keys that no row carries, so "
+                    'those columns would always be empty.' % resource_id,
+                    extra={'line_number': self.line_number,
+                           'cause': ', '.join(unused)})
 
     def _wsi_value(self, value, expected, key, metadata_column):
         """Render a typed metadata value as the format-v4 string, logging type errors."""
@@ -4352,9 +4375,7 @@ class ResourceValidator(WsiRowChecks, Validator):
         `resource_level` is 'SAMPLE' or 'PATIENT'. Uniqueness and part/block
         consistency are tracked across all resource files of the study.
         """
-        values = {}
-        for col_index, col_name in enumerate(self.cols):
-            values[col_name] = data[col_index].strip() if col_index < len(data) else ''
+        values = self._line_values(data)
         column_index = {col_name: col_index for col_index, col_name in enumerate(self.cols)}
         resource_id = values.get('RESOURCE_ID', '')
         wsi_resource_ids = set(self.WSI_RESOURCE_IDS.values())
@@ -4415,10 +4436,14 @@ class ResourceValidator(WsiRowChecks, Validator):
         except:
             return False
 
+    def _line_values(self, data):
+        """Map each column name to its stripped value ('' beyond the end of the line)."""
+        return {col_name: data[col_index].strip() if col_index < len(data) else ''
+                for col_index, col_name in enumerate(self.cols)}
+
     def _is_wsi_line(self, data):
         """Whether a line is a WHOLE_SLIDE_IMAGE row (by TYPE or WSI resource ID)."""
-        values = {col_name: data[col_index].strip() if col_index < len(data) else ''
-                  for col_index, col_name in enumerate(self.cols)}
+        values = self._line_values(data)
         return (values.get('TYPE') == self.WSI_RESOURCE_TYPE
                 or values.get('RESOURCE_ID') in self.WSI_RESOURCE_IDS.values())
 
@@ -4487,6 +4512,12 @@ class ResourceValidator(WsiRowChecks, Validator):
             if col_name == 'METADATA' and value and value.strip().lower() not in self.NULL_VALUES:
                 try:
                     parsed = json.loads(value)
+                    # The value is already parsed here, so collecting its keys costs a dict walk.
+                    # They are checked against the contract once per file, in onComplete.
+                    self.recordMetadataKeys(
+                        data[self.cols.index('RESOURCE_ID')].strip()
+                        if 'RESOURCE_ID' in self.cols else None,
+                        parsed)
                     if not isinstance(parsed, dict):
                         self.logger.error(
                             'METADATA must be a JSON object (key-value map), not an array or scalar',
@@ -5032,67 +5063,6 @@ class MultipleDataFileValidator(FeaturewiseFileValidator, metaclass=ABCMeta):
     def checkId(self):
         return self.checkIdInSamples()
 
-
-class WsiValidator(WsiRowChecks, Validator):
-    """Validate the canonical whole-slide-image study file."""
-
-    def _validate_file(self):
-        try:
-            with open(self.filename, 'r', newline='') as stream:
-                lines = stream.readlines()
-        except OSError:
-            self.logger.error('File could not be opened')
-            return
-        except UnicodeDecodeError:
-            self.logger.error('File contains invalid UTF-8 bytes. Please check values in file')
-            return
-
-        if len(lines) < 5:
-            self.logger.error('WSI file must contain four comment rows and a column header')
-            return
-        if any(not line.startswith('#') for line in lines[:4]):
-            self.logger.error('WSI file must begin with exactly four comment rows')
-            return
-        if lines[4].startswith('#'):
-            self.logger.error('WSI column header is missing')
-            return
-
-        header = lines[4].rstrip('\r\n').split('\t')
-        removed = [name for name in self.REMOVED_HEADERS if name in header]
-        if removed:
-            self._error('WSI file has columns of format v3 or older; format v4 replaces them with '
-                        'SEALED_SOURCE, so re-export data_wsi.txt', 5, cause=', '.join(removed))
-            return
-        if header not in (self.EXPECTED_HEADERS, self.EXPECTED_HEADERS_WITH_IGNORED_TIMING):
-            self._error('Invalid WSI column header or column order', 5,
-                        cause=', '.join(header))
-            return
-        self.cols = header
-        self.numCols = len(header)
-
-        state = new_wsi_row_state()
-        rows = 0
-        for line_number, line in enumerate(lines[5:], start=6):
-            values = line.rstrip('\r\n').split('\t')
-            if not any(value.strip() for value in values):
-                self._error('Blank WSI data row', line_number)
-                continue
-            if values and values[0].startswith('#'):
-                self._error("WSI data row must not start with '#'", line_number)
-                continue
-            if len(values) != len(header):
-                self._error('Expected %d WSI columns, found %d', line_number,
-                            cause=(len(header), len(values)))
-                continue
-            rows += 1
-            # ignored timing columns stay in the row; no check reads them
-            row = dict(zip(header, (value.strip() for value in values)))
-            self._check_wsi_row(row, line_number, header.index, state)
-
-        if rows == 0:
-            self.logger.error('WSI data file contains no slide rows')
-        self.fileCouldBeParsed = True
-        self.logger.info('Validation of WSI file complete')
 
 class GsvaWiseFileValidator(MultipleDataFileValidator, metaclass=ABCMeta):
     """Groups multiple gene set data files from a study to ensure consistency.
@@ -6093,7 +6063,7 @@ def validate_study(study_dir, portal_instance, logger, relaxed_mode, strict_maf_
     global DEFINED_SAMPLE_ATTRIBUTES
     global PATIENTS_WITH_SAMPLES
     global SAMPLE_TO_PATIENT
-    global RESOURCE_DEFINITION_DICTIONARY
+    global RESOURCE_DEFINITION_DICTIONARY, RESOURCE_CONTRACT_KEYS
     global RESOURCE_PATIENTS_WITH_SAMPLES
 
     reset_wsi_resource_state()
@@ -6212,6 +6182,7 @@ def validate_study(study_dir, portal_instance, logger, relaxed_mode, strict_maf_
             cbioportal_common.MetaFileTypes.RESOURCES_DEFINITION]:
             resources_definition_validator.validate()
         RESOURCE_DEFINITION_DICTIONARY = resources_definition_validator.resource_definition_dictionary
+        RESOURCE_CONTRACT_KEYS = resources_definition_validator.resource_contract_keys
 
     # then validate the resource data if exist
     if cbioportal_common.MetaFileTypes.SAMPLE_RESOURCES in validators_by_meta_type:

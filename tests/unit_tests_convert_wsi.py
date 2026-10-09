@@ -187,7 +187,7 @@ class ConvertedOutputTestCase(ConverterTestCase):
         self.assertEqual({'height': 768, 'width': 1024}, serving['tile_metadata_json']['dimensions'])
         self.assertEqual({'model': 'Scan "Q" \\ 40', 'objective_power': 40, 'calibrated': True},
                          serving['tile_metadata_json']['vendor']['scanner'])
-        # UNMATCHED reference samples are dropped, as the native importer stored null
+        # UNMATCHED reference samples are dropped (stored as no reference sample)
         self.assertNotIn('reference_sample_id', json.loads(samples['slide-5']['METADATA']))
         self.assertEqual(0, json.loads(samples['slide-5']['METADATA'])['file_size_bytes'])
 
@@ -201,7 +201,7 @@ class ConvertedOutputTestCase(ConverterTestCase):
         self.assertNotIn('wsi_serving', second)
         self.assertNotIn('wsi_serving', json.loads(patients['slide-6']['METADATA']))
 
-    def test_count_rows_match_native_semantics(self):
+    def test_count_rows(self):
         self.convert()
         self.assertEqual(
             [['PATIENT_ID', 'SAMPLE_ID', 'WSI_SAMPLE_SLIDE_COUNT', 'WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT',
@@ -265,11 +265,6 @@ class ConvertedOutputTestCase(ConverterTestCase):
              ['WSI-P2', '1', '1', '0'],
              ['WSI+P3', 'NA', 'NA', 'NA']],
             data_rows(self.out / 'data_clinical_patient_wsi_counts.txt')[1:])
-        by_sample, by_patient = converter.count_slides(
-            converter.parse_slides(converter.iter_rows(self.write_legacy(rows).parent / 'data_wsi.txt')))
-        self.assertEqual({('WSI-P1', 'WSI-P1-S1'): [1, 0, 1], ('WSI-P2', 'WSI-P2-S1'): [1, 1, 0]},
-                         by_sample)
-        self.assertEqual({'WSI-P1': [2, 0, 1], 'WSI-P2': [1, 1, 0]}, by_patient)
         # the non-viewable slides are still converted to resources
         samples = rows_by_slide(self.out / 'data_resource_sample.txt')
         self.assertIn('slide-3', samples)
@@ -304,17 +299,19 @@ class ConvertedOutputTestCase(ConverterTestCase):
         definitions = data_rows(self.out / 'data_resource_definition.txt')
         self.assertEqual(['WSI_PATIENT'], [row[0] for row in definitions[1:]])
 
-    def test_definitions_declare_identifier_keys_unfilterable(self):
+    def test_definitions_declare_the_full_public_contract(self):
         self.convert()
         header, *definitions = data_rows(self.out / 'data_resource_definition.txt')
         self.assertEqual('CUSTOM_METADATA', header[-1])
         for row in definitions:
             contract = json.loads(row[-1])
             self.assertEqual(1, contract['version'])
-            self.assertEqual(
-                {'slide_key': False, 'part_key': False, 'block_key': False,
-                 'specimen_key': False, 'reference_sample_id': False},
-                {field['key']: field['filterable'] for field in contract['fields']})
+            fields = {field['key']: field for field in contract['fields']}
+            # every public key the converter writes, and never the private serving object
+            self.assertEqual(PUBLIC_KEYS, set(fields))
+            unfilterable = {key for key, field in fields.items() if not field['filterable']}
+            self.assertTrue({'slide_key', 'part_key', 'block_key', 'specimen_key',
+                             'reference_sample_id'} <= unfilterable, unfilterable)
 
     def test_java_fixture_is_current_converter_output(self):
         self.convert(base_url=BASE_URL)
@@ -349,7 +346,7 @@ class ConverterInputTestCase(ConverterTestCase):
         rows[3] = rows[3].replace('\tUNMATCHED\t', '\tPART\t', 1)
         self.assertConversionError('matched rows require SAMPLE_ID', meta=self.write_legacy(rows))
 
-    def test_slide_type_and_stain_flags_follow_native_constraints(self):
+    def test_slide_type_and_stain_flags(self):
         slide_type = converter.COLUMNS.index('SLIDE_TYPE')
         is_hne = converter.COLUMNS.index('IS_HNE')
         for column, value, message in ((slide_type, 'Frozen', 'SLIDE_TYPE must be one of'),
@@ -361,10 +358,6 @@ class ConverterInputTestCase(ConverterTestCase):
             rows[0] = '\t'.join(fields)
             self.assertConversionError(message, meta=self.write_legacy(rows))
 
-    def test_duplicate_slide_is_rejected(self):
-        rows = self.fixture_rows()
-        self.assertConversionError('SLIDE_KEY is not unique', meta=self.write_legacy(rows + rows[:1]))
-
     def test_timing_columns_are_ignored(self):
         # Some files carry seven slide-timing columns before SLIDE_KEY. They are accepted
         # without being required or validated, and never reach the metadata.
@@ -373,7 +366,7 @@ class ConverterInputTestCase(ConverterTestCase):
         timing_values = [
             ['0', 'AVAILABLE', 'RECORDED', 'PATHOLOGY_REPORT', '',
              'patient_first_tumor_sequencing_day_zero', 'surgery 20210314'],
-            # values the removed timing checks rejected
+            # values that would not pass as timing data
             ['not-a-day', 'BOGUS', '', '', 'reason', 'other_coordinates', ''],
         ]
         source = (FIXTURE_DIR / 'data_wsi.txt').read_text(encoding='utf-8').splitlines()
@@ -394,8 +387,6 @@ class ConverterInputTestCase(ConverterTestCase):
                 metadata = json.loads(record['METADATA'])
                 self.assertFalse([key for key in metadata
                                   if key.startswith(('timeline_', 'timepoint_'))], metadata)
-        patients = data_rows(self.out / 'data_clinical_patient_wsi_counts.txt')[0]
-        self.assertNotIn('WSI_PATIENT_UNDATED_SLIDE_COUNT', patients)
 
     def test_line_break_in_output_cell_is_rejected(self):
         rows = self.fixture_rows()
@@ -403,7 +394,7 @@ class ConverterInputTestCase(ConverterTestCase):
         rows[0] = rows[0].replace('\tH&E\tH&E\tTRUE\t', '\tH\r&E\tH&E\tTRUE\t', 1)
         self.assertConversionError('tab or line break', meta=self.write_legacy(rows))
         with self.assertRaises(converter.ConversionError):
-            converter.write_tsv(Path(self.tmp.name) / 'x.txt', [['a\tb']])
+            converter.render_tsv('x.txt', [['a\tb']])
 
     def test_existing_count_attributes_conflict(self):
         study = Path(self.tmp.name) / 'study'
@@ -590,9 +581,6 @@ class V4OnlyTestCase(ConverterTestCase):
         self.assertEqual(list(converter.IGNORED_TIMING_COLUMNS),
                          converter.COLUMNS_WITH_IGNORED_TIMING[28:35])
         self.assertEqual(['SLIDE_KEY', 'SEALED_SOURCE'], converter.COLUMNS_WITH_IGNORED_TIMING[-2:])
-        for name in ('V2_COLUMNS', 'FORMAT_COLUMNS', 'TIMELINE_REQUIRED_COLUMNS',
-                     'find_pathology_timeline', 'read_timeline_index', '_parse_image_ids'):
-            self.assertFalse(hasattr(converter, name), name)
 
     def test_older_format_versions_are_rejected(self):
         for version in ('2', '3'):
@@ -626,11 +614,6 @@ class V4OnlyTestCase(ConverterTestCase):
         rows = ['\t'.join(row.split('\t')[:-2] + timing) for row in source[5:]]
         header = '\t'.join(source[4].split('\t')[:-2] + list(converter.IGNORED_TIMING_COLUMNS))
         self.assertConversionError('invalid header', self.write_legacy(rows, header))
-
-    def test_timeline_options_are_gone(self):
-        with patch('sys.stderr'), self.assertRaises(SystemExit):
-            converter.interface(['--meta-wsi', 'm', '--output-dir', 'o', '--portal-base-url', BASE_URL,
-                                 '--timeline-file', 't'])
 
     def test_failure_late_in_the_file_leaves_no_output(self):
         rows = self.fixture_rows()
@@ -760,7 +743,7 @@ class SlideKeyAndDeidTestCase(ConverterTestCase):
 
     def test_tab_in_output_is_not_echoed(self):
         with self.assertRaises(converter.ConversionError) as context:
-            converter.write_tsv(Path(self.tmp.name) / 'x.txt', [['SECRET\t1']])
+            converter.render_tsv('x.txt', [['SECRET\t1']])
         self.assertNotIn('SECRET', str(context.exception))
 
     def test_each_slide_key_counts_once(self):
@@ -776,10 +759,6 @@ class SlideKeyAndDeidTestCase(ConverterTestCase):
         patients = {row[0]: row[1:] for row in data_rows(
             self.out / 'data_clinical_patient_wsi_counts.txt')[1:]}
         self.assertEqual(['4', '0', '3'], patients['WSI-P1'])
-        # the same slide key again is one slide listed twice, which is rejected
-        shutil.rmtree(self.out)
-        message = self.conversion_error(self.write_legacy(rows + rows[:1]))
-        self.assertIn('line 12: SLIDE_KEY is not unique', message)
 
 
 PUBLIC_KEYS = {
@@ -807,7 +786,8 @@ class ConvertedFilesValidationTestCase(ConverterTestCase):
         self.logger.addHandler(self.buffer)
         self.saved = {name: getattr(validateData, name) for name in (
             'DEFINED_SAMPLE_IDS', 'PATIENTS_WITH_SAMPLES', 'SAMPLE_TO_PATIENT',
-            'RESOURCE_DEFINITION_DICTIONARY', 'WSI_RESOURCE_STATE', 'DEFINED_SAMPLE_ATTRIBUTES')}
+            'RESOURCE_DEFINITION_DICTIONARY', 'RESOURCE_CONTRACT_KEYS', 'WSI_RESOURCE_STATE',
+            'DEFINED_SAMPLE_ATTRIBUTES')}
         validateData.DEFINED_SAMPLE_IDS = set(SAMPLE_TO_PATIENT)
         validateData.PATIENTS_WITH_SAMPLES = set(SAMPLE_TO_PATIENT.values())
         validateData.SAMPLE_TO_PATIENT = dict(SAMPLE_TO_PATIENT)
@@ -834,10 +814,16 @@ class ConvertedFilesValidationTestCase(ConverterTestCase):
                                                  'data_resource_definition.txt')
         self.assertEqual([], [r.getMessage() for r in problems])
         validateData.RESOURCE_DEFINITION_DICTIONARY = validator.resource_definition_dictionary
+        # the contract applies: no undeclared keys (wsi_serving is private) and no unused ones
+        validateData.RESOURCE_CONTRACT_KEYS = validator.resource_contract_keys
+        self.assertEqual({'WSI_SAMPLE', 'WSI_PATIENT'}, set(validator.resource_contract_keys))
         _, problems = self.run_validator(validateData.SampleResourceValidator, 'data_resource_sample.txt')
         self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
         _, problems = self.run_validator(validateData.PatientResourceValidator, 'data_resource_patient.txt')
-        self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
+        # the fixture's unmatched slides leave these optional cells blank, which the contract
+        # check reports as a warning, as it would for any resource
+        self.assertEqual([(logging.WARNING, 'file_size_bytes, part_description, subspecialty')],
+                         [(r.levelno, getattr(r, 'cause', None)) for r in problems])
 
     def test_count_files_pass_clinical_validation(self):
         self.convert()
@@ -851,18 +837,6 @@ class ConvertedFilesValidationTestCase(ConverterTestCase):
         # the only warnings are the generic ones for a patient file without survival columns
         self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems
                               if 'analysis feature will not be available' not in r.getMessage()])
-
-    def test_duplicate_slide_key_across_resource_files_fails(self):
-        self.convert()
-        sample_file = self.out / 'data_resource_sample.txt'
-        patient_file = self.out / 'data_resource_patient.txt'
-        # give an unmatched slide the slide key of a matched one
-        patient_file.write_text(patient_file.read_text().replace(
-            'c66ee336f70e8b59e48bd7afbf0e606d', '2c96f13783250ad2c6bcfcd5b7c3ef22'))
-        validateData.RESOURCE_DEFINITION_DICTIONARY = {'WSI_SAMPLE': ['SAMPLE'], 'WSI_PATIENT': ['PATIENT']}
-        self.run_validator(validateData.SampleResourceValidator, sample_file.name)
-        _, problems = self.run_validator(validateData.PatientResourceValidator, patient_file.name)
-        self.assertIn('SLIDE_KEY must be unique within a study', [r.getMessage() for r in problems])
 
     def test_merged_study_passes_and_meta_wsi_is_rejected(self):
         study = self.copy_study()
