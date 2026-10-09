@@ -216,7 +216,8 @@ public final class DaoResourceData {
     /**
      * The study slide table's public metadata keys. Must match WsiDeidentification.STUDY_TABLE_SCHEMA
      * in cBioPortal/cbioportal and the wsi_slide_table_derived INSERT in its
-     * populate_derived_tables.sql; the portal's tests check that the SQL matches its contract.
+     * populate_derived_tables.sql; the portal's tests check that the SQL matches its contract, and
+     * DaoResourceDataSlideTableKeysTest that each key is a filterable field of the WSI contract.
      */
     public static final java.util.List<String> STUDY_SLIDE_TABLE_METADATA_KEYS = java.util.List.of(
         "stain_name", "stain_group", "magnification", "part_number", "block_number",
