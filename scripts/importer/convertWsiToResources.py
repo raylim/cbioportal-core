@@ -52,10 +52,9 @@ from urllib.parse import quote, urlparse
 
 
 # The WSI row contract below (resource IDs, columns, slide key, sealed source, slide
-# types, stain rule) is also what validateData.py checks WHOLE_SLIDE_IMAGE rows against.
+# types, stain rule) is also what validateData.py checks WSI_SAMPLE/WSI_PATIENT rows against.
 SAMPLE_RESOURCE_ID = "WSI_SAMPLE"
 PATIENT_RESOURCE_ID = "WSI_PATIENT"
-RESOURCE_TYPE = "WHOLE_SLIDE_IMAGE"
 
 # Slide-timing columns that some files still carry before SLIDE_KEY.
 # They are accepted but ignored: neither validated nor written to the metadata.
@@ -144,8 +143,8 @@ SLIDE_TYPES = ("H&E", "IHC", "Other", "Unknown")
 DEFINITION_FILE = "data_resource_definition.txt"
 SAMPLE_RESOURCE_FILE = "data_resource_sample.txt"
 PATIENT_RESOURCE_FILE = "data_resource_patient.txt"
-RESOURCE_HEADER_SAMPLE = ["PATIENT_ID", "SAMPLE_ID", "RESOURCE_ID", "URL", "DISPLAY_NAME", "TYPE", "METADATA"]
-RESOURCE_HEADER_PATIENT = ["PATIENT_ID", "RESOURCE_ID", "URL", "DISPLAY_NAME", "TYPE", "METADATA"]
+RESOURCE_HEADER_SAMPLE = ["PATIENT_ID", "SAMPLE_ID", "RESOURCE_ID", "URL", "DISPLAY_NAME", "METADATA"]
+RESOURCE_HEADER_PATIENT = ["PATIENT_ID", "RESOURCE_ID", "URL", "DISPLAY_NAME", "METADATA"]
 
 
 class ConversionError(ValueError):
@@ -565,10 +564,10 @@ def _convert_into(staging, data_path, study_id, base_url):
                                       ensure_ascii=True)
                 if slide["sample_id"] is not None:
                     sample_writer.write([slide["patient_id"], slide["sample_id"], SAMPLE_RESOURCE_ID,
-                                         url, name, RESOURCE_TYPE, metadata])
+                                         url, name, metadata])
                 else:
                     patient_writer.write([slide["patient_id"], PATIENT_RESOURCE_ID, url,
-                                          name, RESOURCE_TYPE, metadata])
+                                          name, metadata])
         except ConversionError as error:
             if str(error).startswith(str(data_path)):
                 raise

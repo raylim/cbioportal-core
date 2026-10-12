@@ -11,7 +11,7 @@ If you are a developer and want to help contribute to the cBioPortal importer co
 ## WSI imports
 
 Whole-slide images (WSI) are imported as standard resource data
-(`WSI_SAMPLE`/`WSI_PATIENT` rows with `TYPE=WHOLE_SLIDE_IMAGE`). Legacy
+(`WSI_SAMPLE`/`WSI_PATIENT` rows). Legacy
 `meta_wsi.txt`/`data_wsi.txt` pairs are not imported; convert them offline with
 `scripts/importer/convertWsiToResources.py`. See
 [`docs/wsi-study-format.md`](docs/wsi-study-format.md).

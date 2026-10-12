@@ -88,7 +88,7 @@ RESOURCE_DEFINITION_DICTIONARY = {}
 # importing unchanged. Populated from the definition file before any resource data file is read.
 RESOURCE_CONTRACT_KEYS = {}
 RESOURCE_PATIENTS_WITH_SAMPLES = None
-# study-wide cross-row state for WHOLE_SLIDE_IMAGE resource rows (see WsiRowChecks);
+# study-wide cross-row state for WSI resource rows (see WsiRowChecks);
 # shared by the sample and patient resource files so SLIDE_KEY stays unique per study
 WSI_RESOURCE_STATE = None
 
@@ -3944,7 +3944,7 @@ def new_wsi_row_state():
 
 
 def reset_wsi_resource_state():
-    """Forget WHOLE_SLIDE_IMAGE resource rows seen so far (called once per study)."""
+    """Forget WSI resource rows seen so far (called once per study)."""
     global WSI_RESOURCE_STATE
     WSI_RESOURCE_STATE = new_wsi_row_state()
 
@@ -3956,7 +3956,7 @@ def wsi_resource_state():
 
 
 class WsiRowChecks(object):
-    """Whole-slide-image row contract for WHOLE_SLIDE_IMAGE rows in sample/patient
+    """Whole-slide-image row contract for WSI_SAMPLE/WSI_PATIENT rows in sample/patient
     resource files.
 
     Rows are dicts keyed by the format-v4 column names with stripped string
@@ -4223,7 +4223,7 @@ class ResourceValidator(WsiRowChecks, Validator):
     """Abstract Validator class for resource data files.
 
     Subclasses define the columns that must be present in REQUIRED_HEADERS.
-    Rows with TYPE WHOLE_SLIDE_IMAGE are additionally checked against the WSI
+    WSI_SAMPLE and WSI_PATIENT rows are additionally checked against the WSI
     contract (see checkWsiResource).
     """
 
@@ -4231,7 +4231,6 @@ class ResourceValidator(WsiRowChecks, Validator):
     NULL_VALUES = ["[not applicable]", "[not available]", "[pending]", "[discrepancy]", "[completed]", "[null]", "", "na"]
     ALLOW_BLANKS = True
 
-    WSI_RESOURCE_TYPE = wsi_contract.RESOURCE_TYPE
     # resource definition ID required for WSI rows in each resource file type
     WSI_RESOURCE_IDS = {'SAMPLE': wsi_contract.SAMPLE_RESOURCE_ID,
                         'PATIENT': wsi_contract.PATIENT_RESOURCE_ID}
@@ -4337,12 +4336,12 @@ class ResourceValidator(WsiRowChecks, Validator):
         else:
             valid = isinstance(value, int) and not isinstance(value, bool)
         if not valid:
-            self._error('WHOLE_SLIDE_IMAGE metadata value must be a JSON %s' % expected,
+            self._error('WSI metadata value must be a JSON %s' % expected,
                         self.line_number, metadata_column, key)
         return value.strip() if isinstance(value, str) else str(value)
 
     def _wsi_row_from_metadata(self, metadata, metadata_column):
-        """Map WHOLE_SLIDE_IMAGE resource metadata onto a format-v4 WSI row dict."""
+        """Map WSI resource metadata onto a format-v4 WSI row dict."""
         row = {name: '' for name in self.EXPECTED_HEADERS}
         for keys, expected in ((self.WSI_STRING_KEYS, 'string'),
                                (self.WSI_BOOLEAN_KEYS, 'boolean'),
@@ -4354,7 +4353,7 @@ class ResourceValidator(WsiRowChecks, Validator):
         if serving is None:
             return row
         if not isinstance(serving, dict):
-            self._error('WHOLE_SLIDE_IMAGE metadata wsi_serving must be a JSON object',
+            self._error('WSI metadata wsi_serving must be a JSON object',
                         self.line_number, metadata_column, type(serving).__name__)
             return row
         for keys, expected in ((self.WSI_SERVING_STRING_KEYS, 'string'),
@@ -4367,12 +4366,12 @@ class ResourceValidator(WsiRowChecks, Validator):
             if isinstance(tile_metadata, dict):
                 row['TILE_METADATA_JSON'] = json.dumps(tile_metadata)
             else:
-                self._error('WHOLE_SLIDE_IMAGE metadata wsi_serving.tile_metadata_json must be a '
+                self._error('WSI metadata wsi_serving.tile_metadata_json must be a '
                             'JSON object', self.line_number, metadata_column,
                             type(tile_metadata).__name__)
         for key in self.WSI_UNSEALED_SOURCE_KEYS:
             if key in serving:
-                self._error('WHOLE_SLIDE_IMAGE metadata must not contain %s; the image ID and '
+                self._error('WSI metadata must not contain %s; the image ID and '
                             'object URIs are only carried inside sealed_source' % key,
                             self.line_number, metadata_column,
                             'METADATA.%s.%s' % (self.WSI_SERVING_KEY, key))
@@ -4382,13 +4381,13 @@ class ResourceValidator(WsiRowChecks, Validator):
         unknown = sorted(set(serving) - known)
         if unknown:
             self.logger.warning(
-                'WHOLE_SLIDE_IMAGE metadata wsi_serving has keys the portal does not read',
+                'WSI metadata wsi_serving has keys the portal does not read',
                 extra={'line_number': self.line_number, 'column_number': metadata_column + 1,
                        'cause': ', '.join(unknown)})
         return row
 
     def checkWsiResource(self, data, resource_level):
-        """Validate a WHOLE_SLIDE_IMAGE row against the WSI contract.
+        """Validate a WSI_SAMPLE/WSI_PATIENT row against the WSI contract.
 
         `resource_level` is 'SAMPLE' or 'PATIENT'. Uniqueness and part/block
         consistency are tracked across all resource files of the study.
@@ -4397,15 +4396,12 @@ class ResourceValidator(WsiRowChecks, Validator):
         column_index = {col_name: col_index for col_index, col_name in enumerate(self.cols)}
         resource_id = values.get('RESOURCE_ID', '')
         wsi_resource_ids = set(self.WSI_RESOURCE_IDS.values())
-        if values.get('TYPE', '') != self.WSI_RESOURCE_TYPE:
-            if resource_id in wsi_resource_ids:
-                self._error('%s resources must have TYPE %s' % (resource_id, self.WSI_RESOURCE_TYPE),
-                            self.line_number, column_index.get('TYPE'), values.get('TYPE', ''))
+        if resource_id not in wsi_resource_ids:
             return
         expected_resource_id = self.WSI_RESOURCE_IDS[resource_level]
         if resource_id != expected_resource_id:
-            self._error('%s resources in a %s resource file must use RESOURCE_ID %s'
-                        % (self.WSI_RESOURCE_TYPE, resource_level.lower(), expected_resource_id),
+            self._error('WSI resources in a %s resource file must use RESOURCE_ID %s'
+                        % (resource_level.lower(), expected_resource_id),
                         self.line_number, column_index.get('RESOURCE_ID'), resource_id)
         metadata_column = column_index.get('METADATA')
         try:
@@ -4414,12 +4410,12 @@ class ResourceValidator(WsiRowChecks, Validator):
             metadata = None
         if not isinstance(metadata, dict):
             # a present but malformed value was already reported by checkLine
-            self._error('%s resources require a METADATA JSON object' % self.WSI_RESOURCE_TYPE,
+            self._error('WSI resources require a METADATA JSON object',
                         self.line_number, metadata_column)
             return
         for key in self.WSI_FORBIDDEN_PUBLIC_KEYS:
             if key in metadata:
-                self._error('WHOLE_SLIDE_IMAGE public metadata must not contain %s' % key,
+                self._error('WSI public metadata must not contain %s' % key,
                             self.line_number, metadata_column, 'METADATA.' + key)
         row = self._wsi_row_from_metadata(metadata, metadata_column)
         row['PATIENT_ID'] = values.get('PATIENT_ID', '')
@@ -4442,7 +4438,7 @@ class ResourceValidator(WsiRowChecks, Validator):
 
         if row['REFERENCE_SAMPLE_ID'].upper() == 'UNMATCHED':
             # the portal reads this value verbatim as a sample ID; the converter omits it instead
-            self._error('WHOLE_SLIDE_IMAGE metadata reference_sample_id must be omitted, not UNMATCHED, '
+            self._error('WSI metadata reference_sample_id must be omitted, not UNMATCHED, '
                         'when a patient has no reference sample', self.line_number, metadata_column,
                         row['REFERENCE_SAMPLE_ID'])
         self._check_wsi_row(row, self.line_number, column, wsi_resource_state(), label)
@@ -4460,15 +4456,13 @@ class ResourceValidator(WsiRowChecks, Validator):
                 for col_index, col_name in enumerate(self.cols)}
 
     def _is_wsi_line(self, data):
-        """Whether a line is a WHOLE_SLIDE_IMAGE row (by TYPE or WSI resource ID)."""
-        values = self._line_values(data)
-        return (values.get('TYPE') == self.WSI_RESOURCE_TYPE
-                or values.get('RESOURCE_ID') in self.WSI_RESOURCE_IDS.values())
+        """Whether a line is a WSI row (RESOURCE_ID WSI_SAMPLE or WSI_PATIENT)."""
+        return self._line_values(data).get('RESOURCE_ID') in self.WSI_RESOURCE_IDS.values()
 
     def checkLine(self, data):
         """Check the values in a line of data."""
         super(ResourceValidator, self).checkLine(data)
-        # WHOLE_SLIDE_IMAGE URLs and metadata can carry server-side identifiers;
+        # WSI URLs and metadata can carry server-side identifiers;
         # their errors name the column instead of echoing the value.
         wsi_line = self._is_wsi_line(data)
         for col_index, col_name in enumerate(self.cols):
