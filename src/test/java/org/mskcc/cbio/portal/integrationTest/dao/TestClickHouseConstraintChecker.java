@@ -207,9 +207,7 @@ public class TestClickHouseConstraintChecker extends IntegrationTestBase {
         addFk(keys, "allele_specific_copy_number", "sample_id", "sample", "internal_id");
         addFk(keys, "resource_definition", "cancer_study_id", "cancer_study", "cancer_study_id");
         addFk(keys, "resource_data", "cancer_study_id", "cancer_study", "cancer_study_id");
-        addFk(keys, "resource_data", "resource_id,cancer_study_id", "resource_definition", "resource_id,cancer_study_id");
-        addFk(keys, "resource_data", "cancer_study_id,patient_id", "patient", "cancer_study_id,stable_id");
-        addFk(keys, "resource_data", "sample_id", "sample", "stable_id");
+        addFk(keys, "resource_data", "patient_id,cancer_study_id", "patient", "stable_id,cancer_study_id");
         return keys;
     }
 
