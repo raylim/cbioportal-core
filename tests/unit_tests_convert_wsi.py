@@ -135,17 +135,17 @@ class ConvertedOutputTestCase(ConverterTestCase):
     def test_sample_and_patient_rows(self):
         self.convert()
         sample_header = data_rows(self.out / 'data_resource_sample.txt')[0]
-        self.assertEqual(['PATIENT_ID', 'SAMPLE_ID', 'RESOURCE_ID', 'URL', 'DISPLAY_NAME', 'TYPE',
+        self.assertEqual(['PATIENT_ID', 'SAMPLE_ID', 'RESOURCE_ID', 'URL', 'DISPLAY_NAME',
                           'METADATA'], sample_header)
         samples = rows_by_slide(self.out / 'data_resource_sample.txt')
         patients = rows_by_slide(self.out / 'data_resource_patient.txt')
         self.assertEqual(['slide-1', 'slide-2', 'slide-3', 'slide-5'], list(samples))
         self.assertEqual(['slide-4', 'slide-6'], list(patients))
-        self.assertEqual({(r['PATIENT_ID'], r['SAMPLE_ID'], r['RESOURCE_ID'], r['TYPE'])
+        self.assertEqual({(r['PATIENT_ID'], r['SAMPLE_ID'], r['RESOURCE_ID'])
                           for r in samples.values()},
-                         {('WSI-P1', 'WSI-P1-S1', 'WSI_SAMPLE', 'WHOLE_SLIDE_IMAGE'),
-                          ('WSI-P1', 'WSI-P1-S2', 'WSI_SAMPLE', 'WHOLE_SLIDE_IMAGE'),
-                          ('WSI-P2', 'WSI-P2-S1', 'WSI_SAMPLE', 'WHOLE_SLIDE_IMAGE')})
+                         {('WSI-P1', 'WSI-P1-S1', 'WSI_SAMPLE'),
+                          ('WSI-P1', 'WSI-P1-S2', 'WSI_SAMPLE'),
+                          ('WSI-P2', 'WSI-P2-S1', 'WSI_SAMPLE')})
         self.assertEqual({(r['PATIENT_ID'], r['RESOURCE_ID']) for r in patients.values()},
                          {('WSI-P1', 'WSI_PATIENT'), ('WSI+P3', 'WSI_PATIENT')})
         self.assertNotIn('SAMPLE_ID', data_rows(self.out / 'data_resource_patient.txt')[0])

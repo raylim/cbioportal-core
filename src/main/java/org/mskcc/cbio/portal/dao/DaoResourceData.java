@@ -44,29 +44,27 @@ public final class DaoResourceData {
      *
      * @param cancerStudyId  internal cancer-study ID
      * @param resourceId     resource identifier (must match a resource_definition row)
-     * @param entityType     one of "PATIENT", "SAMPLE", or "STUDY"
+     * @param resourceScope  one of "PATIENT", "SAMPLE", or "STUDY"
      * @param patientId      stable patient ID (null for STUDY-level records)
      * @param sampleId       stable sample ID (null for PATIENT/STUDY-level records)
      * @param url            URL of the resource
      * @param displayName    optional display name override (may be null)
-     * @param type           optional type hint, e.g. IMAGE/LINK/PDF (may be null)
      * @param metadata       optional JSON metadata string (may be null)
      */
     public static int addResourceDatum(
             int cancerStudyId,
             String resourceId,
-            String entityType,
+            String resourceScope,
             String patientId,
             String sampleId,
             String url,
             String displayName,
-            String type,
             String metadata) throws DaoException {
 
         if (ClickHouseBulkLoader.isBulkLoad()) {
             // Column order matches DESCRIBE TABLE resource_data:
-            // resource_data_id, resource_id, cancer_study_id, entity_type,
-            // patient_id, sample_id, url, display_name, type, metadata
+            // resource_data_id, resource_id, cancer_study_id, resource_scope,
+            // patient_id, sample_id, url, display_name, metadata
             //
             // Nulls are passed through rather than substituted with "": the loader encodes a
             // null as \N, which ClickHouse stores as a real NULL, and these columns are
@@ -78,12 +76,11 @@ public final class DaoResourceData {
                 Long.toString(ClickHouseAutoIncrement.nextId(RESOURCE_DATA_SEQUENCE)),
                 resourceId,
                 Integer.toString(cancerStudyId),
-                entityType,
+                resourceScope,
                 patientId,
                 sampleId,
                 url,
                 displayName,
-                type,
                 metadata
             );
             return 1;
@@ -93,27 +90,27 @@ public final class DaoResourceData {
         PreparedStatement pstmt = null;
         ResultSet rs = null;
         try {
-            // resource_data_id has no server-side default: allocate it from the same
-            // sequence as the bulk-load path so both paths produce unique row IDs.
-            long resourceDataId = ClickHouseAutoIncrement.nextId(RESOURCE_DATA_SEQUENCE);
             con = JdbcUtil.getDbConnection(DaoResourceData.class);
+            // resource_data_id comes from the shared sequence here too. Leaving it out of the
+            // column list makes ClickHouse default it to 0 for every row this path writes, and
+            // deletions select by resource_data_id -- so one row's deletion would take every
+            // other row written this way with it.
             pstmt = con.prepareStatement(
                 "INSERT INTO `" + RESOURCE_DATA_TABLE + "` "
-                + "(`resource_data_id`,`resource_id`,`cancer_study_id`,`entity_type`,"
+                + "(`resource_data_id`,`resource_id`,`cancer_study_id`,`resource_scope`,"
                 + "`patient_id`,`sample_id`,`url`,"
-                + "`display_name`,`type`,`metadata`) "
-                + "VALUES (?,?,?,?,?,?,?,?,?,?)"
+                + "`display_name`,`metadata`) "
+                + "VALUES (?,?,?,?,?,?,?,?,?)"
             );
-            pstmt.setLong(1, resourceDataId);
+            pstmt.setLong(1, ClickHouseAutoIncrement.nextId(RESOURCE_DATA_SEQUENCE));
             pstmt.setString(2, resourceId);
             pstmt.setInt(3, cancerStudyId);
-            pstmt.setString(4, entityType);
+            pstmt.setString(4, resourceScope);
             pstmt.setString(5, patientId);
             pstmt.setString(6, sampleId);
             pstmt.setString(7, url);
             pstmt.setString(8, displayName);
-            pstmt.setString(9, type);
-            pstmt.setString(10, metadata);
+            pstmt.setString(9, metadata);
             return pstmt.executeUpdate();
         } catch (SQLException e) {
             throw new DaoException(e);
@@ -131,54 +128,84 @@ public final class DaoResourceData {
      * @param resourceIds   resource IDs present in the file being (re-)imported; a no-op if empty
      */
     public static void deleteResourceData(int cancerStudyId, Set<String> resourceIds) throws DaoException {
-        addResourceDataToBulkDelete(cancerStudyId, "resource_id", resourceIds);
-    }
-
-    /**
-     * Queues deletion of the {@code resource_data} rows attached to the given samples of a
-     * study. The rows are removed by the next {@link ClickHouseBulkDeleter#flushAll()}, so
-     * callers can combine this with the other per-sample deletes they already batch.
-     *
-     * @param cancerStudyId   internal cancer-study ID
-     * @param sampleStableIds stable sample IDs; a no-op if empty
-     */
-    public static void addSampleResourceDataToBulkDelete(int cancerStudyId, Set<String> sampleStableIds)
-            throws DaoException {
-        addResourceDataToBulkDelete(cancerStudyId, "sample_id", sampleStableIds);
-    }
-
-    /**
-     * Queues deletion of every {@code resource_data} row attached to the given patients of a
-     * study, including sample-level rows that carry the patient ID. The rows are removed by
-     * the next {@link ClickHouseBulkDeleter#flushAll()}.
-     *
-     * @param cancerStudyId    internal cancer-study ID
-     * @param patientStableIds stable patient IDs; a no-op if empty
-     */
-    public static void addPatientResourceDataToBulkDelete(int cancerStudyId, Set<String> patientStableIds)
-            throws DaoException {
-        addResourceDataToBulkDelete(cancerStudyId, "patient_id", patientStableIds);
-    }
-
-    private static void addResourceDataToBulkDelete(int cancerStudyId, String filterColumn,
-            Set<String> values) throws DaoException {
-        if (values == null || values.isEmpty()) {
+        if (resourceIds == null || resourceIds.isEmpty()) {
             return;
         }
-        Set<Long> idsToDelete = findResourceDataIds(cancerStudyId, filterColumn, values);
+        Set<Long> idsToDelete = findResourceDataIds(cancerStudyId, resourceIds);
         if (idsToDelete.isEmpty()) {
             return;
         }
-        // Queued here, flushed by the caller. The ids collected above belong only to rows that
-        // already existed, and ClickHouseAutoIncrement seeds each counter from
-        // max(persisted, current table max), so the rows an import is about to insert get ids
-        // above every one of them: the deletion is correct whichever side of the inserts it
-        // lands on.
+        // Queued here, flushed by the caller once the whole file has been read. The ids
+        // collected above belong only to rows that already existed, and ClickHouseAutoIncrement
+        // seeds each counter from max(persisted, current table max), so the rows this import is
+        // about to insert get ids above every one of them: the deletion is correct whichever
+        // side of the inserts it lands on.
         ClickHouseBulkDeleter.getBulkDeleter(RESOURCE_DATA_TABLE, "resource_data_id").addIds(idsToDelete);
     }
 
-    private static Set<Long> findResourceDataIds(int cancerStudyId, String filterColumn, Set<String> values)
+    /**
+     * Deletes the {@code resource_data} rows belonging to the given samples of a study.
+     *
+     * <p>The legacy {@code resource_sample} table keyed rows by the sample's <em>internal</em> id,
+     * so deleting a sample could reach its resources directly. {@code resource_data} stores the
+     * <em>stable</em> id instead, and a stable id is unique only within a study, so the lookup has
+     * to be scoped by study before anything is deleted.
+     *
+     * @param cancerStudyId   internal cancer-study ID
+     * @param sampleStableIds stable sample IDs being removed; a no-op if empty
+     */
+    public static void deleteResourceDataForSamples(int cancerStudyId, Set<String> sampleStableIds)
             throws DaoException {
+        deleteResourceDataForEntities(cancerStudyId, "sample_id", sampleStableIds);
+    }
+
+    /**
+     * Deletes the {@code resource_data} rows belonging to the given patients of a study. Only
+     * patient-level rows carry a patient id with no sample; a sample's rows go with the sample.
+     *
+     * @param cancerStudyId    internal cancer-study ID
+     * @param patientStableIds stable patient IDs being removed; a no-op if empty
+     */
+    public static void deleteResourceDataForPatients(int cancerStudyId, Set<String> patientStableIds)
+            throws DaoException {
+        deleteResourceDataForEntities(cancerStudyId, "patient_id", patientStableIds);
+    }
+
+    private static void deleteResourceDataForEntities(
+            int cancerStudyId, String idColumn, Set<String> stableIds) throws DaoException {
+        if (stableIds == null || stableIds.isEmpty()) {
+            return;
+        }
+        Set<Long> idsToDelete = findResourceDataIdsByEntity(cancerStudyId, idColumn, stableIds);
+        if (idsToDelete.isEmpty()) {
+            return;
+        }
+        ClickHouseBulkDeleter.getBulkDeleter(RESOURCE_DATA_TABLE, "resource_data_id").addIds(idsToDelete);
+    }
+
+    private static Set<Long> findResourceDataIdsByEntity(
+            int cancerStudyId, String idColumn, Set<String> stableIds) throws DaoException {
+        // A sample's rows are the ones naming that sample; a patient's are the ones naming the
+        // patient and no sample, so removing a patient does not take rows that belong to a sample
+        // being kept.
+        String scope = "sample_id".equals(idColumn) ? "" : " AND `sample_id` IS NULL";
+        return queryResourceDataIds(
+            "WHERE `cancer_study_id` = ? AND `" + idColumn + "` IN (%s)" + scope,
+            cancerStudyId, stableIds);
+    }
+
+    private static Set<Long> findResourceDataIds(int cancerStudyId, Set<String> resourceIds) throws DaoException {
+        return queryResourceDataIds(
+            "WHERE `cancer_study_id` = ? AND `resource_id` IN (%s)", cancerStudyId, resourceIds);
+    }
+
+    /**
+     * Collects the {@code resource_data_id}s a deletion should queue. The where clause carries one
+     * {@code %s} for the IN placeholders, and is always scoped by study: the values are stable ids,
+     * which repeat across studies.
+     */
+    private static Set<Long> queryResourceDataIds(
+            String whereTemplate, int cancerStudyId, Set<String> values) throws DaoException {
         Set<Long> ids = new HashSet<>();
         Connection con = null;
         PreparedStatement pstmt = null;
@@ -188,7 +215,7 @@ public final class DaoResourceData {
             String placeholders = values.stream().map(id -> "?").collect(Collectors.joining(","));
             pstmt = con.prepareStatement(
                 "SELECT `resource_data_id` FROM `" + RESOURCE_DATA_TABLE + "` "
-                + "WHERE `cancer_study_id` = ? AND `" + filterColumn + "` IN (" + placeholders + ")"
+                + String.format(whereTemplate, placeholders)
             );
             int paramIndex = 1;
             pstmt.setInt(paramIndex++, cancerStudyId);

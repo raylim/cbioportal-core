@@ -44,13 +44,14 @@ resource file pairs:
 
 - `WSI_SAMPLE` (resource type `SAMPLE`): slides matched to a sample
   (`match_level` `PART` or `BLOCK`), one row per slide in the sample resource
-  file with columns `PATIENT_ID SAMPLE_ID RESOURCE_ID URL DISPLAY_NAME TYPE METADATA`.
+  file with columns `PATIENT_ID SAMPLE_ID RESOURCE_ID URL DISPLAY_NAME METADATA`.
 - `WSI_PATIENT` (resource type `PATIENT`): unmatched slides, one row per slide
   in the patient resource file with columns
-  `PATIENT_ID RESOURCE_ID URL DISPLAY_NAME TYPE METADATA`.
+  `PATIENT_ID RESOURCE_ID URL DISPLAY_NAME METADATA`.
 
-Both use `TYPE=WHOLE_SLIDE_IMAGE`, and the `WSI_SAMPLE`/`WSI_PATIENT` IDs are
-reserved for that type. Files are raw tab-separated text: values are not
+The `WSI_SAMPLE`/`WSI_PATIENT` IDs are reserved for slides: a row is a slide
+row because of its `RESOURCE_ID`. Resource files have no `TYPE` column (it is
+retired; `validateData.py` warns and ignores one). Files are raw tab-separated text: values are not
 quoted, and no value may contain a tab or line break. `METADATA` is one compact
 JSON object per row whose keys are the lower-cased format-v4 column names.
 These public keys may be returned to the browser:
@@ -97,7 +98,7 @@ at most 4096 characters that decode to at least 29 bytes. It is required when
 `can_serve_tiles` is true and must be absent or empty otherwise. Error
 messages never echo it.
 
-For every `WHOLE_SLIDE_IMAGE` row, `validateData.py` applies the row contract
+For every `WSI_SAMPLE`/`WSI_PATIENT` row, `validateData.py` applies the row contract
 of [format v4](#legacy-format-v4), shared with the converter:
 required hierarchy keys, typed values, `match_level`
 agreement with the file type (sample rows are matched, patient rows are
@@ -109,7 +110,7 @@ metadata, the sample and reference sample belonging to the row's patient, and
 the `wsi_serving` shape and sealed-source rules. The row's `RESOURCE_ID` must be `WSI_SAMPLE` in sample files and
 `WSI_PATIENT` in patient files.
 
-Error messages for `WHOLE_SLIDE_IMAGE` rows never echo values; only the
+Error messages for WSI rows never echo values; only the
 column or JSON path is reported. Core does not scan free text (`DISPLAY_NAME`,
 part and block descriptions, stain names, tile metadata and similar) for
 protected health information or institution-specific identifiers such as
