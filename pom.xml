@@ -17,9 +17,9 @@
 
 		<!-- THIS SHOULD BE KEPT IN SYNC WITH db.version IN cbioportal/pom.xml and
 		     info.db_schema_version IN cbioportal/src/main/resources/db-scripts/clickhouse/init/schema.sql -->
-		<db.version>3.8.0</db.version>
+		<db.version>3.9.0</db.version>
 		<!-- Pin this to the backend commit containing the matching schema before merging. -->
-		<cbioportal.version>ee15c5b1c5b2fa89abefa371dfa11d68d4f7570b</cbioportal.version>
+		<cbioportal.version>e6ec8b785aa8cb35dc3ae1d7157467ee9499ecda</cbioportal.version>
 		<maf.version>1.0.0</maf.version>
 
 		<commons_lang3.version>3.13.0</commons_lang3.version>

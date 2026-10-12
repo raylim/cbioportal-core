@@ -65,9 +65,8 @@ public class TestImportResourceData extends IntegrationTestBase {
         "AAECAwQFBgcICQoLNpOTYnY8HVb-KcPzu1F5HPykr7D0YY_UhVbbyjOFRlxC63fxCt09YO1aYC-phb85wDhN5PPPpC0X46RS"
             + "D0K0bRRgSptRb9wDiqMLtftFQ6VpBGfGILaddEV_s-Zsmpp28fG5Z3XTNWnyoBRa9qfr9t209wS7V-LhGl8i";
 
-    private record ResourceRow(long resourceDataId, String resourceId, String entityType,
-                               String patientId, String sampleId, String url, String type,
-                               String metadata) {
+    private record ResourceRow(long resourceDataId, String resourceId, String resourceScope,
+                               String patientId, String sampleId, String url, String metadata) {
     }
 
     @Before
@@ -86,10 +85,9 @@ public class TestImportResourceData extends IntegrationTestBase {
 
         ResourceRow first = rows.get(SLIDE_1);
         assertEquals("WSI_SAMPLE", first.resourceId());
-        assertEquals("SAMPLE", first.entityType());
+        assertEquals("SAMPLE", first.resourceScope());
         assertEquals("WSI-P1", first.patientId());
         assertEquals("WSI-P1-S1", first.sampleId());
-        assertEquals("WHOLE_SLIDE_IMAGE", first.type());
         assertEquals("https://portal.example.org/cbioportal/wsi/patient/WSI-P1"
             + "?studyId=wsi_convert_test&slideKey=2c96f13783250ad2c6bcfcd5b7c3ef22", first.url());
         JsonNode metadata = JSON.readTree(first.metadata());
@@ -125,7 +123,7 @@ public class TestImportResourceData extends IntegrationTestBase {
 
         ResourceRow unmatched = rows.get(SLIDE_6);
         assertEquals("WSI_PATIENT", unmatched.resourceId());
-        assertEquals("PATIENT", unmatched.entityType());
+        assertEquals("PATIENT", unmatched.resourceScope());
         assertEquals("WSI+P3", unmatched.patientId());
         assertNull(unmatched.sampleId());
         assertEquals("https://portal.example.org/cbioportal/wsi/patient/WSI%2BP3"
@@ -165,7 +163,8 @@ public class TestImportResourceData extends IntegrationTestBase {
         assertEquals("reimport replaces rows instead of duplicating them", 6, reimported.size());
         // rowsBySlideKey collapses duplicates by key, so also count the stored rows directly.
         assertEquals("reimport leaves exactly one row per slide", 6L, singleLong(
-            "SELECT count() FROM resource_data WHERE cancer_study_id = ? AND type = 'WHOLE_SLIDE_IMAGE'",
+            "SELECT count() FROM resource_data WHERE cancer_study_id = ? "
+                + "AND resource_id IN ('WSI_SAMPLE', 'WSI_PATIENT')",
             study.getInternalId()));
         assertStudySlideTableMatches(study);
         Set<Long> secondIds = ids(reimported.values());
@@ -176,7 +175,7 @@ public class TestImportResourceData extends IntegrationTestBase {
         // The direct (non-bulk) insert path allocates from the same sequence.
         ClickHouseBulkLoader.bulkLoadOff();
         DaoResourceData.addResourceDatum(study.getInternalId(), "WSI_PATIENT", "PATIENT", "WSI-P1",
-            null, "https://portal.example.org/cbioportal/direct", "direct", "LINK", null);
+            null, "https://portal.example.org/cbioportal/direct", "direct", null);
         long directId = singleLong(
             "SELECT resource_data_id FROM resource_data WHERE cancer_study_id = ? AND display_name = 'direct'",
             study.getInternalId());
@@ -233,15 +232,16 @@ public class TestImportResourceData extends IntegrationTestBase {
         Map<String, ResourceRow> rows = new LinkedHashMap<>();
         try (Connection connection = JdbcUtil.getDbConnection(TestImportResourceData.class);
              PreparedStatement statement = connection.prepareStatement(
-                 "SELECT resource_data_id, resource_id, entity_type, patient_id, sample_id, url, type, metadata "
-                     + "FROM resource_data WHERE cancer_study_id = ? AND type = 'WHOLE_SLIDE_IMAGE' "
+                 "SELECT resource_data_id, resource_id, resource_scope, patient_id, sample_id, url, metadata "
+                     + "FROM resource_data WHERE cancer_study_id = ? "
+                     + "AND resource_id IN ('WSI_SAMPLE', 'WSI_PATIENT') "
                      + "ORDER BY resource_id DESC, resource_data_id")) {
             statement.setInt(1, study.getInternalId());
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
                     ResourceRow row = new ResourceRow(result.getLong(1), result.getString(2),
                         result.getString(3), result.getString(4), result.getString(5),
-                        result.getString(6), result.getString(7), result.getString(8));
+                        result.getString(6), result.getString(7));
                     rows.put(JSON.readTree(row.metadata()).get("slide_key").textValue(), row);
                 }
             }
