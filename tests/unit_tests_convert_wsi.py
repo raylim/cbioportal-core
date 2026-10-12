@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Tests for the offline legacy-WSI to resource/clinical file converter.
+"""Tests for the offline legacy-WSI to resource file converter.
 
 The emitted files are run through the real validateData validators, and the
 committed Java integration-test fixture is checked to be current converter
@@ -33,26 +33,10 @@ SAMPLE_TO_PATIENT = {
     'WSI-P2-S1': 'WSI-P2',
     'WSI+P3-S1': 'WSI+P3',
 }
-MERGED_FILES = [
-    'data_clinical_patients.txt',
-    'data_clinical_samples.txt',
-    'data_resource_definition.txt',
-    'data_resource_patient.txt',
-    'data_resource_sample.txt',
-    'meta_clinical_patients.txt',
-    'meta_clinical_samples.txt',
-    'meta_resource_definition.txt',
-    'meta_resource_patient.txt',
-    'meta_resource_sample.txt',
-]
 EXPECTED_FILES = [
-    'data_clinical_patient_wsi_counts.txt',
-    'data_clinical_sample_wsi_counts.txt',
     'data_resource_definition.txt',
     'data_resource_patient.txt',
     'data_resource_sample.txt',
-    'meta_clinical_patient_wsi_counts.txt',
-    'meta_clinical_sample_wsi_counts.txt',
     'meta_resource_definition.txt',
     'meta_resource_patient.txt',
     'meta_resource_sample.txt',
@@ -127,25 +111,21 @@ class ConvertedOutputTestCase(ConverterTestCase):
         self.assertEqual(
             'cancer_study_identifier: wsi_convert_test\nresource_type: SAMPLE\n'
             'data_filename: data_resource_sample.txt\n', meta)
-        meta = (self.out / 'meta_clinical_sample_wsi_counts.txt').read_text()
-        self.assertEqual(
-            'cancer_study_identifier: wsi_convert_test\ngenetic_alteration_type: CLINICAL\n'
-            'datatype: SAMPLE_ATTRIBUTES\ndata_filename: data_clinical_sample_wsi_counts.txt\n', meta)
 
     def test_sample_and_patient_rows(self):
         self.convert()
         sample_header = data_rows(self.out / 'data_resource_sample.txt')[0]
-        self.assertEqual(['PATIENT_ID', 'SAMPLE_ID', 'RESOURCE_ID', 'URL', 'DISPLAY_NAME', 'TYPE',
+        self.assertEqual(['PATIENT_ID', 'SAMPLE_ID', 'RESOURCE_ID', 'URL', 'DISPLAY_NAME',
                           'METADATA'], sample_header)
         samples = rows_by_slide(self.out / 'data_resource_sample.txt')
         patients = rows_by_slide(self.out / 'data_resource_patient.txt')
         self.assertEqual(['slide-1', 'slide-2', 'slide-3', 'slide-5'], list(samples))
         self.assertEqual(['slide-4', 'slide-6'], list(patients))
-        self.assertEqual({(r['PATIENT_ID'], r['SAMPLE_ID'], r['RESOURCE_ID'], r['TYPE'])
+        self.assertEqual({(r['PATIENT_ID'], r['SAMPLE_ID'], r['RESOURCE_ID'])
                           for r in samples.values()},
-                         {('WSI-P1', 'WSI-P1-S1', 'WSI_SAMPLE', 'WHOLE_SLIDE_IMAGE'),
-                          ('WSI-P1', 'WSI-P1-S2', 'WSI_SAMPLE', 'WHOLE_SLIDE_IMAGE'),
-                          ('WSI-P2', 'WSI-P2-S1', 'WSI_SAMPLE', 'WHOLE_SLIDE_IMAGE')})
+                         {('WSI-P1', 'WSI-P1-S1', 'WSI_SAMPLE'),
+                          ('WSI-P1', 'WSI-P1-S2', 'WSI_SAMPLE'),
+                          ('WSI-P2', 'WSI-P2-S1', 'WSI_SAMPLE')})
         self.assertEqual({(r['PATIENT_ID'], r['RESOURCE_ID']) for r in patients.values()},
                          {('WSI-P1', 'WSI_PATIENT'), ('WSI+P3', 'WSI_PATIENT')})
         self.assertNotIn('SAMPLE_ID', data_rows(self.out / 'data_resource_patient.txt')[0])
@@ -187,7 +167,7 @@ class ConvertedOutputTestCase(ConverterTestCase):
         self.assertEqual({'height': 768, 'width': 1024}, serving['tile_metadata_json']['dimensions'])
         self.assertEqual({'model': 'Scan "Q" \\ 40', 'objective_power': 40, 'calibrated': True},
                          serving['tile_metadata_json']['vendor']['scanner'])
-        # UNMATCHED reference samples are dropped, as the native importer stored null
+        # UNMATCHED reference samples are dropped (stored as no reference sample)
         self.assertNotIn('reference_sample_id', json.loads(samples['slide-5']['METADATA']))
         self.assertEqual(0, json.loads(samples['slide-5']['METADATA'])['file_size_bytes'])
 
@@ -201,120 +181,30 @@ class ConvertedOutputTestCase(ConverterTestCase):
         self.assertNotIn('wsi_serving', second)
         self.assertNotIn('wsi_serving', json.loads(patients['slide-6']['METADATA']))
 
-    def test_count_rows_match_native_semantics(self):
-        self.convert()
-        self.assertEqual(
-            [['PATIENT_ID', 'SAMPLE_ID', 'WSI_SAMPLE_SLIDE_COUNT', 'WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT',
-              'WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT'],
-             ['WSI-P1', 'WSI-P1-S1', '1', '0', '1'],
-             ['WSI-P1', 'WSI-P1-S2', '1', '0', '1'],
-             ['WSI-P2', 'WSI-P2-S1', '1', '1', '0']],
-            data_rows(self.out / 'data_clinical_sample_wsi_counts.txt'))
-        self.assertEqual(
-            [['PATIENT_ID', 'WSI_PATIENT_SLIDE_COUNT', 'WSI_PATIENT_PART_MATCHED_SLIDE_COUNT',
-              'WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT'],
-             ['WSI-P1', '3', '0', '2'],
-             ['WSI-P2', '1', '1', '0'],
-             ['WSI+P3', 'NA', 'NA', 'NA']],
-            data_rows(self.out / 'data_clinical_patient_wsi_counts.txt'))
-        header = (self.out / 'data_clinical_sample_wsi_counts.txt').read_text().splitlines()[:4]
-        self.assertEqual(
-            ['#Patient Identifier\tSample Identifier\tWSI Viewable Slides per Sample\t'
-             'WSI Viewable Slides per Sample, Part-matched\t'
-             'WSI Viewable Slides per Sample, Block-matched',
-             '#Patient identifier\tSample identifier\t'
-             'Pathology slides the slide viewer can open, for the sample.\t'
-             'Pathology slides the slide viewer can open, for the sample, matched to a specimen part.\t'
-             'Pathology slides the slide viewer can open, for the sample, matched to a specimen block.',
-             '#STRING\tSTRING\tNUMBER\tNUMBER\tNUMBER',
-             '#1\t1\t1\t1\t1'], header)
-        header = (self.out / 'data_clinical_patient_wsi_counts.txt').read_text().splitlines()[:4]
-        self.assertEqual(
-            ['#Patient Identifier\tWSI Viewable Slides per Patient\t'
-             'WSI Viewable Slides per Patient, Part-matched\t'
-             'WSI Viewable Slides per Patient, Block-matched',
-             '#Patient identifier\t'
-             'Pathology slides the slide viewer can open, for the patient.\t'
-             'Pathology slides the slide viewer can open, for the patient, matched to a specimen part.\t'
-             'Pathology slides the slide viewer can open, for the patient, matched to a specimen block.',
-             '#STRING\tNUMBER\tNUMBER\tNUMBER',
-             '#1\t1\t1\t1'], header)
-
-    def test_only_viewable_slides_are_counted(self):
-        can_serve = converter.COLUMNS.index('CAN_SERVE_TILES')
-        sealed = converter.COLUMNS.index('SEALED_SOURCE')
-        only_s2_slide = 'f9bce50b1498c94fa0fa6cce809f64f2'  # the only slide of WSI-P1-S2
-        rows = self.fixture_rows()
-        for index, row in enumerate(rows):
-            fields = row.split('\t')
-            if fields[SLIDE_KEY] == only_s2_slide:
-                fields[can_serve] = 'FALSE'
-                fields[sealed] = ''
-                rows[index] = '\t'.join(fields)
-        self.convert(meta=self.write_legacy(rows))
-        # The fixture's non-viewable slide and WSI-P1-S2's only slide are not counted. WSI-P1-S2 and
-        # WSI+P3, whose only slides are non-viewable, get no count: NA, which the
-        # importer stores as no value, so the row only keeps the entity defined.
-        self.assertEqual(
-            [['WSI-P1', 'WSI-P1-S1', '1', '0', '1'],
-             ['WSI-P1', 'WSI-P1-S2', 'NA', 'NA', 'NA'],
-             ['WSI-P2', 'WSI-P2-S1', '1', '1', '0']],
-            data_rows(self.out / 'data_clinical_sample_wsi_counts.txt')[1:])
-        self.assertEqual(
-            [['WSI-P1', '2', '0', '1'],
-             ['WSI-P2', '1', '1', '0'],
-             ['WSI+P3', 'NA', 'NA', 'NA']],
-            data_rows(self.out / 'data_clinical_patient_wsi_counts.txt')[1:])
-        by_sample, by_patient = converter.count_slides(
-            converter.parse_slides(converter.iter_rows(self.write_legacy(rows).parent / 'data_wsi.txt')))
-        self.assertEqual({('WSI-P1', 'WSI-P1-S1'): [1, 0, 1], ('WSI-P2', 'WSI-P2-S1'): [1, 1, 0]},
-                         by_sample)
-        self.assertEqual({'WSI-P1': [2, 0, 1], 'WSI-P2': [1, 1, 0]}, by_patient)
-        # the non-viewable slides are still converted to resources
-        samples = rows_by_slide(self.out / 'data_resource_sample.txt')
-        self.assertIn('slide-3', samples)
-
-    def test_entities_without_viewable_slides_get_no_counts(self):
-        can_serve = converter.COLUMNS.index('CAN_SERVE_TILES')
-        rows = [row for row in self.fixture_rows() if row.split('\t')[can_serve] == 'FALSE']
-        self.assertEqual(2, len(rows))  # IMG-2 (WSI-P1-S1) and IMG-6 (WSI+P3, unmatched)
-        self.convert(meta=self.write_legacy(rows))
-        self.assertEqual([['WSI-P1', 'WSI-P1-S1', 'NA', 'NA', 'NA']],
-                         data_rows(self.out / 'data_clinical_sample_wsi_counts.txt')[1:])
-        self.assertEqual([['WSI-P1', 'NA', 'NA', 'NA'], ['WSI+P3', 'NA', 'NA', 'NA']],
-                         data_rows(self.out / 'data_clinical_patient_wsi_counts.txt')[1:])
-
-    def test_merge_requires_entities_with_only_non_viewable_slides(self):
-        # WSI+P3 has no counts, but its slide is still a resource, so the
-        # clinical file must still list it; its count columns are NA.
-        study = self.copy_study()
-        self.convert(study_dir=study)
-        patients = {row[0]: row[-3:] for row in data_rows(self.out / 'data_clinical_patients.txt')}
-        self.assertEqual(['NA', 'NA', 'NA'], patients['WSI+P3'])
-
     def test_only_pairs_with_rows_are_written(self):
         match_level = converter.COLUMNS.index('MATCH_LEVEL')
         unmatched = [row for row in self.fixture_rows() if row.split('\t')[match_level] == 'UNMATCHED']
         written = self.convert(meta=self.write_legacy(unmatched))
         self.assertEqual(
-            ['data_clinical_patient_wsi_counts.txt', 'data_resource_definition.txt',
-             'data_resource_patient.txt', 'meta_clinical_patient_wsi_counts.txt',
+            ['data_resource_definition.txt', 'data_resource_patient.txt',
              'meta_resource_definition.txt', 'meta_resource_patient.txt'],
             sorted(path.name for path in written))
         definitions = data_rows(self.out / 'data_resource_definition.txt')
         self.assertEqual(['WSI_PATIENT'], [row[0] for row in definitions[1:]])
 
-    def test_definitions_declare_identifier_keys_unfilterable(self):
+    def test_definitions_declare_the_full_public_contract(self):
         self.convert()
         header, *definitions = data_rows(self.out / 'data_resource_definition.txt')
         self.assertEqual('CUSTOM_METADATA', header[-1])
         for row in definitions:
             contract = json.loads(row[-1])
             self.assertEqual(1, contract['version'])
-            self.assertEqual(
-                {'slide_key': False, 'part_key': False, 'block_key': False,
-                 'specimen_key': False, 'reference_sample_id': False},
-                {field['key']: field['filterable'] for field in contract['fields']})
+            fields = {field['key']: field for field in contract['fields']}
+            # every public key the converter writes, and never the private serving object
+            self.assertEqual(PUBLIC_KEYS, set(fields))
+            unfilterable = {key for key, field in fields.items() if not field['filterable']}
+            self.assertTrue({'slide_key', 'part_key', 'block_key', 'specimen_key',
+                             'reference_sample_id'} <= unfilterable, unfilterable)
 
     def test_java_fixture_is_current_converter_output(self):
         self.convert(base_url=BASE_URL)
@@ -349,7 +239,7 @@ class ConverterInputTestCase(ConverterTestCase):
         rows[3] = rows[3].replace('\tUNMATCHED\t', '\tPART\t', 1)
         self.assertConversionError('matched rows require SAMPLE_ID', meta=self.write_legacy(rows))
 
-    def test_slide_type_and_stain_flags_follow_native_constraints(self):
+    def test_slide_type_and_stain_flags(self):
         slide_type = converter.COLUMNS.index('SLIDE_TYPE')
         is_hne = converter.COLUMNS.index('IS_HNE')
         for column, value, message in ((slide_type, 'Frozen', 'SLIDE_TYPE must be one of'),
@@ -361,21 +251,16 @@ class ConverterInputTestCase(ConverterTestCase):
             rows[0] = '\t'.join(fields)
             self.assertConversionError(message, meta=self.write_legacy(rows))
 
-    def test_duplicate_slide_is_rejected(self):
-        rows = self.fixture_rows()
-        self.assertConversionError('SLIDE_KEY is not unique', meta=self.write_legacy(rows + rows[:1]))
-
     def test_file_without_timing_has_no_timing_keys(self):
-        # The timing columns are optional: without them no timing key and no undated count is written.
+        # The timing columns are optional: without them no timing key is written or declared.
         self.convert()
         for name in ('data_resource_sample.txt', 'data_resource_patient.txt'):
             for record in rows_by_slide(self.out / name).values():
                 metadata = json.loads(record['METADATA'])
                 self.assertFalse([key for key in metadata
                                   if key.startswith(('timeline_', 'timepoint_'))], metadata)
-        text = (self.out / 'data_clinical_patient_wsi_counts.txt').read_text()
-        self.assertNotIn('WSI_PATIENT_UNDATED_SLIDE_COUNT', text)
-        self.assertNotIn('Undated', text)
+        for row in data_rows(self.out / 'data_resource_definition.txt')[1:]:
+            self.assertEqual(converter.CUSTOM_METADATA, row[-1])
 
     def test_line_break_in_output_cell_is_rejected(self):
         rows = self.fixture_rows()
@@ -383,22 +268,7 @@ class ConverterInputTestCase(ConverterTestCase):
         rows[0] = rows[0].replace('\tH&E\tH&E\tTRUE\t', '\tH\r&E\tH&E\tTRUE\t', 1)
         self.assertConversionError('tab or line break', meta=self.write_legacy(rows))
         with self.assertRaises(converter.ConversionError):
-            converter.write_tsv(Path(self.tmp.name) / 'x.txt', [['a\tb']])
-
-    def test_existing_count_attributes_conflict(self):
-        study = Path(self.tmp.name) / 'study'
-        study.mkdir()
-        (study / 'data_clinical_samples.txt').write_text(textwrap.dedent('''\
-            #Patient Identifier\tSample Identifier\tSlides
-            #Patient\tSample\tSlides
-            #STRING\tSTRING\tNUMBER
-            #1\t1\t1
-            PATIENT_ID\tSAMPLE_ID\tWSI_SAMPLE_SLIDE_COUNT
-            WSI-P1\tWSI-P1-S1\t2
-            '''))
-        self.assertConversionError('data_clinical_samples.txt already defines WSI_SAMPLE_SLIDE_COUNT',
-                                   study_dir=study)
-        self.assertFalse(self.out.exists(), 'nothing may be written after a conflict')
+            converter.render_tsv('x.txt', [['a\tb']])
 
     def test_existing_resource_files_conflict(self):
         study = Path(self.tmp.name) / 'study'
@@ -413,141 +283,6 @@ class ConverterInputTestCase(ConverterTestCase):
         study = self.copy_study()
         self.out = study
         self.assertConversionError('--output-dir must differ from --study-dir', study_dir=study)
-
-
-class ClinicalMergeTestCase(ConverterTestCase):
-
-    """--study-dir merges the counts into copies of the study's clinical files."""
-
-    def assertConversionError(self, text, **kwargs):
-        with self.assertRaises(converter.ConversionError) as context:
-            self.convert(**kwargs)
-        self.assertIn(text, str(context.exception))
-        self.assertFalse(self.out.exists(), 'nothing may be written after a failure')
-
-    def test_writes_merged_clinical_files_under_study_names(self):
-        study = self.copy_study()
-        written = self.convert(study_dir=study)
-        self.assertEqual(MERGED_FILES, sorted(path.name for path in written))
-        for meta in ('meta_clinical_samples.txt', 'meta_clinical_patients.txt'):
-            self.assertEqual((study / meta).read_bytes(), (self.out / meta).read_bytes())
-        # the resource files are the same as without --study-dir
-        resources = Path(self.tmp.name) / 'resources'
-        converter.convert(FIXTURE_DIR / 'meta_wsi.txt', resources, BASE_URL)
-        for name in MERGED_FILES:
-            if 'resource' in name:
-                self.assertEqual((resources / name).read_bytes(), (self.out / name).read_bytes())
-
-    def test_merged_values_and_na(self):
-        study = self.copy_study()
-        self.convert(study_dir=study)
-        self.assertEqual(
-            [['PATIENT_ID', 'SAMPLE_ID', 'CANCER_TYPE', 'TUMOR_PURITY', 'WSI_SAMPLE_SLIDE_COUNT',
-              'WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT', 'WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT'],
-             ['WSI-P1', 'WSI-P1-S1', 'Breast Cancer', '0.45', '1', '0', '1'],
-             ['WSI-P1', 'WSI-P1-S2', 'Breast Cancer', 'NA', '1', '0', '1'],
-             ['WSI-P2', 'WSI-P2-S1', 'Breast Cancer', '0.8', '1', '1', '0'],
-             ['WSI+P3', 'WSI+P3-S1', 'Breast Cancer', '', 'NA', 'NA', 'NA'],
-             ['WSI-P4', 'WSI-P4-S1', 'Breast Cancer', '0.1', 'NA', 'NA', 'NA']],
-            data_rows(self.out / 'data_clinical_samples.txt'))
-        patients = data_rows(self.out / 'data_clinical_patients.txt')
-        self.assertEqual(['WSI_PATIENT_SLIDE_COUNT', 'WSI_PATIENT_PART_MATCHED_SLIDE_COUNT',
-                          'WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT'], patients[0][-3:])
-        self.assertEqual({'WSI-P1': ['3', '0', '2'], 'WSI-P2': ['1', '1', '0'],
-                          'WSI+P3': ['NA', 'NA', 'NA'], 'WSI-P4': ['NA', 'NA', 'NA']},
-                         {row[0]: row[-3:] for row in patients[1:]})
-        header = (self.out / 'data_clinical_samples.txt').read_text().splitlines()[:4]
-        self.assertEqual(
-            ['#Patient Identifier\tSample Identifier\tCancer Type\tTumor Purity\t'
-             'WSI Viewable Slides per Sample\tWSI Viewable Slides per Sample, Part-matched\t'
-             'WSI Viewable Slides per Sample, Block-matched',
-             '#Patient identifier\tSample identifier\tCancer type\tEstimated tumor purity\t'
-             'Pathology slides the slide viewer can open, for the sample.\t'
-             'Pathology slides the slide viewer can open, for the sample, matched to a specimen part.\t'
-             'Pathology slides the slide viewer can open, for the sample, matched to a specimen block.',
-             '#STRING\tSTRING\tSTRING\tNUMBER\tNUMBER\tNUMBER\tNUMBER',
-             '#1\t1\t1\t1\t1\t1\t1'], header)
-
-    def test_existing_lines_are_preserved_byte_for_byte(self):
-        study = self.copy_study()
-        path = study / 'data_clinical_samples.txt'
-        # CRLF on the first rows, a trailing comment, a blank line and no final newline
-        original = (path.read_bytes().replace(b'\n', b'\r\n', 3)
-                    + b'# trailing comment\n\nWSI-P5\tWSI-P5-S1\tBreast Cancer\t0.2')
-        patients = study / 'data_clinical_patients.txt'
-        patients.write_text(patients.read_text() + 'WSI-P5\t0:LIVING\t1\t0:DiseaseFree\t1\tMale\n')
-        path.write_bytes(original)
-        self.convert(study_dir=study)
-        merged = (self.out / 'data_clinical_samples.txt').read_bytes()
-        original_lines = original.split(b'\n')
-        merged_lines = merged.split(b'\n')
-        self.assertEqual(len(original_lines), len(merged_lines))
-        for before, after in zip(original_lines, merged_lines):
-            ending = b'\r' if before.endswith(b'\r') else b''
-            if before.startswith(b'# trailing') or not before.strip():
-                # comment and blank lines stay unchanged
-                self.assertEqual(before, after)
-            else:
-                self.assertTrue(after.startswith(before.rstrip(b'\r') + b'\t'), (before, after))
-                self.assertTrue(after.endswith(ending))
-
-    def test_count_columns_already_present(self):
-        study = self.copy_study()
-        path = study / 'data_clinical_patients.txt'
-        path.write_text(path.read_text().replace('\tSEX\n', '\tWSI_PATIENT_SLIDE_COUNT\n'))
-        self.assertConversionError(
-            'data_clinical_patients.txt already defines WSI_PATIENT_SLIDE_COUNT', study_dir=study)
-
-    def test_wsi_sample_missing_from_clinical_file(self):
-        study = self.copy_study()
-        path = study / 'data_clinical_samples.txt'
-        path.write_text(path.read_text().replace('WSI-P2\tWSI-P2-S1\tBreast Cancer\t0.8\n', ''))
-        self.assertConversionError(
-            'data_clinical_samples.txt: SAMPLE_ID with WSI slides not found in the clinical file: '
-            'WSI-P2-S1', study_dir=study)
-
-    def test_wsi_patient_missing_from_clinical_file(self):
-        study = self.copy_study()
-        path = study / 'data_clinical_patients.txt'
-        lines = [line for line in path.read_text().splitlines(True) if not line.startswith('WSI+P3')]
-        path.write_text(''.join(lines))
-        self.assertConversionError(
-            'PATIENT_ID with WSI slides not found in the clinical file: WSI+P3', study_dir=study)
-
-    def test_sample_patient_mismatch(self):
-        study = self.copy_study()
-        path = study / 'data_clinical_samples.txt'
-        path.write_text(path.read_text().replace('WSI-P1\tWSI-P1-S2', 'WSI-P4\tWSI-P1-S2'))
-        self.assertConversionError('SAMPLE_ID WSI-P1-S2 belongs to WSI-P4 here but to WSI-P1',
-                                   study_dir=study)
-
-    def test_multiple_clinical_meta_files(self):
-        study = self.copy_study()
-        shutil.copy(study / 'meta_clinical_samples.txt', study / 'meta_clinical_samples_2.txt')
-        self.assertConversionError('more than one SAMPLE_ATTRIBUTES clinical meta file',
-                                   study_dir=study)
-
-    def test_missing_clinical_file_fails_only_when_needed(self):
-        study = self.copy_study()
-        (study / 'meta_clinical_patients.txt').unlink()
-        self.assertConversionError('no PATIENT_ATTRIBUTES clinical file', study_dir=study)
-        # a study whose slides are all unmatched needs no sample counts
-        match_level = converter.COLUMNS.index('MATCH_LEVEL')
-        unmatched = [row for row in self.fixture_rows() if row.split('\t')[match_level] == 'UNMATCHED']
-        study = Path(self.tmp.name) / 'study_unmatched'
-        shutil.copytree(STUDY_FIXTURE_DIR, study)
-        (study / 'meta_clinical_samples.txt').unlink()
-        written = self.convert(meta=self.write_legacy(unmatched), study_dir=study)
-        self.assertEqual(
-            ['data_clinical_patients.txt', 'data_resource_definition.txt', 'data_resource_patient.txt',
-             'meta_clinical_patients.txt', 'meta_resource_definition.txt', 'meta_resource_patient.txt'],
-            sorted(path.name for path in written))
-
-    def test_clinical_file_without_attribute_rows(self):
-        study = self.copy_study()
-        path = study / 'data_clinical_samples.txt'
-        path.write_text(''.join(path.read_text().splitlines(True)[4:]))
-        self.assertConversionError("expected the four '#' attribute header rows", study_dir=study)
 
 
 TIMING_META = FIXTURE_DIR / 'meta_wsi_timing.txt'
@@ -623,9 +358,21 @@ class TimingTestCase(ConverterTestCase):
         for label in ('slide-1', 'slide-2', 'slide-5', 'slide-6'):
             self.assertNotIn('timeline_date_reason', metadata[label])
 
+    def test_definitions_declare_the_timing_keys(self):
+        self.convert(meta=TIMING_META)
+        for row in data_rows(self.out / 'data_resource_definition.txt')[1:]:
+            self.assertEqual(converter.CUSTOM_METADATA_WITH_TIMING, row[-1])
+            fields = {field['key']: field for field in json.loads(row[-1])['fields']}
+            self.assertEqual(PUBLIC_KEYS | set(TIMING_KEYS), set(fields))
+            # timing is shown on the Summary timeline, not as resource-table filters or columns
+            for key in TIMING_KEYS:
+                self.assertFalse(fields[key]['filterable'], key)
+                self.assertFalse(fields[key]['visibleByDefault'], key)
+            self.assertEqual('number', fields['timeline_start_days']['type'])
+
     def test_everything_but_timing_matches_the_file_without_timing(self):
         reference = Path(self.tmp.name) / 'reference'
-        converter.convert(FIXTURE_DIR / 'meta_wsi.txt', reference, BASE_URL)
+        written = converter.convert(FIXTURE_DIR / 'meta_wsi.txt', reference, BASE_URL)
         self.convert(meta=TIMING_META, base_url=BASE_URL)
         for name in ('data_resource_sample.txt', 'data_resource_patient.txt'):
             expected = rows_by_slide(reference / name)
@@ -634,88 +381,13 @@ class TimingTestCase(ConverterTestCase):
                 stripped = {key: value for key, value in metadata.items() if key not in TIMING_KEYS}
                 self.assertEqual(json.loads(expected[label].pop('METADATA')), stripped, label)
                 self.assertEqual(expected[label], record, label)
-        for name in ('data_resource_definition.txt', 'data_clinical_sample_wsi_counts.txt'):
-            self.assertEqual((reference / name).read_bytes(), (self.out / name).read_bytes(), name)
-
-    def test_undated_count(self):
-        self.convert(meta=TIMING_META)
-        self.assertEqual(
-            [['PATIENT_ID', 'WSI_PATIENT_SLIDE_COUNT', 'WSI_PATIENT_PART_MATCHED_SLIDE_COUNT',
-              'WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT', 'WSI_PATIENT_UNDATED_SLIDE_COUNT'],
-             # slide-3 and slide-4 are viewable without a procedure day
-             ['WSI-P1', '3', '0', '2', '2'],
-             ['WSI-P2', '1', '1', '0', '0'],
-             ['WSI+P3', 'NA', 'NA', 'NA', 'NA']],
-            data_rows(self.out / 'data_clinical_patient_wsi_counts.txt'))
-        header = (self.out / 'data_clinical_patient_wsi_counts.txt').read_text().splitlines()[:4]
-        self.assertEqual(
-            ['#Patient Identifier\tWSI Viewable Slides per Patient\t'
-             'WSI Viewable Slides per Patient, Part-matched\t'
-             'WSI Viewable Slides per Patient, Block-matched\t'
-             'WSI Undated Viewable Slides per Patient',
-             '#Patient identifier\t'
-             'Pathology slides the slide viewer can open, for the patient.\t'
-             'Pathology slides the slide viewer can open, for the patient, matched to a specimen part.\t'
-             'Pathology slides the slide viewer can open, for the patient, matched to a specimen block.\t'
-             'Viewable pathology slides without a procedure date, which the timeline does not show.',
-             '#STRING\tNUMBER\tNUMBER\tNUMBER\tNUMBER',
-             '#1\t1\t1\t1\t1'], header)
-        # the sample counts have no undated attribute
-        self.assertEqual(
-            ['PATIENT_ID', 'SAMPLE_ID', 'WSI_SAMPLE_SLIDE_COUNT', 'WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT',
-             'WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT'],
-            data_rows(self.out / 'data_clinical_sample_wsi_counts.txt')[0])
-
-    def test_undated_count_ignores_non_viewable_slides(self):
-        undated = dict(TIMELINE_START_DAYS='', TIMELINE_DATE_STATUS='MISSING_PROCEDURE_DATE',
-                       TIMELINE_DATE_KIND='UNDATED', TIMELINE_DATE_REASON='MISSING_PROCEDURE_DATE')
-        rows = self.timing_rows()
-        # slide-2 (WSI-P1) and slide-6 (WSI+P3) cannot serve tiles; make them undated too
-        rows[1] = self.with_timing_cells(rows[1], **undated)
-        rows[5] = self.with_timing_cells(rows[5], **undated)
-        meta = self.write_timed(rows)
-        self.convert(meta=meta)
-        self.assertEqual(
-            [['WSI-P1', '3', '0', '2', '2'],
-             ['WSI-P2', '1', '1', '0', '0'],
-             ['WSI+P3', 'NA', 'NA', 'NA', 'NA']],
-            data_rows(self.out / 'data_clinical_patient_wsi_counts.txt')[1:])
-        by_sample, by_patient = converter.count_slides(
-            converter.parse_slides(converter.iter_rows(meta.parent / 'data_wsi_timing.txt')))
-        self.assertEqual({'WSI-P1': [3, 0, 2, 2], 'WSI-P2': [1, 1, 0, 0]}, by_patient)
-        self.assertEqual({('WSI-P1', 'WSI-P1-S1'): [1, 0, 1], ('WSI-P1', 'WSI-P1-S2'): [1, 0, 1],
-                          ('WSI-P2', 'WSI-P2-S1'): [1, 1, 0]}, by_sample)
-        # a viewable slide that becomes undated is counted
-        rows[4] = self.with_timing_cells(rows[4], **undated)
-        shutil.rmtree(self.out)
-        self.convert(meta=self.write_timed(rows))
-        patients = {row[0]: row[1:] for row in data_rows(
-            self.out / 'data_clinical_patient_wsi_counts.txt')[1:]}
-        self.assertEqual(['1', '1', '0', '1'], patients['WSI-P2'])
-
-    def test_merged_clinical_file_gets_the_undated_count(self):
-        study = self.copy_study()
-        self.convert(meta=TIMING_META, study_dir=study)
-        patients = data_rows(self.out / 'data_clinical_patients.txt')
-        self.assertEqual(['WSI_PATIENT_SLIDE_COUNT', 'WSI_PATIENT_PART_MATCHED_SLIDE_COUNT',
-                          'WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT',
-                          'WSI_PATIENT_UNDATED_SLIDE_COUNT'], patients[0][-4:])
-        self.assertEqual({'WSI-P1': ['3', '0', '2', '2'], 'WSI-P2': ['1', '1', '0', '0'],
-                          'WSI+P3': ['NA', 'NA', 'NA', 'NA'], 'WSI-P4': ['NA', 'NA', 'NA', 'NA']},
-                         {row[0]: row[-4:] for row in patients[1:]})
-
-    def test_existing_undated_count_conflicts(self):
-        study = self.copy_study()
-        path = study / 'data_clinical_patients.txt'
-        lines = path.read_text().splitlines()
-        lines = [line + '\t' + ('WSI_PATIENT_UNDATED_SLIDE_COUNT' if index == 4 else
-                                 ('#NUMBER' if index == 2 else ('#1' if index == 3 else
-                                  ('#x' if index < 4 else '0'))))
-                 for index, line in enumerate(lines)]
-        path.write_text('\n'.join(lines) + '\n')
-        with self.assertRaises(converter.ConversionError) as context:
-            self.convert(meta=TIMING_META, study_dir=study)
-        self.assertIn('already defines WSI_PATIENT_UNDATED_SLIDE_COUNT', str(context.exception))
+        definitions = (self.out / 'data_resource_definition.txt').read_text(encoding='utf-8')
+        self.assertEqual((reference / 'data_resource_definition.txt').read_text(encoding='utf-8'),
+                         definitions.replace(converter.CUSTOM_METADATA_WITH_TIMING,
+                                             converter.CUSTOM_METADATA))
+        for path in written:
+            if path.name.startswith('meta_'):
+                self.assertEqual(path.read_bytes(), (self.out / path.name).read_bytes(), path.name)
 
     def test_inconsistent_timing_is_rejected_without_echoing_values(self):
         cases = (
@@ -724,11 +396,11 @@ class TimingTestCase(ConverterTestCase):
             (0, dict(TIMELINE_DATE_REASON='late 2021-03-14'), 'AVAILABLE timing is inconsistent'),
             (0, dict(TIMELINE_DATE_KIND='UNDATED'), 'AVAILABLE timing is inconsistent'),
             (0, dict(TIMELINE_START_DAYS='2021-03-14'), 'invalid TIMELINE_START_DAYS'),
-            (0, dict(TIMELINE_DATE_STATUS='DATE 2021-03-14'), 'invalid TIMELINE_DATE_STATUS'),
-            (0, dict(TIMELINE_DATE_KIND='DATE 2021-03-14'), 'invalid TIMELINE_DATE_KIND'),
+            (0, dict(TIMELINE_DATE_STATUS='DATE 2021-03-14'), 'TIMELINE_DATE_STATUS must be'),
+            (0, dict(TIMELINE_DATE_KIND='DATE 2021-03-14'), 'TIMELINE_DATE_KIND must be'),
             (0, dict(TIMELINE_DATE_SOURCE=''), 'TIMELINE_DATE_SOURCE is required'),
             (0, dict(TIMELINE_COORDINATE_SYSTEM='DATE 2021-03-14'),
-             'unsupported TIMELINE_COORDINATE_SYSTEM'),
+             'TIMELINE_COORDINATE_SYSTEM must be'),
             (2, dict(TIMELINE_START_DAYS='4'), 'non-AVAILABLE timing cannot have TIMELINE_START_DAYS'),
             (2, dict(TIMELINE_DATE_KIND='RECORDED'), 'missing procedure date must be UNDATED'),
             (3, dict(TIMELINE_DATE_KIND='UNDATED'), 'missing reference date cannot be UNDATED'),
@@ -742,6 +414,18 @@ class TimingTestCase(ConverterTestCase):
             self.assertIn('line %d: %s' % (index + 6, message), text)
             self.assertNotIn('2021', text)
             self.assertFalse(self.out.exists())
+
+    def test_timing_problems_lists_every_broken_rule(self):
+        coordinates = converter.TIMELINE_COORDINATE_SYSTEM
+        self.assertEqual([], converter.timing_problems(
+            0, 'AVAILABLE', 'RECORDED', 'source', '', coordinates))
+        self.assertEqual([], converter.timing_problems(
+            None, 'MISSING_PROCEDURE_DATE', 'UNDATED', 'source', 'reason', coordinates))
+        self.assertEqual(
+            ['TIMELINE_DATE_KIND', 'TIMELINE_DATE_SOURCE', 'TIMELINE_COORDINATE_SYSTEM',
+             'TIMELINE_START_DAYS', 'TIMELINE_DATE_KIND'],
+            [field for field, _ in converter.timing_problems(
+                4, 'MISSING_PROCEDURE_DATE', 'BOGUS', '', '', 'other')])
 
     def test_derive_timepoint_source(self):
         derive = converter.derive_timepoint_source
@@ -778,9 +462,6 @@ class V4OnlyTestCase(ConverterTestCase):
                          converter.COLUMNS_WITH_TIMING[28:35])
         self.assertEqual(list(converter.TIMING_COLUMNS), converter.COLUMNS_WITH_TIMING[28:35])
         self.assertEqual(['SLIDE_KEY', 'SEALED_SOURCE'], converter.COLUMNS_WITH_TIMING[-2:])
-        for name in ('V2_COLUMNS', 'FORMAT_COLUMNS', 'TIMELINE_REQUIRED_COLUMNS',
-                     'find_pathology_timeline', 'read_timeline_index', '_parse_image_ids'):
-            self.assertFalse(hasattr(converter, name), name)
 
     def test_older_format_versions_are_rejected(self):
         for version in ('2', '3'):
@@ -814,11 +495,6 @@ class V4OnlyTestCase(ConverterTestCase):
         rows = ['\t'.join(row.split('\t')[:-2] + timing) for row in source[5:]]
         header = '\t'.join(source[4].split('\t')[:-2] + list(converter.TIMING_COLUMNS))
         self.assertConversionError('invalid header', self.write_legacy(rows, header))
-
-    def test_timeline_options_are_gone(self):
-        with patch('sys.stderr'), self.assertRaises(SystemExit):
-            converter.interface(['--meta-wsi', 'm', '--output-dir', 'o', '--portal-base-url', BASE_URL,
-                                 '--timeline-file', 't'])
 
     def test_failure_late_in_the_file_leaves_no_output(self):
         rows = self.fixture_rows()
@@ -948,35 +624,14 @@ class SlideKeyAndDeidTestCase(ConverterTestCase):
 
     def test_tab_in_output_is_not_echoed(self):
         with self.assertRaises(converter.ConversionError) as context:
-            converter.write_tsv(Path(self.tmp.name) / 'x.txt', [['SECRET\t1']])
+            converter.render_tsv('x.txt', [['SECRET\t1']])
         self.assertNotIn('SECRET', str(context.exception))
-
-    def test_each_slide_key_counts_once(self):
-        rows = self.fixture_rows()
-        # another viewable, block-matched slide on the first row's sample: a new slide key adds
-        # one to its counts (only viewable slides are counted)
-        extra = rows[0].split('\t')
-        extra[SLIDE_KEY] = 'e' * 32
-        self.convert(meta=self.write_legacy(rows + ['\t'.join(extra)]))
-        samples = {tuple(row[:2]): row[2:] for row in data_rows(
-            self.out / 'data_clinical_sample_wsi_counts.txt')[1:]}
-        self.assertEqual(['2', '0', '2'], samples[('WSI-P1', 'WSI-P1-S1')])
-        patients = {row[0]: row[1:] for row in data_rows(
-            self.out / 'data_clinical_patient_wsi_counts.txt')[1:]}
-        self.assertEqual(['4', '0', '3'], patients['WSI-P1'])
-        # the same slide key again is one slide listed twice, which is rejected
-        shutil.rmtree(self.out)
-        message = self.conversion_error(self.write_legacy(rows + rows[:1]))
-        self.assertIn('line 12: SLIDE_KEY is not unique', message)
-
 
 PUBLIC_KEYS = {
     'slide_key', 'reference_sample_id', 'part_key', 'part_number', 'part_type',
     'part_description', 'subspecialty', 'block_key', 'block_number', 'block_label', 'match_level',
     'specimen_key', 'stain_name', 'stain_group', 'magnification', 'slide_type', 'is_hne', 'is_ihc',
-    'can_serve_tiles', 'file_size_bytes', 'timeline_start_days', 'timeline_date_status',
-    'timeline_date_kind', 'timeline_date_source', 'timeline_date_reason',
-    'timeline_coordinate_system', 'timepoint_source',
+    'can_serve_tiles', 'file_size_bytes',
 }
 
 
@@ -997,7 +652,8 @@ class ConvertedFilesValidationTestCase(ConverterTestCase):
         self.logger.addHandler(self.buffer)
         self.saved = {name: getattr(validateData, name) for name in (
             'DEFINED_SAMPLE_IDS', 'PATIENTS_WITH_SAMPLES', 'SAMPLE_TO_PATIENT',
-            'RESOURCE_DEFINITION_DICTIONARY', 'WSI_RESOURCE_STATE', 'DEFINED_SAMPLE_ATTRIBUTES')}
+            'RESOURCE_DEFINITION_DICTIONARY', 'RESOURCE_CONTRACT_KEYS', 'WSI_RESOURCE_STATE',
+            'DEFINED_SAMPLE_ATTRIBUTES')}
         validateData.DEFINED_SAMPLE_IDS = set(SAMPLE_TO_PATIENT)
         validateData.PATIENTS_WITH_SAMPLES = set(SAMPLE_TO_PATIENT.values())
         validateData.SAMPLE_TO_PATIENT = dict(SAMPLE_TO_PATIENT)
@@ -1024,56 +680,34 @@ class ConvertedFilesValidationTestCase(ConverterTestCase):
                                                  'data_resource_definition.txt')
         self.assertEqual([], [r.getMessage() for r in problems])
         validateData.RESOURCE_DEFINITION_DICTIONARY = validator.resource_definition_dictionary
+        # the contract applies: no undeclared keys (wsi_serving is private) and no unused ones
+        validateData.RESOURCE_CONTRACT_KEYS = validator.resource_contract_keys
+        self.assertEqual({'WSI_SAMPLE', 'WSI_PATIENT'}, set(validator.resource_contract_keys))
         _, problems = self.run_validator(validateData.SampleResourceValidator, 'data_resource_sample.txt')
         self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
         _, problems = self.run_validator(validateData.PatientResourceValidator, 'data_resource_patient.txt')
-        self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
+        # the fixture's unmatched slides leave these optional cells blank, which the contract
+        # check reports as a warning, as it would for any resource
+        self.assertEqual([(logging.WARNING, 'file_size_bytes, part_description, subspecialty')],
+                         [(r.levelno, getattr(r, 'cause', None)) for r in problems])
 
     def test_timed_output_passes_validation(self):
-        self.convert(meta=FIXTURE_DIR / 'meta_wsi_timing.txt')
+        self.convert(meta=TIMING_META)
         validator, problems = self.run_validator(validateData.ResourceDefinitionValidator,
                                                  'data_resource_definition.txt')
         self.assertEqual([], [r.getMessage() for r in problems])
         validateData.RESOURCE_DEFINITION_DICTIONARY = validator.resource_definition_dictionary
-        _, problems = self.run_validator(validateData.SampleResourceValidator, 'data_resource_sample.txt')
-        self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
-        _, problems = self.run_validator(validateData.PatientResourceValidator, 'data_resource_patient.txt')
-        self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
-        _, problems = self.run_validator(validateData.PatientClinicalValidator,
-                                         'data_clinical_patient_wsi_counts.txt')
+        # the timing keys are declared, so the contract check finds none of them undeclared
+        validateData.RESOURCE_CONTRACT_KEYS = validator.resource_contract_keys
+        problems = []
+        for validator_class, name in ((validateData.SampleResourceValidator, 'data_resource_sample.txt'),
+                                      (validateData.PatientResourceValidator,
+                                       'data_resource_patient.txt')):
+            problems += self.run_validator(validator_class, name)[1]
         self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems
-                              if 'analysis feature will not be available' not in r.getMessage()])
-        # the legacy file itself passes the WSI validator
-        shutil.copy(FIXTURE_DIR / 'data_wsi_timing.txt', self.out / 'data_wsi_timing.txt')
-        _, problems = self.run_validator(validateData.WsiValidator, 'data_wsi_timing.txt')
-        self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
+                              if r.levelno >= logging.ERROR])
 
-    def test_count_files_pass_clinical_validation(self):
-        self.convert()
-        validator, problems = self.run_validator(validateData.SampleClinicalValidator,
-                                                 'data_clinical_sample_wsi_counts.txt')
-        self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems])
-        self.assertEqual({'WSI-P1-S1', 'WSI-P1-S2', 'WSI-P2-S1'}, set(validator.sampleIds))
-        _, problems = self.run_validator(validateData.PatientClinicalValidator,
-                                         'data_clinical_patient_wsi_counts.txt')
-        # the patient-level count file is validated against the patients of all samples;
-        # the only warnings are the generic ones for a patient file without survival columns
-        self.assertEqual([], [(r.getMessage(), getattr(r, 'cause', None)) for r in problems
-                              if 'analysis feature will not be available' not in r.getMessage()])
-
-    def test_duplicate_slide_key_across_resource_files_fails(self):
-        self.convert()
-        sample_file = self.out / 'data_resource_sample.txt'
-        patient_file = self.out / 'data_resource_patient.txt'
-        # give an unmatched slide the slide key of a matched one
-        patient_file.write_text(patient_file.read_text().replace(
-            'c66ee336f70e8b59e48bd7afbf0e606d', '2c96f13783250ad2c6bcfcd5b7c3ef22'))
-        validateData.RESOURCE_DEFINITION_DICTIONARY = {'WSI_SAMPLE': ['SAMPLE'], 'WSI_PATIENT': ['PATIENT']}
-        self.run_validator(validateData.SampleResourceValidator, sample_file.name)
-        _, problems = self.run_validator(validateData.PatientResourceValidator, patient_file.name)
-        self.assertIn('SLIDE_KEY must be unique within a study', [r.getMessage() for r in problems])
-
-    def test_merged_study_passes_and_meta_wsi_is_rejected(self):
+    def test_converted_study_passes_and_meta_wsi_is_rejected(self):
         study = self.copy_study()
         self.convert(study_dir=study)
         full = Path(self.tmp.name) / 'full'

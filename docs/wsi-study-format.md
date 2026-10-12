@@ -44,13 +44,14 @@ resource file pairs:
 
 - `WSI_SAMPLE` (resource type `SAMPLE`): slides matched to a sample
   (`match_level` `PART` or `BLOCK`), one row per slide in the sample resource
-  file with columns `PATIENT_ID SAMPLE_ID RESOURCE_ID URL DISPLAY_NAME TYPE METADATA`.
+  file with columns `PATIENT_ID SAMPLE_ID RESOURCE_ID URL DISPLAY_NAME METADATA`.
 - `WSI_PATIENT` (resource type `PATIENT`): unmatched slides, one row per slide
   in the patient resource file with columns
-  `PATIENT_ID RESOURCE_ID URL DISPLAY_NAME TYPE METADATA`.
+  `PATIENT_ID RESOURCE_ID URL DISPLAY_NAME METADATA`.
 
-Both use `TYPE=WHOLE_SLIDE_IMAGE`, and the `WSI_SAMPLE`/`WSI_PATIENT` IDs are
-reserved for that type. Files are raw tab-separated text: values are not
+The `WSI_SAMPLE`/`WSI_PATIENT` IDs are reserved for slides: a row is a slide
+row because of its `RESOURCE_ID`. Resource files have no `TYPE` column (it is
+retired; `validateData.py` warns and ignores one). Files are raw tab-separated text: values are not
 quoted, and no value may contain a tab or line break. `METADATA` is one compact
 JSON object per row whose keys are the lower-cased format-v4 column names.
 These public keys may be returned to the browser:
@@ -101,21 +102,20 @@ at most 4096 characters that decode to at least 29 bytes. It is required when
 `can_serve_tiles` is true and must be absent or empty otherwise. Error
 messages never echo it.
 
-For every `WHOLE_SLIDE_IMAGE` row, `validateData.py` applies the same checks
-as the legacy WSI validator described under [Legacy format](#legacy-format-v4):
+For every `WSI_SAMPLE`/`WSI_PATIENT` row, `validateData.py` applies the row contract
+of [format v4](#legacy-format-v4), shared with the converter:
 required hierarchy keys, typed values, consistent timing when a row has any
 timing key, `match_level`
 agreement with the file type (sample rows are matched, patient rows are
 unmatched), `slide_type` being `H&E`, `IHC`, `Other`, or `Unknown` with
 consistent stain flags (never both `is_hne` and `is_ihc`; `H&E` requires
-`is_hne`, `IHC` requires `is_ihc`, `Other`/`Unknown` allow neither), as the
-native `wsi_slide` table constraints required, `slide_key` (32 lowercase hex
+`is_hne`, `IHC` requires `is_ihc`, `Other`/`Unknown` allow neither), `slide_key` (32 lowercase hex
 characters) unique across both files of the study, consistent part and block
 metadata, the sample and reference sample belonging to the row's patient, and
 the `wsi_serving` shape and sealed-source rules. The row's `RESOURCE_ID` must be `WSI_SAMPLE` in sample files and
 `WSI_PATIENT` in patient files.
 
-Error messages for `WHOLE_SLIDE_IMAGE` rows never echo values; only the
+Error messages for WSI rows never echo values; only the
 column or JSON path is reported. Core does not scan free text (`DISPLAY_NAME`,
 part and block descriptions, stain names, tile metadata and similar) for
 protected health information or institution-specific identifiers such as
@@ -160,13 +160,13 @@ python scripts/importer/convertWsiToResources.py \
   optionally with a context path; a trailing slash is ignored. It builds the
   viewer links shown above.
 - `--study-dir` (optional, recommended): the study the output will join. The
-  converter merges the slide counts into copies of the study's clinical files
-  (see [Slide counts](#slide-counts)). It must differ from `--output-dir`.
+  converter fails without writing anything if the study already has a
+  resource definition, sample resource, or patient resource file. It must
+  differ from `--output-dir`.
 
-Rows are parsed like the retired native importer: leading `#` rows are
-skipped, the header must match format v4 exactly, `MATCH_LEVEL` must agree
-with `SAMPLE_ID`, `SLIDE_TYPE` and the stain flags must satisfy the native
-`wsi_slide` constraints above, an `UNMATCHED` reference sample is dropped, and
+Leading `#` rows are skipped, the header must match format v4 exactly,
+`MATCH_LEVEL` must agree with `SAMPLE_ID`, `SLIDE_TYPE` and the stain flags
+must satisfy the rules above, an `UNMATCHED` reference sample is dropped, and
 serving fields are dropped when `CAN_SERVE_TILES=FALSE`. `SLIDE_KEY` is required, must be 32
 lowercase hex characters and unique. `SEALED_SOURCE` must have the
 [sealed-source shape](#sealed-source), is required when `CAN_SERVE_TILES=TRUE`
@@ -181,8 +181,8 @@ in a hidden `.<output dir name>.*.partial` directory next to `--output-dir`
 and only moved into it when the whole conversion succeeds, so a failed run
 writes nothing there.
 
-The converter always writes the resource files; each pair is only written
-when it has rows:
+The converter writes only resource files; each pair is only written when it
+has rows:
 
 | Files | Content |
 | --- | --- |
@@ -195,74 +195,9 @@ The `CUSTOM_METADATA` contract declares the per-slide identifier keys
 `reference_sample_id`) as `"filterable": false`. Nearly every slide has its own
 value for these keys, so without the declaration the portal's resource table
 would list every value as a filter option. The columns stay visible, searchable
-and sortable.
-
-With `--study-dir`, it also writes merged copies of the study's clinical sample
-and patient files, under the study's own meta and data file names (for example
-`meta_clinical_samples.txt`/`data_clinical_samples.txt`). The files are found
-through their meta files (`datatype: SAMPLE_ATTRIBUTES` or
-`PATIENT_ATTRIBUTES`); the meta files are copied unchanged. Copy the output
-directory over the study to use them.
-
-Without `--study-dir`, it writes the counts as standalone pairs instead:
-
-| Files | Content |
-| --- | --- |
-| `meta_clinical_sample_wsi_counts.txt`, `data_clinical_sample_wsi_counts.txt` | sample viewable-slide counts (only when a slide is matched) |
-| `meta_clinical_patient_wsi_counts.txt`, `data_clinical_patient_wsi_counts.txt` | patient viewable-slide counts |
-
-A study may contain only one clinical sample file and one clinical patient
-file, so the standalone pairs are only for studies without clinical files of
-their own, or as input for merging by hand.
-
-With `--study-dir`, the converter fails without writing anything if:
-
-- a clinical file in the study already has any of the six `WSI_*` count
-  columns or `WSI_PATIENT_UNDATED_SLIDE_COUNT`;
-- a sample or patient with slides is missing from the clinical sample or
-  patient file, or a sample belongs to a different patient there;
-- the study has more than one clinical sample or clinical patient meta file;
-- the study has no clinical patient file (every slide's patient must be listed),
-  or no clinical sample file while some slide is matched to a sample;
-- a clinical file to merge lacks the four `#` attribute header rows;
-- the study already has a resource definition, sample resource, or patient
-  resource file.
-
-### Slide counts
-
-The count files carry the attributes the native importer used to write, as
-`NUMBER` attributes with priority 1:
-
-| Attribute | Display name |
-| --- | --- |
-| `WSI_SAMPLE_SLIDE_COUNT` | WSI Viewable Slides per Sample |
-| `WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT` | WSI Viewable Slides per Sample, Part-matched |
-| `WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT` | WSI Viewable Slides per Sample, Block-matched |
-| `WSI_PATIENT_SLIDE_COUNT` | WSI Viewable Slides per Patient |
-| `WSI_PATIENT_PART_MATCHED_SLIDE_COUNT` | WSI Viewable Slides per Patient, Part-matched |
-| `WSI_PATIENT_BLOCK_MATCHED_SLIDE_COUNT` | WSI Viewable Slides per Patient, Block-matched |
-| `WSI_PATIENT_UNDATED_SLIDE_COUNT` | WSI Undated Viewable Slides per Patient (only with [slide timing](#slide-timing)) |
-
-Only viewable slides, those with `CAN_SERVE_TILES=TRUE` that the slide viewer
-can open, are counted, and each slide (`SLIDE_KEY`, unique within the study)
-counts once. Sample counts cover matched slides only, so only samples with a
-viewable matched slide get values. Patient counts include unmatched slides, so
-every patient with a viewable slide gets values. A sample or patient whose
-slides are all non-viewable gets no values. Part and block counts follow
-`MATCH_LEVEL`, and zero is written for an entity that has values. In a merged
-clinical file, the rows of samples or patients without a viewable slide get
-`NA`. When the legacy file has the [timing columns](#slide-timing), the
-patient counts also get `WSI_PATIENT_UNDATED_SLIDE_COUNT`: the patient's
-viewable slides without a `timeline_start_days`, which the timeline does not
-show. Non-viewable slides are not counted there either. Without the timing
-columns the attribute is not written at all. The standalone count files list every sample or patient with a slide,
-giving `NA` to those without a viewable slide, so the entities their resource
-rows refer to stay defined; `NA` is imported as no value. The merge appends
-the count columns and their four header rows (display name, description,
-`NUMBER`, priority `1`); every existing line, value and line ending is kept,
-including comment and blank lines. Study View uses the patient-level values so
-pagination cannot produce partial totals. Because the counts are ordinary
-clinical data, re-importing corrected files replaces them.
+and sortable. When the legacy file has the [timing columns](#slide-timing), the
+contract also declares the seven timing keys, neither filterable nor visible by
+default; without them it does not declare them.
 
 ### Timeline
 
@@ -340,10 +275,10 @@ between `THUMBNAIL_CONTENT_TYPE` and `SLIDE_KEY`, or none.
 TIMELINE_START_DAYS  TIMELINE_DATE_STATUS  TIMELINE_DATE_KIND  TIMELINE_DATE_SOURCE  TIMELINE_DATE_REASON  TIMELINE_COORDINATE_SYSTEM  TIMEPOINT_SOURCE
 ```
 
-A file without them converts and validates as described above, and its
-slides carry no timing in `METADATA`. A file with them carries the
-de-identified relative timing contract on every row, which places slides on
-the patient Summary timeline:
+A file without them converts as described above, and its slides carry no
+timing in `METADATA`. A file with them carries the de-identified relative
+timing contract on every row, which places slides on the patient Summary
+timeline:
 
 - `TIMELINE_START_DAYS` is an integer number of days relative to the
   patient's first tumor-sequencing sample; day zero is valid. It is blank for
@@ -368,18 +303,17 @@ the patient Summary timeline:
 The converter writes these to `METADATA` as `timeline_start_days` (a JSON
 integer, omitted for undated slides), `timeline_date_status`,
 `timeline_date_kind`, `timeline_date_source`, `timeline_date_reason` (only
-when set), `timeline_coordinate_system` and `timepoint_source`, and adds
-`WSI_PATIENT_UNDATED_SLIDE_COUNT` to the patient counts (see
-[Slide counts](#slide-counts)). Missing procedure dates remain in the WSI
-hierarchy and are represented by the undated section next to the timeline;
-they are not converted into dated clinical events. `validateData.py` applies the same
-rules to the legacy file and, for `WHOLE_SLIDE_IMAGE` resource rows that have
-any timing key, to the metadata, where it also checks that
-`timeline_start_days` is a JSON integer and the other timing keys are strings.
-Errors name the column or key, never its value. The timing free text
-(`TIMELINE_DATE_SOURCE`, `TIMELINE_DATE_REASON`, `TIMEPOINT_SOURCE`) is
-returned to the browser; de-identifying it is the data provider's
-responsibility.
+when set), `timeline_coordinate_system` and `timepoint_source`, and declares
+them in the definitions' `CUSTOM_METADATA`. Missing procedure dates remain in
+the WSI hierarchy as undated slides; they are not converted into dated
+clinical events. The rules live in one place, the converter's WSI contract:
+`validateData.py` applies them to `WSI_SAMPLE`/`WSI_PATIENT` resource rows
+that have any timing key, where it also checks that `timeline_start_days` is a
+JSON integer, the other timing keys are strings, and `timepoint_source` is
+set (the portal rejects timed slides without one). Errors name the column or
+key, never its value. The timing free text (`TIMELINE_DATE_SOURCE`,
+`TIMELINE_DATE_REASON`, `TIMEPOINT_SOURCE`) is returned to the browser;
+de-identifying it is the data provider's responsibility.
 
 The converter and validator assume these values were already materialized by
 the upstream artifact-generation/export pipeline. They do not discover source

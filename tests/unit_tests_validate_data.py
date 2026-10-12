@@ -2988,6 +2988,78 @@ class ResourceWiseTestCase(PostClinicalDataFileTestCase):
         self.assertEqual(set(), {2, 3, 4} & set(by_line))
         validateData.RESOURCE_DEFINITION_DICTIONARY = {}
 
+
+    def test_a_retired_column_is_reported_rather_than_ignored(self):
+        """TYPE is no longer stored; a file still carrying it must hear about it."""
+        validateData.RESOURCE_DEFINITION_DICTIONARY = {'PATHOLOGY_SLIDE': ['SAMPLE']}
+        self.logger.setLevel(logging.WARNING)
+
+        record_list = self.validate('data_resource_sample_retired_type.txt',
+                                    validateData.SampleResourceValidator)
+
+        retired = [r for r in record_list if 'no longer read by the portal' in r.getMessage()]
+        self.assertEqual(1, len(retired))
+        self.assertEqual('TYPE', retired[0].cause)
+        validateData.RESOURCE_DEFINITION_DICTIONARY = {}
+
+    def test_metadata_keys_must_be_declared_when_a_contract_exists(self):
+        """A key the contract omits would be imported and never shown, so it is an error."""
+        validateData.RESOURCE_DEFINITION_DICTIONARY = {'PATHOLOGY_SLIDE': ['SAMPLE']}
+        validateData.RESOURCE_CONTRACT_KEYS = {'PATHOLOGY_SLIDE': {'stain'}}
+        self.logger.setLevel(logging.ERROR)
+        record_list = self.validate('data_resource_sample_undeclared_keys.txt',
+                            validateData.ResourceValidator)
+
+        self.assertEqual(1, len(record_list))
+        record = record_list.pop()
+        self.assertEqual(logging.ERROR, record.levelno)
+        self.assertIn('does not declare in CUSTOM_METADATA', record.getMessage())
+        # One message for the file, naming every undeclared key -- not one per row.
+        self.assertEqual('magnification, slide_id', record.cause)
+        validateData.RESOURCE_CONTRACT_KEYS = {}
+        validateData.RESOURCE_DEFINITION_DICTIONARY = {}
+
+    def test_metadata_keys_are_not_checked_without_a_contract(self):
+        """No contract means the portal still builds columns from the data, so nothing is lost."""
+        validateData.RESOURCE_DEFINITION_DICTIONARY = {'PATHOLOGY_SLIDE': ['SAMPLE']}
+        validateData.RESOURCE_CONTRACT_KEYS = {}
+        self.logger.setLevel(logging.ERROR)
+
+        self.assertEqual([], self.validate('data_resource_sample_undeclared_keys.txt',
+                                           validateData.ResourceValidator))
+        validateData.RESOURCE_DEFINITION_DICTIONARY = {}
+
+    def test_an_unreadable_contract_declares_nothing_rather_than_declaring_no_keys(self):
+        """A contract the portal cannot read is reported on its own and leaves the data alone.
+
+        The portal falls back to deriving columns from the data, so the file's keys are not
+        undeclared -- telling a curator to remove them points at the wrong file.
+        """
+        self.assertIsNone(
+            validateData.ResourceDefinitionValidator.declaredKeys({'version': 1, 'field': []}))
+        self.assertIsNone(
+            validateData.ResourceDefinitionValidator.declaredKeys({'fields': {'key': 'stain'}}))
+        self.assertIsNone(validateData.ResourceDefinitionValidator.declaredKeys([]))
+        self.assertEqual(
+            {'stain'},
+            validateData.ResourceDefinitionValidator.declaredKeys(
+                {'version': 1, 'fields': [{'key': 'stain'}]}))
+
+    def test_declared_key_that_no_row_carries_is_a_warning(self):
+        validateData.RESOURCE_DEFINITION_DICTIONARY = {'PATHOLOGY_SLIDE': ['SAMPLE']}
+        validateData.RESOURCE_CONTRACT_KEYS = {
+            'PATHOLOGY_SLIDE': {'stain', 'magnification', 'slide_id', 'scanner'}}
+        self.logger.setLevel(logging.WARNING)
+        record_list = self.validate('data_resource_sample_undeclared_keys.txt',
+                            validateData.ResourceValidator)
+
+        warnings = [r for r in record_list if r.levelno == logging.WARNING]
+        self.assertEqual(1, len(warnings))
+        self.assertIn('no row carries', warnings[0].getMessage())
+        self.assertEqual('scanner', warnings[0].cause)
+        validateData.RESOURCE_CONTRACT_KEYS = {}
+        validateData.RESOURCE_DEFINITION_DICTIONARY = {}
+
     # sample resources tests
     def test_sample_resource_should_have_definition(self):
         # reset RESOURCE_DEFINITION_DICTIONARY
@@ -3322,68 +3394,20 @@ WSI_SEALED_SOURCE_VECTOR = (
     'D0K0bRRgSptRb9wDiqMLtftFQ6VpBGfGILaddEV_s-Zsmpp28fG5Z3XTNWnyoBRa9qfr9t209wS7V-LhGl8i')
 
 
-class WsiValidatorTestCase(PostClinicalDataFileTestCase):
+class WsiRowChecksTestCase(unittest.TestCase):
 
-    def test_valid_unmatched_slide(self):
-        self.logger.setLevel(logging.ERROR)
-        record_list = self.validate('data_wsi_valid.txt', validateData.WsiValidator)
-        self.assertEqual([], [record for record in record_list if record.levelno >= logging.ERROR])
-
-    def test_malformed_tile_metadata_is_rejected(self):
-        valid_data = Path('test_data/data_wsi_valid.txt').read_text()
-        malformed_data = valid_data.replace(
-            '"dimensions":{"width":256,"height":256}',
-            '"dimensions":{"width":"bad","height":256}',
-        )
-        with temp_inputfolder({'data_wsi_invalid.txt': malformed_data}) as study_dir:
-            validator = validateData.WsiValidator(
-                study_dir,
-                {'data_filename': 'data_wsi_invalid.txt'},
-                PORTAL_INSTANCE,
-                self.logger,
-                False,
-                False,
-            )
-            validator.validate()
-
-        errors = [
-            record
-            for record in self.get_log_records()
-            if record.levelno >= logging.ERROR
-        ]
-        self.assertTrue(
-            any('valid tile metadata' in record.getMessage() for record in errors),
-            errors,
-        )
-
-    def test_reference_sample_must_agree_per_patient(self):
-        lines = Path('test_data/data_wsi_valid.txt').read_text().splitlines()
-        values = lines[5].split('\t')
-        slide_key = validateData.WsiValidator.EXPECTED_HEADERS.index('SLIDE_KEY')
-        values[slide_key] = '2' * 32
-        values[1] = 'UNMATCHED'  # the same as blank: no reference sample
-        unmatched = '\t'.join(values)
-        values[slide_key] = '3' * 32
-        values[1] = 'TEST-SAMPLE-REF'
-        conflicting = '\t'.join(values)
-        with temp_inputfolder({'data_wsi.txt': '\n'.join(lines + [unmatched, conflicting]) + '\n'}) as study_dir:
-            validateData.WsiValidator(study_dir, {'data_filename': 'data_wsi.txt'}, PORTAL_INSTANCE,
-                                      self.logger, False, False).validate()
-        conflicts = [record for record in self.get_log_records()
-                     if record.getMessage().startswith('All WSI rows of a patient')]
-        self.assertEqual([(8, 'patient TEST-PAT1: <none> (data_wsi.txt line 6) vs TEST-SAMPLE-REF')],
-                         [(record.line_number, record.cause) for record in conflicts])
+    """Field-level helpers of the WSI row contract."""
 
     def test_tile_metadata_requires_browser_contract(self):
-        self.assertFalse(validateData.WsiValidator._is_valid_tile_metadata({}))
-        self.assertFalse(validateData.WsiValidator._is_valid_tile_metadata({
+        self.assertFalse(validateData.WsiRowChecks._is_valid_tile_metadata({}))
+        self.assertFalse(validateData.WsiRowChecks._is_valid_tile_metadata({
             'dimensions': {'width': 256, 'height': 256},
             'levels': 1,
             'level_dimensions': [],
             'max_zoom': 0,
             'tile_size': 256,
         }))
-        self.assertTrue(validateData.WsiValidator._is_valid_tile_metadata({
+        self.assertTrue(validateData.WsiRowChecks._is_valid_tile_metadata({
             'dimensions': {'width': 256, 'height': 256},
             'levels': 1,
             'level_dimensions': [{'width': 256, 'height': 256}],
@@ -3404,227 +3428,37 @@ class WsiValidatorTestCase(PostClinicalDataFileTestCase):
             'max_decode_pixels': 16777216,
             'thumbnail_max_decode_pixels': 16777216,
         }
-        self.assertTrue(validateData.WsiValidator._is_valid_tile_metadata(current))
+        self.assertTrue(validateData.WsiRowChecks._is_valid_tile_metadata(current))
         self.assertFalse(
-            validateData.WsiValidator._is_valid_tile_metadata(
+            validateData.WsiRowChecks._is_valid_tile_metadata(
                 {**current, 'level_downsamples': [float('inf')]}
             )
         )
         self.assertFalse(
-            validateData.WsiValidator._is_valid_tile_metadata(
+            validateData.WsiRowChecks._is_valid_tile_metadata(
                 {**current, 'level_downsamples': [float('nan')]}
             )
         )
-        self.assertFalse(validateData.WsiValidator._is_valid_tile_metadata({**current, 'tile_metadata_schema_version': 99}))
-        self.assertFalse(validateData.WsiValidator._is_valid_tile_metadata({**current, 'safe_min_level': 1}))
-        self.assertFalse(validateData.WsiValidator._is_valid_tile_metadata({**current, 'decode_policy_version': 'old'}))
-        self.assertFalse(validateData.WsiValidator._is_valid_tile_metadata({**current, 'tile_metadata_schema_version': None}))
-        self.assertFalse(validateData.WsiValidator._is_valid_tile_metadata({**current, 'max_decode_pixels': '16777216'}))
-        self.assertFalse(validateData.WsiValidator._is_valid_tile_metadata({**current, 'max_decode_pixels': 16777216.0}))
+        self.assertFalse(validateData.WsiRowChecks._is_valid_tile_metadata({**current, 'tile_metadata_schema_version': 99}))
+        self.assertFalse(validateData.WsiRowChecks._is_valid_tile_metadata({**current, 'safe_min_level': 1}))
+        self.assertFalse(validateData.WsiRowChecks._is_valid_tile_metadata({**current, 'decode_policy_version': 'old'}))
+        self.assertFalse(validateData.WsiRowChecks._is_valid_tile_metadata({**current, 'tile_metadata_schema_version': None}))
+        self.assertFalse(validateData.WsiRowChecks._is_valid_tile_metadata({**current, 'max_decode_pixels': '16777216'}))
+        self.assertFalse(validateData.WsiRowChecks._is_valid_tile_metadata({**current, 'max_decode_pixels': 16777216.0}))
 
     def test_image_content_types(self):
-        self.assertTrue(validateData.WsiValidator._is_image_content_type('image/webp'))
-        self.assertTrue(validateData.WsiValidator._is_image_content_type('image/avif'))
-        self.assertTrue(validateData.WsiValidator._is_image_content_type('image/svg+xml'))
-        self.assertFalse(validateData.WsiValidator._is_image_content_type('text/plain'))
-        self.assertFalse(validateData.WsiValidator._is_image_content_type('image/foo=bar'))
-        self.assertFalse(validateData.WsiValidator._is_image_content_type('image/jpeg; charset=utf-8'))
-        self.assertFalse(validateData.WsiValidator._is_image_content_type('image/jpëg'))
-
-    def validate_wsi_content(self, content):
-        with TemporaryDirectory() as study_dir:
-            Path(study_dir, 'data_wsi.txt').write_text(content)
-            validator = validateData.WsiValidator(
-                study_dir,
-                {'data_filename': 'data_wsi.txt'},
-                PORTAL_INSTANCE,
-                self.logger,
-                False,
-                False,
-            )
-            validator.validate()
-        return [record for record in self.get_log_records() if record.levelno >= logging.ERROR]
-
-    def with_cell(self, name, value):
-        lines = Path('test_data/data_wsi_valid.txt').read_text().splitlines()
-        values = lines[5].split('\t')
-        values[validateData.WsiValidator.EXPECTED_HEADERS.index(name)] = value
-        lines[5] = '\t'.join(values)
-        return '\n'.join(lines) + '\n'
-
-    def test_wsi_free_text_is_not_deid_scanned(self):
-        """De-identifying free text is the data provider's responsibility."""
-        content = Path('test_data/data_wsi_valid.txt').read_text()
-        content = content.replace('"tile_size":256}',
-                                  '"tile_size":256,"vendor":"March 14, 2021 MRN: 123456"}')
-        content = content.replace('image/jpeg', 'image/webp')
-        self.assertEqual([], self.validate_wsi_content(content))
-        for name, value in (('PART_KEY', 'PART-2021-03-14'), ('BLOCK_KEY', 'BLOCK-MRN:123456'),
-                            ('PART_DESCRIPTION', 'Resected March 14, 2021')):
-            self.assertEqual([], self.validate_wsi_content(self.with_cell(name, value)), name)
-
-    def test_slide_key_is_required_lowercase_hex_and_unique(self):
-        self.assertEqual('SLIDE_KEY', validateData.WsiValidator.EXPECTED_HEADERS[-2])
-        records = self.validate_wsi_content(self.with_cell('SLIDE_KEY', ''))
-        self.assertIn(('Required WSI value is blank', 'SLIDE_KEY'),
-                      [(record.getMessage(), getattr(record, 'cause', None)) for record in records])
-        for value in ('0123456789ABCDEF0123456789ABCDEF', '0123456789abcdef'):
-            records = self.validate_wsi_content(self.with_cell('SLIDE_KEY', value))
-            self.assertEqual([('SLIDE_KEY must be 32 lowercase hex characters', 'SLIDE_KEY')],
-                             [(record.getMessage(), getattr(record, 'cause', None)) for record in records])
-        lines = Path('test_data/data_wsi_valid.txt').read_text().splitlines()
-        records = self.validate_wsi_content('\n'.join(lines + lines[5:6]) + '\n')
-        self.assertEqual([('SLIDE_KEY must be unique within a study', 'SLIDE_KEY')],
-                         [(record.getMessage(), getattr(record, 'cause', None)) for record in records])
-
-    def with_timing(self, values_by_row):
-        """data_wsi_valid.txt with the seven timing columns before SLIDE_KEY.
-
-        ``values_by_row`` gives the seven timing values of each slide row in turn
-        (the last entry repeats).
-        """
-        timing = validateData.WsiValidator.TIMING_HEADERS
-        lines = Path('test_data/data_wsi_valid.txt').read_text().splitlines()
-
-        def add(line, values):
-            fields = line.split('\t')
-            return '\t'.join(fields[:-2] + list(values) + fields[-2:])
-
-        content = [add(line, ['#' + name for name in timing]) for line in lines[:4]]
-        content.append(add(lines[4], timing))
-        content += [add(line, values_by_row[min(index, len(values_by_row) - 1)])
-                    for index, line in enumerate(lines[5:])]
-        return '\n'.join(content) + '\n'
-
-    DATED = ['0', 'AVAILABLE', 'RECORDED', 'PATHOLOGY_REPORT', '',
-             'patient_first_tumor_sequencing_day_zero', 'surgery 20210314']
-    UNDATED = ['', 'MISSING_PROCEDURE_DATE', 'UNDATED', 'NO_VERIFIED_PROCEDURE_DATE',
-               'MISSING_PROCEDURE_DATE', 'patient_first_tumor_sequencing_day_zero', '']
-
-    def timing_errors(self, *values_by_row):
-        return [(record.getMessage(), getattr(record, 'cause', None))
-                for record in self.validate_wsi_content(self.with_timing(values_by_row))]
-
-    def test_timing_columns_are_optional(self):
-        """The seven timing columns may be absent, or present before SLIDE_KEY."""
-        self.assertEqual([], self.validate_wsi_content(
-            Path('test_data/data_wsi_valid.txt').read_text()))
-        self.assertEqual([], self.timing_errors(self.DATED, self.UNDATED))
-        estimated = ['-17', 'AVAILABLE', 'ESTIMATED', 'SURGICAL_CASE_DATE', '',
-                     'patient_first_tumor_sequencing_day_zero', '']
-        no_reference = ['', 'MISSING_REFERENCE_SEQUENCING_DATE', 'ESTIMATED', 'SURGICAL_CASE_DATE',
-                        'NO_SEQUENCING_REFERENCE', 'patient_first_tumor_sequencing_day_zero',
-                        'Curated consult date']
-        self.assertEqual([], self.timing_errors(estimated, no_reference))
-        # the timing columns must keep their place before SLIDE_KEY and SEALED_SOURCE
-        timing = validateData.WsiValidator.TIMING_HEADERS
-        lines = Path('test_data/data_wsi_valid.txt').read_text().splitlines()
-        header = lines[4].split('\t') + list(timing)
-        content = lines[:4] + ['\t'.join(header)] + [line + '\t' * len(timing) for line in lines[5:]]
-        records = self.validate_wsi_content('\n'.join(content) + '\n')
-        self.assertEqual(['Invalid WSI column header or column order'],
-                         [record.getMessage() for record in records])
-
-    def test_timing_vocabularies_are_checked_without_echoing_values(self):
-        values = ['2021-03-14', 'DATE 2021-03-14', 'MRN 123', '', 'reason',
-                  'other_coordinates', 'surgery 20210314']
-        errors = self.timing_errors(values)
-        self.assertEqual(
-            [('WSI timeline offset is invalid', 'TIMELINE_START_DAYS'),
-             ('WSI timeline status must be AVAILABLE, MISSING_PROCEDURE_DATE, '
-              'MISSING_REFERENCE_SEQUENCING_DATE', 'TIMELINE_DATE_STATUS'),
-             ('WSI timeline date kind must be RECORDED, ESTIMATED, UNDATED', 'TIMELINE_DATE_KIND'),
-             ('WSI timeline date source is required', 'TIMELINE_DATE_SOURCE'),
-             ('WSI timeline coordinate system must be patient_first_tumor_sequencing_day_zero',
-              'TIMELINE_COORDINATE_SYSTEM'),
-             ('WSI non-AVAILABLE timing cannot have an offset', 'TIMELINE_START_DAYS')],
-            errors[:6])
-        for value in values:
-            if value:
-                self.assertNotIn(value, repr(errors))
-
-    def test_timing_consistency(self):
-        def changed(base, **changes):
-            values = list(base)
-            for name, value in changes.items():
-                values[validateData.WsiValidator.TIMING_HEADERS.index(name)] = value
-            return values
-
-        for values, expected in (
-                (changed(self.DATED, TIMELINE_START_DAYS=''),
-                 ('WSI AVAILABLE timing is inconsistent', 'TIMELINE_DATE_STATUS')),
-                (changed(self.DATED, TIMELINE_DATE_KIND='UNDATED'),
-                 ('WSI AVAILABLE timing is inconsistent', 'TIMELINE_DATE_STATUS')),
-                (changed(self.DATED, TIMELINE_DATE_REASON='late report'),
-                 ('WSI AVAILABLE timing is inconsistent', 'TIMELINE_DATE_STATUS')),
-                (changed(self.UNDATED, TIMELINE_START_DAYS='5'),
-                 ('WSI non-AVAILABLE timing cannot have an offset', 'TIMELINE_START_DAYS')),
-                (changed(self.UNDATED, TIMELINE_DATE_KIND='RECORDED'),
-                 ('WSI missing procedure dates must be UNDATED', 'TIMELINE_DATE_KIND')),
-                (changed(self.UNDATED, TIMELINE_DATE_STATUS='MISSING_REFERENCE_SEQUENCING_DATE'),
-                 ('WSI missing reference dates cannot be UNDATED', 'TIMELINE_DATE_KIND'))):
-            self.assertEqual([expected], self.timing_errors(values), values)
-
-    def test_format_v4_columns(self):
-        headers = validateData.WsiValidator.EXPECTED_HEADERS
-        self.assertEqual(30, len(headers))
-        self.assertEqual(['THUMBNAIL_CONTENT_TYPE', 'SLIDE_KEY', 'SEALED_SOURCE'], headers[-3:])
-        with_timing = validateData.WsiValidator.EXPECTED_HEADERS_WITH_TIMING
-        self.assertEqual(37, len(with_timing))
-        self.assertEqual(validateData.WsiValidator.TIMING_HEADERS, with_timing[28:35])
-        self.assertEqual(['SLIDE_KEY', 'SEALED_SOURCE'], with_timing[-2:])
-        for name in ('IMAGE_ID', 'SOURCE_URL', 'THUMBNAIL_URL'):
-            self.assertNotIn(name, headers)
-
-    def test_format_v3_columns_are_rejected_without_echoing_values(self):
-        lines = Path('test_data/data_wsi_valid.txt').read_text().splitlines()
-        for names in (['IMAGE_ID'], ['SOURCE_URL'], ['THUMBNAIL_URL'],
-                      ['IMAGE_ID', 'SOURCE_URL', 'THUMBNAIL_URL']):
-            content = ([line + '\t#x' * len(names) for line in lines[:4]]
-                       + ['\t'.join(lines[4].split('\t') + names)]
-                       + [line + '\tS-SECRET-1' * len(names) for line in lines[5:]])
-            records = self.validate_wsi_content('\n'.join(content) + '\n')
-            self.assertEqual([('WSI file has columns of format v3 or older; format v4 replaces them '
-                               'with SEALED_SOURCE, so re-export data_wsi.txt', ', '.join(names))],
-                             [(record.getMessage(), getattr(record, 'cause', None)) for record in records])
-            for record in records:
-                self.assertNotIn('S-SECRET', repr(record.__dict__))
-
-    def test_sealed_source_shape_is_checked_without_echoing_it(self):
-        def sealed(size):
-            return base64.urlsafe_b64encode(bytes(index % 256 for index in range(size))).decode().rstrip('=')
-        for value in (sealed(29), 'A' * 4096, WSI_SEALED_SOURCE_VECTOR):
-            self.assertEqual([], self.validate_wsi_content(self.with_cell('SEALED_SOURCE', value)))
-        message = ('WSI SEALED_SOURCE must be unpadded base64url of at least 29 bytes and at most '
-                   '4096 characters')
-        for value in (sealed(28), WSI_SEALED_SOURCE_VECTOR + '==',
-                      WSI_SEALED_SOURCE_VECTOR.replace('-', '+'), WSI_SEALED_SOURCE_VECTOR + '.x',
-                      'A' * 41, 'A' * 4097):
-            records = self.validate_wsi_content(self.with_cell('SEALED_SOURCE', value))
-            self.assertEqual([(message, 'SEALED_SOURCE')],
-                             [(record.getMessage(), getattr(record, 'cause', None)) for record in records])
-            for record in records:
-                self.assertNotIn(value[:20], repr(record.__dict__))
-
-    def test_sealed_source_is_required_iff_servable(self):
-        records = self.validate_wsi_content(self.with_cell('SEALED_SOURCE', ''))
-        self.assertEqual([('Servable WSI rows require complete pixel artifacts', 'SEALED_SOURCE')],
-                         [(record.getMessage(), getattr(record, 'cause', None)) for record in records])
-        lines = self.with_cell('CAN_SERVE_TILES', 'FALSE')
-        records = self.validate_wsi_content(lines)
-        self.assertEqual([('WSI SEALED_SOURCE must be empty when CAN_SERVE_TILES is FALSE',
-                           'SEALED_SOURCE')],
-                         [(record.getMessage(), getattr(record, 'cause', None)) for record in records])
-        values = lines.splitlines()
-        row = values[5].split('\t')
-        row[validateData.WsiValidator.EXPECTED_HEADERS.index('SEALED_SOURCE')] = ''
-        values[5] = '\t'.join(row)
-        self.assertEqual([], self.validate_wsi_content('\n'.join(values) + '\n'))
+        self.assertTrue(validateData.WsiRowChecks._is_image_content_type('image/webp'))
+        self.assertTrue(validateData.WsiRowChecks._is_image_content_type('image/avif'))
+        self.assertTrue(validateData.WsiRowChecks._is_image_content_type('image/svg+xml'))
+        self.assertFalse(validateData.WsiRowChecks._is_image_content_type('text/plain'))
+        self.assertFalse(validateData.WsiRowChecks._is_image_content_type('image/foo=bar'))
+        self.assertFalse(validateData.WsiRowChecks._is_image_content_type('image/jpeg; charset=utf-8'))
+        self.assertFalse(validateData.WsiRowChecks._is_image_content_type('image/jpëg'))
 
 
 class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
 
-    """WHOLE_SLIDE_IMAGE rows in sample/patient resource files follow the WSI contract."""
+    """WSI_SAMPLE/WSI_PATIENT rows in sample/patient resource files follow the WSI contract."""
 
     TILE_METADATA = {
         'dimensions': {'width': 256, 'height': 256}, 'levels': 1,
@@ -3676,23 +3510,24 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
         return json.dumps(value)
 
     def sample_row(self, metadata=None, patient='WSI-P1', sample='WSI-P1-S1',
-                   resource_id='WSI_SAMPLE', resource_type='WHOLE_SLIDE_IMAGE'):
+                   resource_id='WSI_SAMPLE'):
         return [patient, sample, resource_id, 'https://portal.example/wsi/patient/' + patient,
-                'slide', resource_type, metadata if metadata is not None else self.metadata()]
+                'slide', metadata if metadata is not None else self.metadata()]
 
-    def patient_row(self, metadata=None, patient='WSI-P1', resource_id='WSI_PATIENT',
-                    resource_type='WHOLE_SLIDE_IMAGE'):
+    def patient_row(self, metadata=None, patient='WSI-P1', resource_id='WSI_PATIENT'):
         if metadata is None:
             metadata = self.metadata(slide='slide-9', match_level='UNMATCHED')
         return [patient, resource_id, 'https://portal.example/wsi/patient/' + patient + '/9',
-                'slide', resource_type, metadata]
+                'slide', metadata]
 
-    def validate_resource(self, validator_class, rows, keep_state=False, with_line=False):
+    def validate_resource(self, validator_class, rows, keep_state=False, with_line=False,
+                          extra_columns=()):
         """Validate one resource file; study-wide WSI state is reset unless keep_state."""
         if not keep_state:
             validateData.reset_wsi_resource_state()
         header = (['PATIENT_ID', 'SAMPLE_ID'] if validator_class is validateData.SampleResourceValidator
-                  else ['PATIENT_ID']) + ['RESOURCE_ID', 'URL', 'DISPLAY_NAME', 'TYPE', 'METADATA']
+                  else ['PATIENT_ID']) + ['RESOURCE_ID', 'URL', 'DISPLAY_NAME', 'METADATA']
+        header += list(extra_columns)
         content = '\n'.join('\t'.join(row) for row in [header] + rows) + '\n'
         with temp_inputfolder({'data_resource.txt': content}) as study_dir:
             validator = validator_class(study_dir, {'data_filename': 'data_resource.txt'},
@@ -3710,18 +3545,24 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
 
     def test_resource_id_must_match_file_type(self):
         errors = self.validate_resource(validateData.SampleResourceValidator,
-                                        [self.sample_row(resource_id='PATHOLOGY_SLIDE')])
-        self.assertIn(('WHOLE_SLIDE_IMAGE resources in a sample resource file must use RESOURCE_ID '
-                       'WSI_SAMPLE', 'PATHOLOGY_SLIDE'), errors)
+                                        [self.sample_row(resource_id='WSI_PATIENT')])
+        self.assertIn(('WSI resources in a sample resource file must use RESOURCE_ID '
+                       'WSI_SAMPLE', 'WSI_PATIENT'), errors)
         errors = self.validate_resource(validateData.PatientResourceValidator,
-                                        [self.patient_row(resource_id='SCANS')])
-        self.assertIn(('WHOLE_SLIDE_IMAGE resources in a patient resource file must use RESOURCE_ID '
-                       'WSI_PATIENT', 'SCANS'), errors)
+                                        [self.patient_row(resource_id='WSI_SAMPLE')])
+        self.assertIn(('WSI resources in a patient resource file must use RESOURCE_ID '
+                       'WSI_PATIENT', 'WSI_SAMPLE'), errors)
 
-    def test_wsi_resource_ids_require_wsi_type(self):
+    def test_retired_type_column_is_ignored(self):
+        # TYPE is a retired resource column: a slide row is identified by its RESOURCE_ID alone,
+        # and a TYPE value, whatever it says, neither marks nor unmarks it.
         errors = self.validate_resource(validateData.SampleResourceValidator,
-                                        [self.sample_row(resource_type='IMAGE')])
-        self.assertEqual([('WSI_SAMPLE resources must have TYPE WHOLE_SLIDE_IMAGE', 'IMAGE')], errors)
+                                        [self.sample_row() + ['IMAGE']], extra_columns=['TYPE'])
+        self.assertEqual([], errors)
+        errors = self.validate_resource(
+            validateData.SampleResourceValidator,
+            [self.sample_row(self.metadata(part_key=None)) + ['IMAGE']], extra_columns=['TYPE'])
+        self.assertIn(('Required WSI value is blank', 'METADATA.part_key'), errors)
 
     def test_required_hierarchy_keys(self):
         errors = self.validate_resource(validateData.SampleResourceValidator,
@@ -3732,22 +3573,21 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
         self.assertIn(('Required WSI value is blank', 'METADATA.block_key'), errors)
         errors = self.validate_resource(validateData.SampleResourceValidator,
                                         [self.sample_row('')])
-        self.assertIn(('WHOLE_SLIDE_IMAGE resources require a METADATA JSON object', None), errors)
+        self.assertIn(('WSI resources require a METADATA JSON object', None), errors)
 
     def test_typed_values(self):
         errors = self.validate_resource(validateData.SampleResourceValidator,
                                         [self.sample_row(self.metadata(is_hne='TRUE'))])
-        self.assertEqual([('WHOLE_SLIDE_IMAGE metadata value must be a JSON boolean', 'is_hne')], errors)
+        self.assertEqual([('WSI metadata value must be a JSON boolean', 'is_hne')], errors)
         errors = self.validate_resource(validateData.SampleResourceValidator,
                                         [self.sample_row(self.metadata(file_size_bytes='3'))])
-        self.assertEqual([('WHOLE_SLIDE_IMAGE metadata value must be a JSON integer',
+        self.assertEqual([('WSI metadata value must be a JSON integer',
                            'file_size_bytes')], errors)
         errors = self.validate_resource(validateData.SampleResourceValidator,
                                         [self.sample_row(self.metadata(part_number=1))])
-        self.assertEqual([('WHOLE_SLIDE_IMAGE metadata value must be a JSON string', 'part_number')], errors)
+        self.assertEqual([('WSI metadata value must be a JSON string', 'part_number')], errors)
 
     def test_slide_type_and_stain_flags(self):
-        # mirrors the native wsi_slide_type_valid / wsi_slide_stain_flags_valid constraints
         errors = self.validate_resource(validateData.SampleResourceValidator,
                                         [self.sample_row(self.metadata(slide_type=None))])
         self.assertIn(('WSI SLIDE_TYPE must be H&E, IHC, Other, or Unknown', ''), errors)
@@ -3777,59 +3617,94 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
         return self.metadata(**dict(self.TIMING, **changes))
 
     def test_timing_metadata_is_optional_and_accepted(self):
+        # rows without any timing key are covered by test_valid_sample_and_patient_rows
         self.assertEqual([], self.validate_resource(validateData.SampleResourceValidator,
                                                     [self.sample_row(self.timed_metadata())]))
+        self.assertEqual([], self.validate_resource(validateData.SampleResourceValidator,
+                                                    [self.sample_row(self.timed_metadata(
+                                                        timeline_start_days=0))]))
         undated = self.timed_metadata(
             slide='slide-9', match_level='UNMATCHED', timeline_start_days=None,
             timeline_date_status='MISSING_PROCEDURE_DATE', timeline_date_kind='UNDATED',
             timeline_date_reason='MISSING_PROCEDURE_DATE', timepoint_source='MISSING_PROCEDURE_DATE')
         self.assertEqual([], self.validate_resource(validateData.PatientResourceValidator,
                                                     [self.patient_row(undated)]))
+        no_reference = self.timed_metadata(
+            timeline_start_days=None, timeline_date_status='MISSING_REFERENCE_SEQUENCING_DATE',
+            timeline_date_kind='ESTIMATED', timeline_date_reason='NO_SEQUENCING_REFERENCE')
+        self.assertEqual([], self.validate_resource(validateData.SampleResourceValidator,
+                                                    [self.sample_row(no_reference)]))
 
     def test_timing_metadata_types(self):
         errors = self.validate_resource(validateData.SampleResourceValidator,
                                         [self.sample_row(self.timed_metadata(timeline_start_days='-3'))])
-        self.assertEqual([('WHOLE_SLIDE_IMAGE metadata value must be a JSON integer',
-                           'timeline_start_days')], errors)
+        self.assertEqual([('WSI metadata value must be a JSON integer', 'timeline_start_days')],
+                         errors)
         for key in ('timeline_date_status', 'timeline_date_kind', 'timeline_date_source',
                     'timeline_date_reason', 'timeline_coordinate_system', 'timepoint_source'):
             errors = self.validate_resource(validateData.SampleResourceValidator,
                                             [self.sample_row(self.timed_metadata(**{key: 7}))])
-            self.assertIn(('WHOLE_SLIDE_IMAGE metadata value must be a JSON string', key), errors)
+            self.assertIn(('WSI metadata value must be a JSON string', key), errors)
 
-    def test_consistent_timing(self):
-        errors = self.validate_resource(validateData.SampleResourceValidator,
-                                        [self.sample_row(self.timed_metadata(timeline_start_days=None))])
-        self.assertEqual([('WSI AVAILABLE timing is inconsistent', 'METADATA.timeline_date_status')],
-                         errors)
+    def test_timing_rules_come_from_the_shared_contract(self):
+        for changes, expected in (
+                (dict(timeline_start_days=None),
+                 ('WSI timing: AVAILABLE timing is inconsistent', 'METADATA.timeline_date_status')),
+                (dict(timeline_date_kind='UNDATED'),
+                 ('WSI timing: AVAILABLE timing is inconsistent', 'METADATA.timeline_date_status')),
+                (dict(timeline_date_reason='late report'),
+                 ('WSI timing: AVAILABLE timing is inconsistent', 'METADATA.timeline_date_status')),
+                (dict(timeline_date_status='MISSING_REFERENCE_SEQUENCING_DATE',
+                      timeline_start_days=None, timeline_date_kind='UNDATED'),
+                 ('WSI timing: missing reference date cannot be UNDATED',
+                  'METADATA.timeline_date_kind'))):
+            errors = self.validate_resource(validateData.SampleResourceValidator,
+                                            [self.sample_row(self.timed_metadata(**changes))])
+            self.assertEqual([expected], errors, changes)
         errors = self.validate_resource(validateData.SampleResourceValidator, [self.sample_row(
             self.timed_metadata(timeline_date_status='MISSING_PROCEDURE_DATE'))])
-        self.assertIn(('WSI non-AVAILABLE timing cannot have an offset',
-                       'METADATA.timeline_start_days'), errors)
-        self.assertIn(('WSI missing procedure dates must be UNDATED',
-                       'METADATA.timeline_date_kind'), errors)
-        # any timing key brings in the timing checks, which then require the others
+        self.assertEqual(
+            [('WSI timing: non-AVAILABLE timing cannot have TIMELINE_START_DAYS',
+              'METADATA.timeline_start_days'),
+             ('WSI timing: missing procedure date must be UNDATED', 'METADATA.timeline_date_kind')],
+            errors)
+
+    def test_any_timing_key_requires_a_complete_set_without_echoing_values(self):
         errors = self.validate_resource(validateData.SampleResourceValidator, [self.sample_row(
             self.metadata(timeline_date_kind='DATE 2021-03-14'))])
-        self.assertIn(('WSI timeline date kind must be RECORDED, ESTIMATED, UNDATED',
-                       'METADATA.timeline_date_kind'), errors)
-        self.assertIn(('WSI timeline date source is required', 'METADATA.timeline_date_source'),
-                      errors)
+        self.assertEqual(
+            [('WSI timing: TIMELINE_DATE_STATUS must be AVAILABLE, MISSING_PROCEDURE_DATE, '
+              'MISSING_REFERENCE_SEQUENCING_DATE', 'METADATA.timeline_date_status'),
+             ('WSI timing: TIMELINE_DATE_KIND must be RECORDED, ESTIMATED, UNDATED',
+              'METADATA.timeline_date_kind'),
+             ('WSI timing: TIMELINE_DATE_SOURCE is required', 'METADATA.timeline_date_source'),
+             ('WSI timing: TIMELINE_COORDINATE_SYSTEM must be '
+              'patient_first_tumor_sequencing_day_zero', 'METADATA.timeline_coordinate_system'),
+             ('WSI timing: TIMEPOINT_SOURCE is required', 'METADATA.timepoint_source')],
+            errors)
         self.assertNotIn('2021', repr(errors))
         # the portal requires a timepoint source on every timed slide
         errors = self.validate_resource(validateData.SampleResourceValidator,
                                         [self.sample_row(self.timed_metadata(timepoint_source=None))])
-        self.assertEqual([('WSI timepoint source is required', 'METADATA.timepoint_source')],
+        self.assertEqual([('WSI timing: TIMEPOINT_SOURCE is required', 'METADATA.timepoint_source')],
                          errors)
 
-    def test_slide_key_unique_across_resource_files(self):
-        errors = self.validate_resource(validateData.SampleResourceValidator,
-                                        [self.sample_row(), self.sample_row()])
-        self.assertIn(('SLIDE_KEY must be unique within a study', 'METADATA.slide_key'), errors)
-        self.validate_resource(validateData.SampleResourceValidator, [self.sample_row()])
-        errors = self.validate_resource(validateData.PatientResourceValidator, [self.patient_row(
-            self.metadata(match_level='UNMATCHED'))], keep_state=True)
-        self.assertEqual([('SLIDE_KEY must be unique within a study', 'METADATA.slide_key')], errors)
+    def test_contract_check_ignores_private_wsi_serving(self):
+        """wsi_serving is never a column, so a WSI contract does not declare it."""
+        saved = validateData.RESOURCE_CONTRACT_KEYS
+        try:
+            public = set(json.loads(self.metadata())) - {'wsi_serving'}
+            validateData.RESOURCE_CONTRACT_KEYS = {'WSI_SAMPLE': public}
+            self.assertEqual([], self.validate_resource(
+                validateData.SampleResourceValidator, [self.sample_row()]))
+            validateData.RESOURCE_CONTRACT_KEYS = {'WSI_SAMPLE': public - {'slide_type'}}
+            self.assertEqual([("METADATA carries keys that resource 'WSI_SAMPLE' does not declare in "
+                               'CUSTOM_METADATA, so the portal would not show them. Declare them or '
+                               'remove them from the file.', 'slide_type')],
+                             self.validate_resource(validateData.SampleResourceValidator,
+                                                    [self.sample_row()]))
+        finally:
+            validateData.RESOURCE_CONTRACT_KEYS = saved
 
     def test_sample_must_belong_to_patient(self):
         errors = self.validate_resource(validateData.SampleResourceValidator,
@@ -3851,7 +3726,7 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
                                                        reference_sample_id=ref))
                         for index, ref in enumerate(patient_refs)]
         for index, row in enumerate(sample_rows + patient_rows):
-            row[-4] += '/%d' % index  # distinct URLs, so rows are not duplicate resources
+            row[-3] += '/%d' % index  # distinct URLs, so rows are not duplicate resources
         errors = self.validate_resource(validateData.SampleResourceValidator, sample_rows,
                                         with_line=True)
         errors += self.validate_resource(validateData.PatientResourceValidator, patient_rows,
@@ -3890,7 +3765,7 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
     def test_unmatched_reference_sample_is_rejected_in_metadata(self):
         errors = self.validate_resource(validateData.PatientResourceValidator, [self.patient_row(
             self.metadata(slide='slide-9', match_level='UNMATCHED', reference_sample_id='UNMATCHED'))])
-        self.assertEqual([('WHOLE_SLIDE_IMAGE metadata reference_sample_id must be omitted, not UNMATCHED, '
+        self.assertEqual([('WSI metadata reference_sample_id must be omitted, not UNMATCHED, '
                            'when a patient has no reference sample', 'UNMATCHED')], errors)
 
     def test_match_level_matches_file_type(self):
@@ -3904,12 +3779,12 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
     def test_serving_shape(self):
         errors = self.validate_resource(validateData.SampleResourceValidator, [self.sample_row(
             self.metadata(wsi_serving=[WSI_SEALED_SOURCE_VECTOR]))])
-        self.assertIn(('WHOLE_SLIDE_IMAGE metadata wsi_serving must be a JSON object', 'list'), errors)
+        self.assertIn(('WSI metadata wsi_serving must be a JSON object', 'list'), errors)
         serving = json.loads(self.metadata())['wsi_serving']
         serving['tile_metadata_json'] = json.dumps(self.TILE_METADATA)
         errors = self.validate_resource(validateData.SampleResourceValidator, [self.sample_row(
             self.metadata(slide='slide-4', wsi_serving=serving))])
-        self.assertIn(('WHOLE_SLIDE_IMAGE metadata wsi_serving.tile_metadata_json must be a JSON object',
+        self.assertIn(('WSI metadata wsi_serving.tile_metadata_json must be a JSON object',
                        'str'), errors)
         for key in ('sealed_source', 'thumbnail_content_type', 'thumbnail_width'):
             serving = json.loads(self.metadata())['wsi_serving']
@@ -3941,7 +3816,7 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
         serving['sealed_source'] = 29
         errors = self.validate_resource(validateData.SampleResourceValidator, [self.sample_row(
             self.metadata(wsi_serving=serving))])
-        self.assertIn(('WHOLE_SLIDE_IMAGE metadata value must be a JSON string',
+        self.assertIn(('WSI metadata value must be a JSON string',
                        'wsi_serving.sealed_source'), errors)
 
     def test_unsealed_source_keys_are_rejected_in_wsi_serving(self):
@@ -3950,7 +3825,7 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
             serving[key] = 'S-SECRET-1'
             errors = self.validate_resource(validateData.SampleResourceValidator, [self.sample_row(
                 self.metadata(wsi_serving=serving))])
-            self.assertEqual([('WHOLE_SLIDE_IMAGE metadata must not contain %s; the image ID and object '
+            self.assertEqual([('WSI metadata must not contain %s; the image ID and object '
                                'URIs are only carried inside sealed_source' % key,
                                'METADATA.wsi_serving.' + key)], errors)
             self.assertNotIn('S-SECRET', str(errors))
@@ -3964,7 +3839,7 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
             value[key] = 'S-SECRET-1'
             errors = self.validate_resource(validateData.SampleResourceValidator,
                                             [self.sample_row(json.dumps(value))])
-            self.assertEqual([('WHOLE_SLIDE_IMAGE public metadata must not contain %s' % key,
+            self.assertEqual([('WSI public metadata must not contain %s' % key,
                                'METADATA.' + key)], errors)
 
     def test_slide_key_format_and_uniqueness_across_files(self):
@@ -4005,21 +3880,25 @@ class WsiResourceValidatorTestCase(PostClinicalDataFileTestCase):
         self.assertNotIn('S-SECRET', str(errors))
 
     def test_study_with_legacy_wsi_file_fails(self):
-        with temp_inputfolder({
-            'meta_study.txt': 'cancer_study_identifier: spam\ntype_of_cancer: brca\n'
-                              'name: Spam\ndescription: Spam\nadd_global_case_list: true\n',
-            'meta_samples.txt': 'cancer_study_identifier: spam\ngenetic_alteration_type: CLINICAL\n'
-                                'datatype: SAMPLE_ATTRIBUTES\ndata_filename: data_samples.txt\n',
-            'data_samples.txt': '#a\tb\n#a\tb\n#STRING\tSTRING\n#1\t1\n'
-                                'PATIENT_ID\tSAMPLE_ID\nTEST-PAT1\tTEST-PAT1-S1\n',
-            'meta_wsi.txt': 'cancer_study_identifier: spam\ngenetic_alteration_type: PATHOLOGY_SLIDES\n'
-                            'datatype: WSI\ndata_filename: data_wsi.txt\nformat_version: 4\n',
-            'data_wsi.txt': Path('test_data/data_wsi_valid.txt').read_text(),
-        }) as study_dir:
-            self.logger.setLevel(logging.ERROR)
-            validateData.validate_study(study_dir, PORTAL_INSTANCE, self.logger, False, False)
-        self.assertEqual([cbioportal_common.LEGACY_WSI_IMPORT_MESSAGE],
-                         [record.getMessage() for record in self.get_log_records()])
+        """Any meta_wsi, whatever its format_version, gets the convert-it error rather than
+        being skipped as an unrecognized meta file."""
+        wsi_meta = ('cancer_study_identifier: spam\ngenetic_alteration_type: PATHOLOGY_SLIDES\n'
+                    'datatype: WSI\ndata_filename: data_wsi.txt\n')
+        for extra in ('format_version: 4\n', 'format_version: 3\n', ''):
+            with temp_inputfolder({
+                'meta_study.txt': 'cancer_study_identifier: spam\ntype_of_cancer: brca\n'
+                                  'name: Spam\ndescription: Spam\nadd_global_case_list: true\n',
+                'meta_samples.txt': 'cancer_study_identifier: spam\ngenetic_alteration_type: CLINICAL\n'
+                                    'datatype: SAMPLE_ATTRIBUTES\ndata_filename: data_samples.txt\n',
+                'data_samples.txt': '#a\tb\n#a\tb\n#STRING\tSTRING\n#1\t1\n'
+                                    'PATIENT_ID\tSAMPLE_ID\nTEST-PAT1\tTEST-PAT1-S1\n',
+                'meta_wsi.txt': wsi_meta + extra,
+                'data_wsi.txt': 'not read\n',
+            }) as study_dir:
+                self.logger.setLevel(logging.ERROR)
+                validateData.validate_study(study_dir, PORTAL_INSTANCE, self.logger, False, False)
+            self.assertEqual([cbioportal_common.LEGACY_WSI_IMPORT_MESSAGE],
+                             [record.getMessage() for record in self.get_log_records()], extra)
 
 if __name__ == '__main__':
     unittest.main(buffer=True)
