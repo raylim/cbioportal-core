@@ -168,9 +168,10 @@ and sortable.
 
 ### Timeline
 
-The converter does not produce timeline data, and slides carry no timing in
-`METADATA`. Pathology procedure events stay in the study's clinical timeline
-files. `PATHOLOGY SLIDES` events reach the browser through the clinical events
+The converter does not produce timeline data, and neither `data_wsi.txt` nor
+`METADATA` carries slide timing. Slide timing lives only in the study's
+pathology timeline file, which core's normal timeline import loads as
+`PATHOLOGY SLIDES` clinical events. `PATHOLOGY SLIDES` events reach the browser through the clinical events
 API, so `validateData.py` and `ImportTimelineData` reject such events with a
 non-blank `IMAGE_ID` or `IMAGE_IDS` column (without echoing the value).
 `SPECIMEN`/`LINKOUT` should carry only the opaque specimen key.
@@ -194,10 +195,11 @@ exact header (tab-delimited, 30 columns):
 PATIENT_ID  REFERENCE_SAMPLE_ID  SAMPLE_ID  PART_KEY  PART_NUMBER  PART_DESIGNATOR  PART_TYPE  PART_DESCRIPTION  SUBSPECIALTY  PATH_DX_TITLE  BLOCK_KEY  BLOCK_NUMBER  BLOCK_LABEL  MATCH_LEVEL  SPECIMEN_KEY  STAIN_NAME  STAIN_GROUP  IS_HNE  IS_IHC  MAGNIFICATION  FILE_SIZE_BYTES  BARCODE  SLIDE_TYPE  CAN_SERVE_TILES  TILE_METADATA_JSON  THUMBNAIL_WIDTH  THUMBNAIL_HEIGHT  THUMBNAIL_CONTENT_TYPE  SLIDE_KEY  SEALED_SOURCE
 ```
 
-A file may also carry the seven slide-timing columns (`TIMELINE_START_DAYS`
-through `TIMEPOINT_SOURCE`) between `THUMBNAIL_CONTENT_TYPE` and `SLIDE_KEY`
-(37 columns); the converter ignores them. Other format versions, and files
-with an `IMAGE_ID`, `SOURCE_URL` or `THUMBNAIL_URL` column, are rejected.
+`data_wsi.txt` carries no slide timing. Slide dates go in the study's
+pathology timeline file and are imported as `PATHOLOGY SLIDES` clinical events
+(see [Timeline](#timeline)). Any other header is rejected, including one with
+slide-timing columns, as are other format versions and files with an
+`IMAGE_ID`, `SOURCE_URL` or `THUMBNAIL_URL` column.
 `PATIENT_ID` is required, booleans are `TRUE` or `FALSE`, and
 `TILE_METADATA_JSON` is a JSON object when set.
 
