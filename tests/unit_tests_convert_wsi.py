@@ -254,36 +254,6 @@ class ConverterInputTestCase(ConverterTestCase):
             rows[0] = '\t'.join(fields)
             self.assertConversionError(message, meta=self.write_legacy(rows))
 
-    def test_timing_columns_are_ignored(self):
-        # Some files carry seven slide-timing columns before SLIDE_KEY. They are accepted
-        # without being required or validated, and never reach the metadata.
-        reference = Path(self.tmp.name) / 'reference'
-        written = converter.convert(FIXTURE_DIR / 'meta_wsi.txt', reference, BASE_URL)
-        timing_values = [
-            ['0', 'AVAILABLE', 'RECORDED', 'PATHOLOGY_REPORT', '',
-             'patient_first_tumor_sequencing_day_zero', 'surgery 20210314'],
-            # values that would not pass as timing data
-            ['not-a-day', 'BOGUS', '', '', 'reason', 'other_coordinates', ''],
-        ]
-        source = (FIXTURE_DIR / 'data_wsi.txt').read_text(encoding='utf-8').splitlines()
-
-        def with_timing(line, values):
-            fields = line.split('\t')
-            return '\t'.join(fields[:-2] + values + fields[-2:])
-
-        header = with_timing(source[4], list(converter.IGNORED_TIMING_COLUMNS))
-        self.assertEqual(converter.COLUMNS_WITH_IGNORED_TIMING, header.split('\t'))
-        rows = [with_timing(row, timing_values[index % 2])
-                for index, row in enumerate(self.fixture_rows())]
-        self.convert(meta=self.write_legacy(rows, header), base_url=BASE_URL)
-        for path in written:
-            self.assertEqual(path.read_bytes(), (self.out / path.name).read_bytes(), path.name)
-        for name in ('data_resource_sample.txt', 'data_resource_patient.txt'):
-            for record in rows_by_slide(self.out / name).values():
-                metadata = json.loads(record['METADATA'])
-                self.assertFalse([key for key in metadata
-                                  if key.startswith(('timeline_', 'timepoint_'))], metadata)
-
     def test_line_break_in_output_cell_is_rejected_without_echoing_it(self):
         rows = self.fixture_rows()
         # STAIN_NAME reaches DISPLAY_NAME verbatim
@@ -294,8 +264,7 @@ class ConverterInputTestCase(ConverterTestCase):
 
 class V4OnlyTestCase(ConverterTestCase):
 
-    """Only format v4 (30 columns ending with SLIDE_KEY and SEALED_SOURCE; 37 with ignored
-    timing columns) is converted."""
+    """Only format v4 (30 columns ending with SLIDE_KEY and SEALED_SOURCE) is converted."""
 
     def test_older_format_versions_are_rejected(self):
         for version in ('2', '3'):
@@ -322,11 +291,33 @@ class V4OnlyTestCase(ConverterTestCase):
                               if index != len(converter.COLUMNS) + drop) for row in source[5:]]
             header = '\t'.join(name for name in converter.COLUMNS if name != converter.COLUMNS[drop])
             self.assertConversionError('invalid header', meta=self.write_legacy(rows, header))
-        # nor with the ignored timing columns and neither key column
-        timing = ['' for _ in converter.IGNORED_TIMING_COLUMNS]
-        rows = ['\t'.join(row.split('\t')[:-2] + timing) for row in source[5:]]
-        header = '\t'.join(source[4].split('\t')[:-2] + list(converter.IGNORED_TIMING_COLUMNS))
-        self.assertConversionError('invalid header', meta=self.write_legacy(rows, header))
+
+    def test_slide_timing_columns_are_rejected_without_echoing_values(self):
+        # Slide timing belongs in the pathology timeline file, not data_wsi.txt: a
+        # 37-column file with seven timing columns before SLIDE_KEY is not format v4.
+        timing_columns = ['TIMELINE_START_DAYS', 'TIMELINE_DATE_STATUS', 'TIMELINE_DATE_KIND',
+                          'TIMELINE_DATE_SOURCE', 'TIMELINE_DATE_REASON',
+                          'TIMELINE_COORDINATE_SYSTEM', 'TIMEPOINT_SOURCE']
+        timing_values = ['4242', 'AVAILABLE', 'RECORDED', 'PATHOLOGY_REPORT', '',
+                         'patient_first_tumor_sequencing_day_zero', 'SECRET-SURGERY']
+        source = (FIXTURE_DIR / 'data_wsi.txt').read_text(encoding='utf-8').splitlines()
+
+        def with_timing(line, values):
+            fields = line.split('\t')
+            return '\t'.join(fields[:-2] + values + fields[-2:])
+
+        header = with_timing(source[4], timing_columns)
+        self.assertEqual(37, len(header.split('\t')))
+        rows = [with_timing(row, timing_values) for row in source[5:]]
+        message = self.assertConversionError(
+            'invalid header or column order; expected the 30-column format v4 header',
+            meta=self.write_legacy(rows, header))
+        self.assertNotIn('SECRET', message)
+        self.assertNotIn('4242', message)
+        for row in source[5:]:
+            for value in row.split('\t'):
+                if len(value) > 3:
+                    self.assertNotIn(value, message)
 
     def test_failure_late_in_the_file_leaves_no_output(self):
         rows = self.fixture_rows()
