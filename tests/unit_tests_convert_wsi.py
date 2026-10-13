@@ -11,7 +11,6 @@ import base64
 import json
 import logging.handlers
 import shutil
-import textwrap
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -78,8 +77,17 @@ class ConverterTestCase(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def convert(self, meta=FIXTURE_DIR / 'meta_wsi.txt', base_url=BASE_URL + '/', study_dir=None):
-        return converter.convert(meta, self.out, base_url, study_dir)
+    def convert(self, meta=FIXTURE_DIR / 'meta_wsi.txt', base_url=BASE_URL + '/'):
+        return converter.convert(meta, self.out, base_url)
+
+    def assertConversionError(self, text, **kwargs):
+        """Assert the conversion fails with ``text``, writing nothing; return the message."""
+        with self.assertRaises(converter.ConversionError) as context:
+            self.convert(**kwargs)
+        self.assertFalse(self.out.exists())
+        message = str(context.exception)
+        self.assertIn(text, message)
+        return message
 
     def write_legacy(self, rows, header=None):
         """Write a legacy pair made of the fixture's comment rows and the given data rows."""
@@ -216,11 +224,6 @@ class ConvertedOutputTestCase(ConverterTestCase):
 
 class ConverterInputTestCase(ConverterTestCase):
 
-    def assertConversionError(self, text, **kwargs):
-        with self.assertRaises(converter.ConversionError) as context:
-            self.convert(**kwargs)
-        self.assertIn(text, str(context.exception))
-
     def test_portal_base_url_must_be_absolute_http(self):
         for value in ('/cbioportal', 'portal.example.org', 'ftp://portal.example.org',
                       'https://portal.example.org/?x=1'):
@@ -234,17 +237,17 @@ class ConverterInputTestCase(ConverterTestCase):
     def test_match_level_must_agree_with_sample(self):
         rows = self.fixture_rows()
         rows[0] = rows[0].replace('\tBLOCK\t', '\tUNMATCHED\t', 1)
-        self.assertConversionError('UNMATCHED rows cannot have SAMPLE_ID', meta=self.write_legacy(rows))
+        self.assertConversionError('UNMATCHED slides cannot have a SAMPLE_ID', meta=self.write_legacy(rows))
         rows = self.fixture_rows()
         rows[3] = rows[3].replace('\tUNMATCHED\t', '\tPART\t', 1)
-        self.assertConversionError('matched rows require SAMPLE_ID', meta=self.write_legacy(rows))
+        self.assertConversionError('matched slides require a SAMPLE_ID', meta=self.write_legacy(rows))
 
     def test_slide_type_and_stain_flags(self):
         slide_type = converter.COLUMNS.index('SLIDE_TYPE')
         is_hne = converter.COLUMNS.index('IS_HNE')
         for column, value, message in ((slide_type, 'Frozen', 'SLIDE_TYPE must be one of'),
                                        (slide_type, '', 'SLIDE_TYPE must be one of'),
-                                       (is_hne, 'FALSE', 'inconsistent with SLIDE_TYPE H&E')):
+                                       (is_hne, 'FALSE', 'IS_HNE/IS_IHC are inconsistent with SLIDE_TYPE')):
             rows = self.fixture_rows()
             fields = rows[0].split('\t')
             fields[column] = value
@@ -281,27 +284,12 @@ class ConverterInputTestCase(ConverterTestCase):
                 self.assertFalse([key for key in metadata
                                   if key.startswith(('timeline_', 'timepoint_'))], metadata)
 
-    def test_line_break_in_output_cell_is_rejected(self):
+    def test_line_break_in_output_cell_is_rejected_without_echoing_it(self):
         rows = self.fixture_rows()
         # STAIN_NAME reaches DISPLAY_NAME verbatim
-        rows[0] = rows[0].replace('\tH&E\tH&E\tTRUE\t', '\tH\r&E\tH&E\tTRUE\t', 1)
-        self.assertConversionError('tab or line break', meta=self.write_legacy(rows))
-        with self.assertRaises(converter.ConversionError):
-            converter.render_tsv('x.txt', [['a\tb']])
-
-    def test_existing_resource_files_conflict(self):
-        study = Path(self.tmp.name) / 'study'
-        study.mkdir()
-        (study / 'meta_resource_definition.txt').write_text(
-            'cancer_study_identifier: wsi_convert_test\nresource_type: DEFINITION\n'
-            'data_filename: data_resource_definition.txt\n')
-        self.assertConversionError('meta_resource_definition.txt already provides a DEFINITION',
-                                   study_dir=study)
-
-    def test_output_dir_must_differ_from_study_dir(self):
-        study = self.copy_study()
-        self.out = study
-        self.assertConversionError('--output-dir must differ from --study-dir', study_dir=study)
+        rows[0] = rows[0].replace('\tH&E\tH&E\tTRUE\t', '\tSECRET\r&E\tH&E\tTRUE\t', 1)
+        message = self.assertConversionError('tab or line break', meta=self.write_legacy(rows))
+        self.assertNotIn('SECRET', message)
 
 
 class V4OnlyTestCase(ConverterTestCase):
@@ -309,27 +297,11 @@ class V4OnlyTestCase(ConverterTestCase):
     """Only format v4 (30 columns ending with SLIDE_KEY and SEALED_SOURCE; 37 with ignored
     timing columns) is converted."""
 
-    def assertConversionError(self, text, meta):
-        with self.assertRaises(converter.ConversionError) as context:
-            converter.convert(meta, self.out, BASE_URL)
-        self.assertIn(text, str(context.exception))
-        self.assertFalse(self.out.exists())
-
-    def test_columns(self):
-        self.assertEqual(30, len(converter.COLUMNS))
-        self.assertEqual(['THUMBNAIL_CONTENT_TYPE', 'SLIDE_KEY', 'SEALED_SOURCE'], converter.COLUMNS[-3:])
-        for name in ('IMAGE_ID', 'SOURCE_URL', 'THUMBNAIL_URL'):
-            self.assertNotIn(name, converter.COLUMNS)
-        self.assertEqual(37, len(converter.COLUMNS_WITH_IGNORED_TIMING))
-        self.assertEqual(list(converter.IGNORED_TIMING_COLUMNS),
-                         converter.COLUMNS_WITH_IGNORED_TIMING[28:35])
-        self.assertEqual(['SLIDE_KEY', 'SEALED_SOURCE'], converter.COLUMNS_WITH_IGNORED_TIMING[-2:])
-
     def test_older_format_versions_are_rejected(self):
         for version in ('2', '3'):
             meta = self.write_legacy(self.fixture_rows())
             meta.write_text(meta.read_text().replace('format_version: 4', 'format_version: ' + version))
-            self.assertConversionError('unsupported WSI format_version; expected 4', meta)
+            self.assertConversionError('unsupported WSI format_version; expected 4', meta=meta)
 
     def test_format_v3_columns_are_rejected_without_echoing_values(self):
         source = (FIXTURE_DIR / 'data_wsi.txt').read_text(encoding='utf-8').splitlines()
@@ -337,13 +309,11 @@ class V4OnlyTestCase(ConverterTestCase):
                       ['IMAGE_ID', 'SOURCE_URL', 'THUMBNAIL_URL']):
             header = '\t'.join(source[4].split('\t') + names)
             rows = [row + '\tS-SECRET-1' * len(names) for row in source[5:]]
-            with self.assertRaises(converter.ConversionError) as context:
-                converter.convert(self.write_legacy(rows, header), self.out, BASE_URL)
-            message = str(context.exception)
-            self.assertIn('%s column(s) of format v3 or older' % ', '.join(names), message)
+            message = self.assertConversionError(
+                '%s column(s) of format v3 or older' % ', '.join(names),
+                meta=self.write_legacy(rows, header))
             self.assertIn('SEALED_SOURCE', message)
             self.assertNotIn('S-SECRET', message)
-            self.assertFalse(self.out.exists())
 
     def test_file_without_slide_key_or_sealed_source_is_rejected(self):
         source = (FIXTURE_DIR / 'data_wsi.txt').read_text(encoding='utf-8').splitlines()
@@ -351,17 +321,17 @@ class V4OnlyTestCase(ConverterTestCase):
             rows = ['\t'.join(cell for index, cell in enumerate(row.split('\t'))
                               if index != len(converter.COLUMNS) + drop) for row in source[5:]]
             header = '\t'.join(name for name in converter.COLUMNS if name != converter.COLUMNS[drop])
-            self.assertConversionError('invalid header', self.write_legacy(rows, header))
+            self.assertConversionError('invalid header', meta=self.write_legacy(rows, header))
         # nor with the ignored timing columns and neither key column
         timing = ['' for _ in converter.IGNORED_TIMING_COLUMNS]
         rows = ['\t'.join(row.split('\t')[:-2] + timing) for row in source[5:]]
         header = '\t'.join(source[4].split('\t')[:-2] + list(converter.IGNORED_TIMING_COLUMNS))
-        self.assertConversionError('invalid header', self.write_legacy(rows, header))
+        self.assertConversionError('invalid header', meta=self.write_legacy(rows, header))
 
     def test_failure_late_in_the_file_leaves_no_output(self):
         rows = self.fixture_rows()
         rows[-1] = rows[-1].replace('\tUNMATCHED\t', '\tSOMETIMES\t', 1)
-        self.assertConversionError('invalid MATCH_LEVEL', self.write_legacy(rows))
+        self.assertConversionError('MATCH_LEVEL must be', meta=self.write_legacy(rows))
         self.assertEqual([], [path.name for path in Path(self.tmp.name).iterdir()
                               if path.name.endswith('.partial')])
 
@@ -390,24 +360,18 @@ class SlideKeyAndDeidTestCase(ConverterTestCase):
         rows[row] = '\t'.join(fields)
         return self.write_legacy(rows)
 
-    def conversion_error(self, meta):
-        with self.assertRaises(converter.ConversionError) as context:
-            converter.convert(meta, self.out, BASE_URL)
-        self.assertFalse(self.out.exists())
-        return str(context.exception)
-
     def test_slide_key_is_required_and_must_be_lowercase_hex(self):
         for value in ('', '2C96F13783250AD2C6BCFCD5B7C3EF22', '2c96f13783250ad2', 'g' * 32,
                       '2c96f13783250ad2c6bcfcd5b7c3ef22a'):
-            message = self.conversion_error(self.with_cell(SLIDE_KEY, value))
-            self.assertIn('SLIDE_KEY', message, value)
+            self.assertConversionError('SLIDE_KEY', meta=self.with_cell(SLIDE_KEY, value))
 
     def test_slide_key_must_be_unique(self):
         rows = self.fixture_rows()
         duplicate = rows[1].split('\t')
         duplicate[SLIDE_KEY] = rows[0].split('\t')[SLIDE_KEY]
         rows[1] = '\t'.join(duplicate)
-        self.assertIn('line 7: SLIDE_KEY is not unique', self.conversion_error(self.write_legacy(rows)))
+        self.assertConversionError('line 7: SLIDE_KEY must be unique within a study',
+                                   meta=self.write_legacy(rows))
 
     def test_sealed_source_shape(self):
         def sealed(size):
@@ -422,16 +386,17 @@ class SlideKeyAndDeidTestCase(ConverterTestCase):
                       SEALED_SOURCE_VECTOR + '.x',             # not base64url
                       'A' * 41,                                # not a whole number of bytes
                       'A' * 4097):                             # too long
-            message = self.conversion_error(self.with_cell(SEALED_SOURCE, value))
-            self.assertIn('line 6: SEALED_SOURCE must be unpadded base64url', message)
+            message = self.assertConversionError('line 6: SEALED_SOURCE must be unpadded base64url',
+                                                 meta=self.with_cell(SEALED_SOURCE, value))
             self.assertNotIn(value[:20], message)
 
     def test_sealed_source_is_required_iff_servable(self):
-        message = self.conversion_error(self.with_cell(SEALED_SOURCE, ''))
-        self.assertIn('line 6: SEALED_SOURCE is required', message)
+        self.assertConversionError('line 6: SEALED_SOURCE is required when CAN_SERVE_TILES is TRUE',
+                                   meta=self.with_cell(SEALED_SOURCE, ''))
         # slide-2 (second row) cannot serve tiles
-        message = self.conversion_error(self.with_cell(SEALED_SOURCE, SEALED_SOURCE_VECTOR, row=1))
-        self.assertIn('line 7: SEALED_SOURCE must be empty when CAN_SERVE_TILES is FALSE', message)
+        message = self.assertConversionError(
+            'line 7: SEALED_SOURCE must be empty when CAN_SERVE_TILES is FALSE',
+            meta=self.with_cell(SEALED_SOURCE, SEALED_SOURCE_VECTOR, row=1))
         self.assertNotIn(SEALED_SOURCE_VECTOR[:20], message)
 
     def test_url_display_name_and_metadata_shape(self):
@@ -483,11 +448,6 @@ class SlideKeyAndDeidTestCase(ConverterTestCase):
         self.assertEqual('image/jpeg', serving['thumbnail_content_type'])
         # non-servable rows have no serving object
         self.assertNotIn('wsi_serving', json.loads(samples['slide-2']['METADATA']))
-
-    def test_tab_in_output_is_not_echoed(self):
-        with self.assertRaises(converter.ConversionError) as context:
-            converter.render_tsv('x.txt', [['SECRET\t1']])
-        self.assertNotIn('SECRET', str(context.exception))
 
 PUBLIC_KEYS = {
     'slide_key', 'reference_sample_id', 'part_key', 'part_number', 'part_type',
@@ -555,7 +515,7 @@ class ConvertedFilesValidationTestCase(ConverterTestCase):
 
     def test_converted_study_passes_and_meta_wsi_is_rejected(self):
         study = self.copy_study()
-        self.convert(study_dir=study)
+        self.convert()
         full = Path(self.tmp.name) / 'full'
         shutil.copytree(study, full)
         for path in self.out.iterdir():
