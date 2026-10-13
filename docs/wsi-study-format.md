@@ -1,41 +1,21 @@
 # WSI study import
 
-cBioPortal core is the sole database writer for whole-slide-image (WSI)
-studies. Slides are imported as standard resource data: an upstream
-artifact-generation/export pipeline produces a normal study directory whose
-resource files describe the slides, `validateData.py` checks them, and
-`metaImport.py` loads them with the rest of the study. The tile server only
-serves the source and thumbnail artifacts named by the sealed source that
-cBioPortal hands it in the access token. The upstream
-pipeline is deployment-specific and may use Databricks, scripts, or another
-service; Databricks is not required by cBioPortal core.
-
-Legacy `meta_wsi.txt`/`data_wsi.txt` pairs are no longer
-imported. Validation and import both fail for a study that still contains
-`meta_wsi.txt`; convert it offline first (see
+Whole-slide images (WSI) are imported as standard resource data. An upstream
+pipeline produces a normal study directory whose resource files describe the
+slides; `validateData.py` checks them and `metaImport.py` loads them with the
+rest of the study. A study that contains a legacy `meta_wsi.txt` fails
+validation and import; convert it first (see
 [Converting legacy files](#converting-legacy-files)).
 
-## Upstream artifact publication
+## Upstream pipeline
 
-Before the study files are imported, an upstream artifact-generation/export
-pipeline must read or receive the eligible slide inventory and source rows,
-generate the required master thumbnails and tile metadata, store the artifacts
-where the deployment's tile-serving layer can access them, seal each servable
-slide's source (see [Sealed source](#sealed-source)), and materialize the
-artifact fields below into the study files. The pipeline must set
-`can_serve_tiles` consistently with the availability of the sealed source,
-tile-metadata, and thumbnail fields. An implementation may maintain a
-registry, perform canonical-association queries, or use a completion watermark,
-but those details are producer-specific and are not part of the cBioPortal core
-contract.
-
-The artifact-generation process is outside cBioPortal core and outside the
-frontend. The frontend is a read-only consumer. A tile-serving deployment may
-provide optional development or controlled-remediation tooling, but those
-tools are not required by core and must not be used as the production
-publication mechanism. The export must wait until artifact generation and
-metadata publication are complete, and any producer-side metadata needed for
-serving must be finalized before the study is imported.
+The pipeline is deployment-specific and outside cBioPortal core. Before the
+study is exported it must generate each slide's thumbnail and tile metadata,
+store the artifacts where the tile server can read them, seal each servable
+slide's source (see [Sealed source](#sealed-source)) and write the fields
+below into the study files, setting `can_serve_tiles` only for slides whose
+artifacts are complete. Core does not discover slides, generate thumbnails or
+write the artifact store.
 
 ## Resource files
 
@@ -49,12 +29,11 @@ resource file pairs:
   in the patient resource file with columns
   `PATIENT_ID RESOURCE_ID URL DISPLAY_NAME METADATA`.
 
-The `WSI_SAMPLE`/`WSI_PATIENT` IDs are reserved for slides: a row is a slide
-row because of its `RESOURCE_ID`. Resource files have no `TYPE` column (it is
-retired; `validateData.py` warns and ignores one). Files are raw tab-separated text: values are not
-quoted, and no value may contain a tab or line break. `METADATA` is one compact
-JSON object per row whose keys are the lower-cased format-v4 column names.
-These public keys may be returned to the browser:
+A row is a slide row because of its `RESOURCE_ID`. Files are raw
+tab-separated text: values are not quoted, and no value may contain a tab or
+line break. `METADATA` is one compact JSON object per row whose keys are the
+lower-cased [format-v4](#legacy-format-v4) column names. These public keys may
+be returned to the browser:
 
 - strings: `slide_key`, `reference_sample_id`, `part_key`, `part_number`,
   `part_type`, `part_description`, `subspecialty`, `block_key`,
@@ -68,23 +47,56 @@ and one private key:
 - `wsi_serving`, only for slides that can serve tiles: an object with
   `sealed_source`, `tile_metadata_json` (a JSON object, not a string),
   `thumbnail_width`, `thumbnail_height` (integers) and
-  `thumbnail_content_type`. Slides that cannot serve tiles have no
-  `wsi_serving`.
+  `thumbnail_content_type`.
 
 `slide_key` is the opaque per-slide key of the WSI de-identification contract
 (`wsi-serving-v6`): 32 lowercase hex characters computed upstream from a
-salted hash of the image ID, unique within the study. It is the only slide
-identifier the browser sees. `wsi_serving` is private: the backend strips it
-from generic resource responses and only reads it to build the authorized WSI
-access token, into which it copies `sealed_source` verbatim.
+salted hash of the image ID. It is the only slide identifier the browser sees.
+The backend strips `wsi_serving` from generic resource responses and only
+reads it to build the authorized WSI access token, into which it copies
+`sealed_source` verbatim. The pathology image ID and the object URIs that
+embed it are not stored anywhere in cBioPortal; they exist only inside the
+sealed source.
 
-The pathology image ID and the object URIs that embed it (`source_url`,
-`thumbnail_url`) are not stored anywhere in cBioPortal, not even in
-`wsi_serving`; they exist only inside the sealed source. `validateData.py`
-rejects rows whose top-level metadata has `image_id`, `source_url`,
-`thumbnail_url`, `barcode`, `part_designator`, `path_dx_title` or
-`sealed_source`, and rows whose `wsi_serving` has `image_id`, `source_url` or
-`thumbnail_url`. Missing keys are treated as absent values.
+### Row contract
+
+`validateData.py` checks every `WSI_SAMPLE`/`WSI_PATIENT` row against these
+rules, and the converter applies the same rules to each legacy row (both use
+`convertWsiToResources.py`):
+
+- `slide_key`, `part_key`, `block_key`, `match_level`, `specimen_key`,
+  `is_hne`, `is_ihc` and `can_serve_tiles` are required, and every key has the
+  JSON type listed above. Missing keys are absent values.
+- `slide_key` is 32 lowercase hex characters and unique within the study,
+  across both files.
+- `part_key` and `block_key` contain no `?`; slides that share a part or
+  block key carry the same part or block values.
+- `match_level` is `BLOCK`, `PART` or `UNMATCHED`; matched slides have a
+  `SAMPLE_ID` (sample file) and unmatched slides have none (patient file).
+- `slide_type` is `H&E`, `IHC`, `Other` or `Unknown`. `H&E` requires
+  `is_hne`, `IHC` requires `is_ihc`, `Other`/`Unknown` allow neither, and a
+  slide is never both.
+- `file_size_bytes` is not negative.
+- All slides of a patient have the same `reference_sample_id`, or all omit it
+  (`UNMATCHED` is not a value). The sample and reference sample belong to the
+  row's patient in the clinical files.
+- When `can_serve_tiles` is true, all five `wsi_serving` keys are set: a valid
+  sealed source, tile metadata of schema version 2 (positive `dimensions`, one
+  positive `level_dimensions` entry and one `level_downsamples` value per
+  level, `max_zoom`, `tile_size`, `safe_min_level`,
+  `tile_metadata_schema_version` 2, and the decode policy fields the tile
+  server sets; other fields are kept), thumbnail dimensions between 1 and
+  8192, and an `image/*` content type. When it is false, `sealed_source` is
+  absent or empty.
+- The public keys never include `image_id`, `source_url`, `thumbnail_url`,
+  `barcode`, `part_designator`, `path_dx_title` or `sealed_source`, and
+  `wsi_serving` never includes `image_id`, `source_url` or `thumbnail_url`.
+
+WSI errors name the column or `METADATA` path, never the value. Core does not
+scan free text (`DISPLAY_NAME`, part and block descriptions, stain names, tile
+metadata and similar) for protected health information or
+institution-specific identifiers: the data provider is responsible for
+de-identifying free text before export.
 
 ### Sealed source
 
@@ -94,86 +106,53 @@ cBioPortal core and the backend cannot open it. It is unpadded base64url
 (`A-Z`, `a-z`, `0-9`, `-`, `_`) of an AES-GCM nonce (12 bytes), the
 ciphertext of the slide's image ID, tile source and thumbnail source, and the
 tag (16 bytes), authenticated with the slide key. Core checks only its shape:
-at most 4096 characters that decode to at least 29 bytes. It is required when
-`can_serve_tiles` is true and must be absent or empty otherwise. Error
-messages never echo it.
+at most 4096 characters that decode to at least 29 bytes. The tile server
+validates the URIs it unseals.
 
-For every `WSI_SAMPLE`/`WSI_PATIENT` row, `validateData.py` applies the row contract
-of [format v4](#legacy-format-v4), shared with the converter:
-required hierarchy keys, typed values, `match_level`
-agreement with the file type (sample rows are matched, patient rows are
-unmatched), `slide_type` being `H&E`, `IHC`, `Other`, or `Unknown` with
-consistent stain flags (never both `is_hne` and `is_ihc`; `H&E` requires
-`is_hne`, `IHC` requires `is_ihc`, `Other`/`Unknown` allow neither), `slide_key` (32 lowercase hex
-characters) unique across both files of the study, consistent part and block
-metadata, the sample and reference sample belonging to the row's patient, and
-the `wsi_serving` shape and sealed-source rules. The row's `RESOURCE_ID` must be `WSI_SAMPLE` in sample files and
-`WSI_PATIENT` in patient files.
+### Viewer link
 
-Error messages for WSI rows never echo values; only the
-column or JSON path is reported. Core does not scan free text (`DISPLAY_NAME`,
-part and block descriptions, stain names, tile metadata and similar) for
-protected health information or institution-specific identifiers such as
-specimen accession numbers: the data provider is responsible for
-de-identifying free text before export.
-
-`URL` is the link opened from the Files & Links tab. The supported viewer link
-is the standalone viewer route:
+`URL` is the link opened from the Files & Links tab, the standalone viewer
+route:
 
 ```text
 <portal base URL>/wsi/patient/<patient ID>?studyId=<study ID>&slideKey=<slide key>
 ```
 
 The base URL is absolute and includes any context path the portal is deployed
-under; each path and query value is percent-encoded. The link never contains
-the image ID or the sealed source. `DISPLAY_NAME` is a non-identifying label; the converter writes
+under; each path and query value is percent-encoded. `DISPLAY_NAME` is a
+non-identifying label; the converter writes
 `<stain name> · Specimen <part number> / Block <block number>` (falling back
 to the slide type, and omitting missing parts).
 
 ## Converting legacy files
 
 `scripts/importer/convertWsiToResources.py` converts a legacy pair offline. It
-never contacts cBioPortal, a database, or the artifact store. It accepts only
-[format v4](#legacy-format-v4), which carries the `SLIDE_KEY` and
-`SEALED_SOURCE` on every row. Older formats are no longer converted: a meta
-file with another `format_version`, or a data file that still has an
-`IMAGE_ID`, `SOURCE_URL` or `THUMBNAIL_URL` column (format v3 and older), is
-rejected without echoing any value; re-export such studies as format v4.
+never contacts cBioPortal, a database, or the artifact store.
 
 ```bash
 python scripts/importer/convertWsiToResources.py \
   --meta-wsi /path/to/legacy/meta_wsi.txt \
   --output-dir /path/to/converted \
-  --portal-base-url https://portal.example.org/cbioportal \
-  --study-dir /path/to/study
+  --portal-base-url https://portal.example.org/cbioportal
 ```
 
-- `--meta-wsi` (required): the legacy meta file; its `data_filename` is read
-  from the same directory.
-- `--output-dir` (required): where the converted files are written.
-- `--portal-base-url` (required): absolute `http`/`https` URL of the portal,
-  optionally with a context path; a trailing slash is ignored. It builds the
-  viewer links shown above.
+- `--meta-wsi`: the legacy meta file; its `data_filename` is read from the
+  same directory.
+- `--output-dir`: where the converted files are written.
+- `--portal-base-url`: absolute `http`/`https` URL of the portal, optionally
+  with a context path; a trailing slash is ignored. It builds the viewer
+  links.
 - `--study-dir` (optional, recommended): the study the output will join. The
   converter merges the slide counts into copies of the study's clinical files
   (see [Slide counts](#slide-counts)). It must differ from `--output-dir`.
 
-Leading `#` rows are skipped, the header must match format v4 exactly,
-`MATCH_LEVEL` must agree with `SAMPLE_ID`, `SLIDE_TYPE` and the stain flags
-must satisfy the rules above, an `UNMATCHED` reference sample is dropped, and
-serving fields are dropped when `CAN_SERVE_TILES=FALSE`. `SLIDE_KEY` is required, must be 32
-lowercase hex characters and unique. `SEALED_SOURCE` must have the
-[sealed-source shape](#sealed-source), is required when `CAN_SERVE_TILES=TRUE`
-and must be empty otherwise; it is copied verbatim into `wsi_serving`. Error
-messages name the column, never the value. Free-text cells are copied as
-given; de-identifying them is the data provider's responsibility. Run
-`validateData.py` on the study afterwards; the converter does not
-re-implement the tile metadata contract.
-
-Rows are streamed, so memory does not grow with the slide metadata. The output is staged
-in a hidden `.<output dir name>.*.partial` directory next to `--output-dir`
-and only moved into it when the whole conversion succeeds, so a failed run
-writes nothing there.
+The converter fails on the first row that breaks the
+[row contract](#row-contract). It drops `BARCODE`, `PART_DESIGNATOR` and
+`PATH_DX_TITLE`, an `UNMATCHED` reference sample, and the `wsi_serving`
+object of rows with `CAN_SERVE_TILES=FALSE`; it copies `SEALED_SOURCE`
+verbatim. Rows are streamed, and the output is staged in a hidden
+`.<output dir name>.*.partial` directory next to `--output-dir`, so a failed
+run writes nothing there. Run `validateData.py` on the study afterwards.
 
 The converter always writes the resource files; each pair is only written
 when it has rows:
@@ -217,9 +196,7 @@ With `--study-dir`, the converter fails without writing anything if:
 - the study has more than one clinical sample or clinical patient meta file;
 - the study has no clinical patient file (every slide's patient must be listed),
   or no clinical sample file while some slide is matched to a sample;
-- a clinical file to merge lacks the four `#` attribute header rows;
-- the study already has a resource definition, sample resource, or patient
-  resource file.
+- a clinical file to merge lacks the four `#` attribute header rows.
 
 ### Slide counts
 
@@ -253,23 +230,16 @@ clinical data, re-importing corrected files replaces them.
 
 ### Timeline
 
-The converter does not produce timeline data. Pathology procedure events stay
-in the study's existing clinical timeline files, which are imported unchanged.
-Slides carry no timing in `METADATA`.
-
-`PATHOLOGY SLIDES` timeline events reach the browser through the clinical
-events API, so they must not carry real slide identifiers: `validateData.py`
-and `ImportTimelineData` reject such events when they have a non-blank
-`IMAGE_ID` or `IMAGE_IDS` column (again without echoing the value); slides
-are addressed by their opaque key. `SPECIMEN`/`LINKOUT` should carry only the
-opaque specimen key; other free-text columns are the data provider's
-responsibility to de-identify.
+The converter does not produce timeline data, and slides carry no timing in
+`METADATA`. Pathology procedure events stay in the study's clinical timeline
+files. `PATHOLOGY SLIDES` events reach the browser through the clinical events
+API, so `validateData.py` and `ImportTimelineData` reject such events with a
+non-blank `IMAGE_ID` or `IMAGE_IDS` column (without echoing the value).
+`SPECIMEN`/`LINKOUT` should carry only the opaque specimen key.
 
 ## Legacy format v4
 
 This is the converter's only input format.
-
-### Legacy metadata
 
 ```text
 cancer_study_identifier: <study stable id>
@@ -279,49 +249,19 @@ data_filename: data_wsi.txt
 format_version: 4
 ```
 
-The converter rejects unsupported format versions. A legacy study has one WSI
-pair. The data file follows the normal cBioPortal five-row preamble: four
-comment rows, followed by this exact header:
+The data file has the normal cBioPortal preamble of four `#` rows, then this
+exact header (tab-delimited, 30 columns):
 
 ```text
 PATIENT_ID  REFERENCE_SAMPLE_ID  SAMPLE_ID  PART_KEY  PART_NUMBER  PART_DESIGNATOR  PART_TYPE  PART_DESCRIPTION  SUBSPECIALTY  PATH_DX_TITLE  BLOCK_KEY  BLOCK_NUMBER  BLOCK_LABEL  MATCH_LEVEL  SPECIMEN_KEY  STAIN_NAME  STAIN_GROUP  IS_HNE  IS_IHC  MAGNIFICATION  FILE_SIZE_BYTES  BARCODE  SLIDE_TYPE  CAN_SERVE_TILES  TILE_METADATA_JSON  THUMBNAIL_WIDTH  THUMBNAIL_HEIGHT  THUMBNAIL_CONTENT_TYPE  SLIDE_KEY  SEALED_SOURCE
 ```
 
-Values are tab-delimited; a row has 30 columns. `SLIDE_KEY` is the opaque
-slide key described under [Resource files](#resource-files) and
-`SEALED_SOURCE` (last) the [sealed source](#sealed-source). Files that
-still carry the seven slide-timing columns (`TIMELINE_START_DAYS` through
-`TIMEPOINT_SOURCE`) between `THUMBNAIL_CONTENT_TYPE` and `SLIDE_KEY` (37
-columns) are accepted, but those columns are ignored for now: they are neither
-required, validated nor converted. A file with an `IMAGE_ID`, `SOURCE_URL`
-or `THUMBNAIL_URL` column (format v3 and older) is rejected.
-Required values are `PATIENT_ID`,
-`PART_KEY`, `BLOCK_KEY`, `MATCH_LEVEL`, `SPECIMEN_KEY`, `IS_HNE`, `IS_IHC`,
-`CAN_SERVE_TILES` and `SLIDE_KEY`. `MATCH_LEVEL` is `BLOCK`, `PART`, or `UNMATCHED`;
-matched rows require `SAMPLE_ID`, while unmatched rows leave it blank.
-
-`SLIDE_KEY` is unique within a study. Repeated part and block keys must carry
-the same descriptive values. Stable patient, sample, and reference-sample IDs
-must resolve to the study, and a sample/reference sample must belong to the
-row's patient. `TILE_METADATA_JSON` must be a JSON object when present. For
-servable rows, it must contain positive `dimensions.width` and
-`dimensions.height`, a positive `levels` count with one positive
-`level_dimensions` entry per level, a nonnegative `max_zoom`, and a positive
-`tile_size`; additional producer-defined fields are preserved. When
-`CAN_SERVE_TILES=TRUE`, the sealed source, tile metadata, thumbnail dimensions
-between 1 and 8192, and an `image/*` thumbnail content type are mandatory;
-when it is `FALSE`, `SEALED_SOURCE` must be empty. Core never sees the source
-or thumbnail URIs, so it does not check them: the tile server validates the
-URIs it unseals (scheme, allowlisted roots, extensions).
-The converter drops the artifact columns for non-servable rows. Core does
-not perform de-identification scanning of free text; the data provider
-(upstream publication pipeline) is responsible for removing protected health
-information and deployment-specific identifiers before export.
-
-The converter and validator assume these values were already materialized by
-the upstream artifact-generation/export pipeline. They do not discover source
-slides, generate thumbnails, read a producer-specific registry, or write the
-object store.
+A file may also carry the seven slide-timing columns (`TIMELINE_START_DAYS`
+through `TIMEPOINT_SOURCE`) between `THUMBNAIL_CONTENT_TYPE` and `SLIDE_KEY`
+(37 columns); the converter ignores them. Other format versions, and files
+with an `IMAGE_ID`, `SOURCE_URL` or `THUMBNAIL_URL` column, are rejected.
+`PATIENT_ID` is required, booleans are `TRUE` or `FALSE`, and
+`TILE_METADATA_JSON` is a JSON object when set.
 
 ## ClickHouse storage
 
@@ -329,7 +269,4 @@ Resource rows are stored in `resource_data` and definitions in
 `resource_definition`. Resource row IDs (`RESOURCE_DATA_ID`) come from the
 importer's sequence, so they stay unique across importer processes.
 Re-importing a resource file replaces the study's rows for the resource IDs in
-that file, and study deletion removes them.
-
-WSI data has no tables of its own: core neither writes nor deletes any
-`wsi_*` table, and the backend schema has none from migration 3.7.0 on.
+that file, and study deletion removes them. WSI data has no tables of its own.

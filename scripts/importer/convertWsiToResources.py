@@ -1,52 +1,18 @@
 #!/usr/bin/env python3
-"""Convert a legacy WSI file pair (format v4) into standard cBioPortal study files.
+"""Convert a legacy WSI file pair (format v4) into standard cBioPortal resource files.
 
-The converter is deliberately offline: it never connects to cBioPortal, a
-database, or an artifact store. It reads ``meta_wsi.txt``/``data_wsi.txt``,
-parses and normalizes the slide rows, and writes:
-
-* ``data_resource_definition.txt`` with the ``WSI_SAMPLE``/``WSI_PATIENT``
-  definitions that have rows;
-* ``data_resource_sample.txt`` for slides matched to a sample (``PART`` or
-  ``BLOCK``) and ``data_resource_patient.txt`` for unmatched slides; each row
-  links to the standalone viewer by its opaque ``slide_key`` and carries the
-  slide metadata as JSON;
-* six ``WSI_*`` slide-count attributes, counting only viewable (``CAN_SERVE_TILES``) slides: with
-  ``--study-dir``, merged into copies of the study's clinical sample and
-  patient files (same file names); without it, as standalone
-  ``data_clinical_sample_wsi_counts.txt``/``data_clinical_patient_wsi_counts.txt``
-  pairs for studies without clinical files of their own or for hand merging;
-
-each with its meta file. A generated data/meta pair is only written when it has rows.
-Timeline files are not produced: existing clinical timeline files stay in the
-study and are imported unchanged.
-
-Only format v4 is accepted: 30 columns ending with the opaque ``SLIDE_KEY``
-(32 lowercase hex characters, unique per study) and ``SEALED_SOURCE``. Files
-that also carry the seven slide-timing columns before ``SLIDE_KEY`` (37
-columns) are accepted, but those columns are ignored: they are neither
-validated nor written. Files with an ``IMAGE_ID``, ``SOURCE_URL`` or
-``THUMBNAIL_URL`` column (format v3 and older) are rejected.
-De-identification (contract wsi-serving-v6, sealed source): the pathology
-image ID and the object URIs that embed it never reach the study files. The
-upstream pipeline seals them into ``SEALED_SOURCE``, an opaque value only the
-tile server can open; it is copied verbatim into the private ``wsi_serving``
-metadata of servable slides. The URL and ``DISPLAY_NAME`` carry only the
-slide key and non-identifying labels, and ``BARCODE``/``PART_DESIGNATOR``/
-``PATH_DX_TITLE`` are not written. The data provider is responsible for
-de-identifying the remaining free-text cells. Error messages name columns,
-never values.
-
-Rows are streamed, so large studies convert in bounded memory; output is
-staged next to ``--output-dir`` and only moved there when the conversion
-succeeds. The output is not validated here beyond the row contract checked
-while parsing; run ``validateData.py`` on the study after adding the files.
+Runs offline. Reads ``meta_wsi.txt``/``data_wsi.txt`` and writes the
+``WSI_SAMPLE``/``WSI_PATIENT`` resource definition, sample and patient files and the
+WSI slide-count clinical attributes.
+This module also holds the WSI row contract that validateData.py checks resource
+rows against. The formats and rules are described in docs/wsi-study-format.md.
 """
 
 import argparse
 import base64
 import binascii
 import json
+import math
 import os
 import re
 import shutil
@@ -56,10 +22,10 @@ from pathlib import Path
 from urllib.parse import quote, urlparse
 
 
-# The WSI row contract below (resource IDs, columns, slide key, sealed source, slide
-# types, stain rule) is also what validateData.py checks WSI_SAMPLE/WSI_PATIENT rows against.
+# The WSI row contract below is also what validateData.py checks WSI_SAMPLE/WSI_PATIENT rows against.
 SAMPLE_RESOURCE_ID = "WSI_SAMPLE"
 PATIENT_RESOURCE_ID = "WSI_PATIENT"
+WSI_RESOURCE_IDS = (SAMPLE_RESOURCE_ID, PATIENT_RESOURCE_ID)
 
 # Slide-timing columns that some files still carry before SLIDE_KEY.
 # They are accepted but ignored: neither validated nor written to the metadata.
@@ -96,14 +62,28 @@ PUBLIC_STRING_FIELDS = [
     "BLOCK_NUMBER", "BLOCK_LABEL", "MATCH_LEVEL", "SPECIMEN_KEY", "STAIN_NAME",
     "STAIN_GROUP", "MAGNIFICATION", "SLIDE_TYPE",
 ]
+BOOLEAN_FIELDS = ["IS_HNE", "IS_IHC", "CAN_SERVE_TILES"]
+# The METADATA keys by JSON type, named by their format-v4 column.
+PUBLIC_FIELD_TYPES = ([(field, "string") for field in PUBLIC_STRING_FIELDS + ["REFERENCE_SAMPLE_ID"]]
+                      + [(field, "boolean") for field in BOOLEAN_FIELDS]
+                      + [("FILE_SIZE_BYTES", "integer")])
+REQUIRED_FIELDS = ["SLIDE_KEY", "PART_KEY", "BLOCK_KEY", "MATCH_LEVEL", "SPECIMEN_KEY"] + BOOLEAN_FIELDS
 SERVING_KEY = "wsi_serving"
+SERVING_FIELD_TYPES = [("SEALED_SOURCE", "string"), ("TILE_METADATA_JSON", "object"),
+                       ("THUMBNAIL_WIDTH", "integer"), ("THUMBNAIL_HEIGHT", "integer"),
+                       ("THUMBNAIL_CONTENT_TYPE", "string")]
+SERVING_FIELDS = [field for field, _ in SERVING_FIELD_TYPES]
+# Keys that would carry the pathology image ID or an object URI embedding it; those values exist
+# only inside the sealed source.
+UNSEALED_SOURCE_KEYS = ("image_id", "source_url", "thumbnail_url")
+FORBIDDEN_PUBLIC_KEYS = UNSEALED_SOURCE_KEYS + ("barcode", "part_designator", "path_dx_title",
+                                                "sealed_source")
 # The CUSTOM_METADATA contract of both WSI resource definitions: every public metadata key the
 # converter writes, so validateData.py's undeclared-key check holds for converted files. The
 # private wsi_serving object is not a column and is never declared. Keys that identify a single
 # slide or specimen (nearly every row has its own value) and free text are not filterable;
 # otherwise the portal's resource table would list every distinct value as a filter option (over
-# a million for slide_key on a large study). Keys, types and labels of the stain, magnification,
-# part, block and match-level columns follow the backend's study slide table.
+# a million for slide_key on a large study).
 CONTRACT_FIELDS = [
     # (key, type, label, filterable, visibleByDefault)
     ("stain_name", "string", "Stain", True, True),
@@ -144,6 +124,11 @@ SEALED_SOURCE_MAX_LENGTH = 4096
 
 MATCH_LEVELS = ("BLOCK", "PART", "UNMATCHED")
 SLIDE_TYPES = ("H&E", "IHC", "Other", "Unknown")
+MAX_THUMBNAIL_DIMENSION = 8192
+# Tile metadata the browser and tile server read (schema version 2, as the backend requires).
+TILE_METADATA_SCHEMA_VERSION = 2
+DECODE_POLICY_VERSION = "geometry-v2;tile-max=16777216;thumbnail-max=16777216"
+MAX_DECODE_PIXELS = 16777216
 
 # The count attributes. They count only slides the viewer can open.
 SAMPLE_COUNT_ATTRIBUTES = [
@@ -347,118 +332,243 @@ def stain_flags_valid(slide_type, is_hne, is_ihc):
             and (slide_type not in ("Other", "Unknown") or (not is_hne and not is_ihc)))
 
 
+def _positive_ints(value, names):
+    return isinstance(value, dict) and all(
+        type(value.get(name)) is int and value[name] > 0 for name in names)
+
+
+def tile_metadata_valid(metadata):
+    """Whether a tile metadata object follows schema version 2."""
+    levels = metadata.get("levels")
+    level_dimensions = metadata.get("level_dimensions")
+    downsamples = metadata.get("level_downsamples")
+    max_zoom = metadata.get("max_zoom")
+    safe_min_level = metadata.get("safe_min_level")
+    return (
+        _positive_ints(metadata.get("dimensions"), ("width", "height"))
+        and type(levels) is int and levels > 0
+        and isinstance(level_dimensions, list) and len(level_dimensions) == levels
+        and all(_positive_ints(level, ("width", "height")) for level in level_dimensions)
+        and type(max_zoom) is int and max_zoom >= 0
+        and _positive_ints(metadata, ("tile_size",))
+        and type(metadata.get("tile_metadata_schema_version")) is int
+        and metadata["tile_metadata_schema_version"] == TILE_METADATA_SCHEMA_VERSION
+        and type(safe_min_level) is int and 0 <= safe_min_level <= max_zoom
+        and isinstance(downsamples, list) and len(downsamples) == levels
+        and all(type(value) in (int, float) and math.isfinite(value) and value > 0
+                for value in downsamples)
+        and metadata.get("decode_policy_version") == DECODE_POLICY_VERSION
+        and all(type(metadata.get(name)) is int and metadata[name] == MAX_DECODE_PIXELS
+                for name in ("max_decode_pixels", "thumbnail_max_decode_pixels")))
+
+
+_MEDIA_TYPE_TOKEN = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")
+
+
+def image_content_type_valid(value):
+    """Whether a value is a bare ``image/<subtype>`` media type."""
+    media_type = value.strip().lower()
+    return (media_type.startswith("image/")
+            and bool(_MEDIA_TYPE_TOKEN.fullmatch(media_type[len("image/"):])))
+
+
+def _well_typed(value, kind):
+    if kind == "boolean":
+        return isinstance(value, bool)
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    return isinstance(value, dict if kind == "object" else str)
+
+
+def _typed_values(source, field_types, problems):
+    """Return {field: value} of the set, well-typed keys of ``source``; report the others."""
+    values = {}
+    for field, kind in field_types:
+        value = source.get(field.lower())
+        if value is None:
+            continue
+        if _well_typed(value, kind):
+            values[field] = value
+        else:
+            problems.append((field, f"{field} must be a JSON {kind}"))
+    return values
+
+
+def slide_problems(metadata, sample_id):
+    """Return (field, message) for each WSI rule a slide's METADATA object breaks; [] when it holds.
+
+    ``metadata`` is a WSI resource row's METADATA object and ``sample_id`` its SAMPLE_ID ('' for
+    patient rows); the study-wide rules are in SlideRegistry. The converter fails on the first
+    problem and validateData.py reports each of them. Fields are format-v4 column names or
+    METADATA keys; messages name fields, never values.
+    """
+    problems = [(key, f"METADATA must not contain {key}")
+                for key in FORBIDDEN_PUBLIC_KEYS if key in metadata]
+    values = _typed_values(metadata, PUBLIC_FIELD_TYPES, problems)
+    for field in REQUIRED_FIELDS:
+        if metadata.get(field.lower()) in (None, ""):
+            problems.append((field, f"{field} is required"))
+    slide_key = values.get("SLIDE_KEY")
+    if slide_key and not SLIDE_KEY_PATTERN.fullmatch(slide_key):
+        problems.append(("SLIDE_KEY", "SLIDE_KEY must be 32 lowercase hex characters"))
+    for field in ("PART_KEY", "BLOCK_KEY"):
+        if "?" in values.get(field, ""):
+            problems.append((field, f"{field} must not contain ?"))
+    match_level = values.get("MATCH_LEVEL")
+    if match_level and match_level not in MATCH_LEVELS:
+        problems.append(("MATCH_LEVEL", "MATCH_LEVEL must be " + ", ".join(MATCH_LEVELS)))
+    if match_level == "UNMATCHED" and sample_id:
+        problems.append(("SAMPLE_ID", "UNMATCHED slides cannot have a SAMPLE_ID"))
+    if match_level in ("BLOCK", "PART") and not sample_id:
+        problems.append(("SAMPLE_ID", "matched slides require a SAMPLE_ID"))
+    if values.get("REFERENCE_SAMPLE_ID", "").upper() == "UNMATCHED":
+        problems.append(("REFERENCE_SAMPLE_ID",
+                         "REFERENCE_SAMPLE_ID must be omitted, not UNMATCHED, when there is none"))
+    slide_type = values.get("SLIDE_TYPE")
+    if slide_type not in SLIDE_TYPES:
+        problems.append(("SLIDE_TYPE", "SLIDE_TYPE must be one of " + ", ".join(SLIDE_TYPES)))
+    elif ("IS_HNE" in values and "IS_IHC" in values
+          and not stain_flags_valid(slide_type, values["IS_HNE"], values["IS_IHC"])):
+        problems.append(("SLIDE_TYPE", "IS_HNE/IS_IHC are inconsistent with SLIDE_TYPE"))
+    if values.get("FILE_SIZE_BYTES", 0) < 0:
+        problems.append(("FILE_SIZE_BYTES", "FILE_SIZE_BYTES cannot be negative"))
+    return problems + _serving_problems(metadata.get(SERVING_KEY, {}), values.get("CAN_SERVE_TILES"))
+
+
+def _serving_problems(serving, can_serve):
+    if not isinstance(serving, dict):
+        return [(SERVING_KEY, f"{SERVING_KEY} must be a JSON object")]
+    problems = [(f"{SERVING_KEY}.{key}",
+                 f"{SERVING_KEY} must not contain {key}; the image ID and object URIs are only "
+                 f"carried inside the sealed source")
+                for key in UNSEALED_SOURCE_KEYS if key in serving]
+    values = _typed_values(serving, SERVING_FIELD_TYPES, problems)
+    # SEALED_SOURCE is opaque and only the tile server can open it; never echo it.
+    sealed_source = values.get("SEALED_SOURCE")
+    if sealed_source and not sealed_source_valid(sealed_source):
+        problems.append(("SEALED_SOURCE", "SEALED_SOURCE must be unpadded base64url of at least "
+                         f"{SEALED_SOURCE_MIN_BYTES} bytes and at most {SEALED_SOURCE_MAX_LENGTH} "
+                         f"characters"))
+    if can_serve is not True:
+        if can_serve is False and sealed_source:
+            problems.append(("SEALED_SOURCE", "SEALED_SOURCE must be empty when CAN_SERVE_TILES is FALSE"))
+        return problems
+    for field in SERVING_FIELDS:
+        if serving.get(field.lower()) in (None, ""):
+            problems.append((field, f"{field} is required when CAN_SERVE_TILES is TRUE"))
+    tile_metadata = values.get("TILE_METADATA_JSON")
+    if tile_metadata is not None and not tile_metadata_valid(tile_metadata):
+        problems.append(("TILE_METADATA_JSON", "TILE_METADATA_JSON must follow tile metadata "
+                         f"schema version {TILE_METADATA_SCHEMA_VERSION}"))
+    for field in ("THUMBNAIL_WIDTH", "THUMBNAIL_HEIGHT"):
+        if field in values and not 1 <= values[field] <= MAX_THUMBNAIL_DIMENSION:
+            problems.append((field, f"{field} must be between 1 and {MAX_THUMBNAIL_DIMENSION}"))
+    content_type = values.get("THUMBNAIL_CONTENT_TYPE")
+    if content_type and not image_content_type_valid(content_type):
+        problems.append(("THUMBNAIL_CONTENT_TYPE", "THUMBNAIL_CONTENT_TYPE must be an image media type"))
+    return problems
+
+
+def _string(metadata, key):
+    value = metadata.get(key)
+    return value if isinstance(value, str) else ""
+
+
+class SlideRegistry:
+    """The study-wide WSI rules: each SLIDE_KEY once, one reference sample (or none) per
+    patient, and the same part and block values wherever a part or block key repeats."""
+
+    PART_KEYS = ("part_number", "part_type", "part_description", "subspecialty")
+    BLOCK_KEYS = ("block_number", "block_label")
+
+    def __init__(self):
+        self.slide_keys = set()
+        self.references = {}
+        self.reference_conflicts = set()
+        self.parts = {}
+        self.blocks = {}
+
+    def problems(self, patient_id, metadata):
+        """Record one slide's METADATA; return (field, message) for each rule it breaks."""
+        problems = []
+        slide_key = _string(metadata, "slide_key")
+        if slide_key in self.slide_keys:
+            problems.append(("SLIDE_KEY", "SLIDE_KEY must be unique within a study"))
+        elif slide_key:
+            self.slide_keys.add(slide_key)
+        reference = _string(metadata, "reference_sample_id")
+        if (self.references.setdefault(patient_id, reference) != reference
+                and patient_id not in self.reference_conflicts):
+            # reported once per patient
+            self.reference_conflicts.add(patient_id)
+            problems.append(("REFERENCE_SAMPLE_ID", "all slides of a patient must have the same "
+                             "REFERENCE_SAMPLE_ID, or all omit it"))
+        part_key = _string(metadata, "part_key")
+        block_key = _string(metadata, "block_key")
+        part = tuple(metadata.get(key) for key in self.PART_KEYS)
+        if part_key and self.parts.setdefault((patient_id, part_key), part) != part:
+            problems.append(("PART_KEY", "slides of the same PART_KEY have different part values"))
+        block = tuple(metadata.get(key) for key in self.BLOCK_KEYS)
+        if (part_key and block_key
+                and self.blocks.setdefault((patient_id, part_key, block_key), block) != block):
+            problems.append(("BLOCK_KEY", "slides of the same BLOCK_KEY have different block values"))
+        return problems
+
+
 def normalize_row(row, line):
-    """Parse one row and return its metadata object."""
-    metadata = {}
-    for field in PUBLIC_STRING_FIELDS:
-        if row[field]:
-            metadata[field.lower()] = row[field]
+    """Parse one legacy row and return its metadata object."""
+    metadata = {field.lower(): row[field] for field in PUBLIC_STRING_FIELDS if row[field]}
     reference = row["REFERENCE_SAMPLE_ID"]
     if reference and reference.upper() != "UNMATCHED":
         metadata["reference_sample_id"] = reference
-    metadata["is_hne"] = _boolean(row, "IS_HNE", line)
-    metadata["is_ihc"] = _boolean(row, "IS_IHC", line)
-    can_serve = _boolean(row, "CAN_SERVE_TILES", line)
-    metadata["can_serve_tiles"] = can_serve
-    if row["SLIDE_TYPE"] not in SLIDE_TYPES:
-        _fail(line, "SLIDE_TYPE must be one of " + ", ".join(SLIDE_TYPES))
-    if not stain_flags_valid(row["SLIDE_TYPE"], metadata["is_hne"], metadata["is_ihc"]):
-        _fail(line, "IS_HNE/IS_IHC are inconsistent with SLIDE_TYPE " + row["SLIDE_TYPE"])
-
+    for field in BOOLEAN_FIELDS:
+        metadata[field.lower()] = _boolean(row, field, line)
     file_size = _optional_int(row, "FILE_SIZE_BYTES", line)
     if file_size is not None:
-        if file_size < 0:
-            _fail(line, "FILE_SIZE_BYTES cannot be negative")
         metadata["file_size_bytes"] = file_size
-
-    thumbnail_width = _optional_int(row, "THUMBNAIL_WIDTH", line)
-    thumbnail_height = _optional_int(row, "THUMBNAIL_HEIGHT", line)
-    for value in (thumbnail_width, thumbnail_height):
-        if value is not None and not 0 <= value <= 0xFFFFFFFF:
-            _fail(line, "thumbnail dimension is out of range")
     tile_metadata = None
     if row["TILE_METADATA_JSON"]:
         try:
             tile_metadata = json.loads(row["TILE_METADATA_JSON"])
         except ValueError:
-            tile_metadata = None
+            pass
         if not isinstance(tile_metadata, dict):
             _fail(line, "TILE_METADATA_JSON must be a JSON object")
-
-    # SEALED_SOURCE is opaque and may only be opened by the tile server; never echo it.
-    sealed_source = row["SEALED_SOURCE"]
-    if sealed_source and not sealed_source_valid(sealed_source):
-        _fail(line, "SEALED_SOURCE must be unpadded base64url of at least "
-                    f"{SEALED_SOURCE_MIN_BYTES} bytes and at most {SEALED_SOURCE_MAX_LENGTH} characters")
-    if not can_serve:
-        if sealed_source:
-            _fail(line, "SEALED_SOURCE must be empty when CAN_SERVE_TILES is FALSE")
-        # Non-servable rows have no private serving object.
-        return metadata
-    for field in ("SEALED_SOURCE", "TILE_METADATA_JSON", "THUMBNAIL_CONTENT_TYPE"):
-        _require(row, field, line)
-    for value in (thumbnail_width, thumbnail_height):
-        if value is None or not 1 <= value <= 8192:
-            _fail(line, "servable thumbnail dimensions must be between 1 and 8192")
-    metadata[SERVING_KEY] = {
-        "sealed_source": sealed_source,
+    serving = {
+        "sealed_source": row["SEALED_SOURCE"],
         "tile_metadata_json": tile_metadata,
-        "thumbnail_width": thumbnail_width,
-        "thumbnail_height": thumbnail_height,
+        "thumbnail_width": _optional_int(row, "THUMBNAIL_WIDTH", line),
+        "thumbnail_height": _optional_int(row, "THUMBNAIL_HEIGHT", line),
         "thumbnail_content_type": row["THUMBNAIL_CONTENT_TYPE"],
     }
+    metadata[SERVING_KEY] = {key: value for key, value in serving.items() if value not in (None, "")}
+    problems = slide_problems(metadata, row["SAMPLE_ID"])
+    if problems:
+        _fail(line, problems[0][1])
+    if not metadata["can_serve_tiles"]:
+        # Non-servable rows have no private serving object.
+        del metadata[SERVING_KEY]
     return metadata
 
 
 class SlideParser:
-    """Normalize rows one at a time, applying the cross-row consistency checks."""
+    """Normalize rows one at a time, applying the study-wide rules."""
 
     def __init__(self):
-        self.slide_keys = set()
-        self.patient_references = {}
-        self.parts = {}
-        self.blocks = {}
+        self.registry = SlideRegistry()
 
     def parse(self, line, row):
         patient_id = _require(row, "PATIENT_ID", line)
-        slide_key = _require(row, "SLIDE_KEY", line)
-        if not SLIDE_KEY_PATTERN.fullmatch(slide_key):
-            _fail(line, "SLIDE_KEY must be 32 lowercase hex characters")
-        if slide_key in self.slide_keys:
-            _fail(line, "SLIDE_KEY is not unique")
-        self.slide_keys.add(slide_key)
-        part_key = _require(row, "PART_KEY", line)
-        block_key = _require(row, "BLOCK_KEY", line)
-        if "?" in part_key or "?" in block_key:
-            _fail(line, "part/block keys cannot contain ?")
-        match_level = row["MATCH_LEVEL"]
-        if match_level not in MATCH_LEVELS:
-            _fail(line, "invalid MATCH_LEVEL")
-        sample_id = row["SAMPLE_ID"]
-        if match_level == "UNMATCHED" and sample_id:
-            _fail(line, "UNMATCHED rows cannot have SAMPLE_ID")
-        if match_level != "UNMATCHED" and not sample_id:
-            _fail(line, "matched rows require SAMPLE_ID")
-        reference = row["REFERENCE_SAMPLE_ID"]
-        reference = reference if reference and reference.upper() != "UNMATCHED" else None
-        if self.patient_references.setdefault(patient_id, reference) != reference:
-            _fail(line, "patient has conflicting reference samples")
-        part = tuple(row[field] for field in (
-            "PART_NUMBER", "PART_DESIGNATOR", "PART_TYPE",
-            "PART_DESCRIPTION", "SUBSPECIALTY", "PATH_DX_TITLE"))
-        if self.parts.setdefault((patient_id, part_key), part) != part:
-            _fail(line, "conflicting part metadata")
-        block = (row["BLOCK_NUMBER"], row["BLOCK_LABEL"])
-        if self.blocks.setdefault((patient_id, part_key, block_key), block) != block:
-            _fail(line, "conflicting block metadata")
-        _require(row, "SPECIMEN_KEY", line)
         metadata = normalize_row(row, line)
+        problems = self.registry.problems(patient_id, metadata)
+        if problems:
+            _fail(line, problems[0][1])
         return {
             "patient_id": patient_id,
-            "sample_id": sample_id or None,
-            "slide_key": slide_key,
+            "sample_id": row["SAMPLE_ID"] or None,
+            "slide_key": metadata["slide_key"],
             "display_name": display_name(row),
-            "match_level": match_level,
+            "match_level": metadata["match_level"],
             "metadata": metadata,
         }
 
@@ -573,11 +683,9 @@ def _find_clinical_meta(study_dir, datatype):
 
 
 def check_study_conflicts(study_dir):
-    """Refuse to emit files that would duplicate definitions already in the study."""
+    """Refuse to merge counts into a study whose clinical files already define them."""
     study_dir = Path(study_dir)
-    problems = []
     clinical_files = set(study_dir.glob("data_clinical*"))
-    resource_meta = []
     for meta_path in sorted(study_dir.iterdir()):
         if not meta_path.is_file() or "meta" not in meta_path.name.lower():
             continue
@@ -587,17 +695,12 @@ def check_study_conflicts(study_dir):
             continue
         if meta.get("genetic_alteration_type") == "CLINICAL" and meta.get("data_filename"):
             clinical_files.add(study_dir / meta["data_filename"])
-        if meta.get("resource_type") in ("DEFINITION", "SAMPLE", "PATIENT"):
-            resource_meta.append((meta_path.name, meta["resource_type"]))
+    problems = []
     for path in sorted(clinical_files):
         duplicated = sorted(COUNT_ATTRIBUTE_IDS.intersection(_data_header(path)))
         if duplicated:
             problems.append(f"{path.name} already defines {', '.join(duplicated)}; remove those "
                             f"columns first (the converted counts replace them)")
-    for name, resource_type in resource_meta:
-        problems.append(
-            f"{name} already provides a {resource_type} resource file; a study may contain only one, "
-            f"so merge the converted rows into it instead")
     if problems:
         raise ConversionError(
             "the study directory already contains data the converter would duplicate:\n  - "
@@ -898,8 +1001,7 @@ def interface(args=None):
                              "(e.g. https://example.org/cbioportal); used for viewer links")
     parser.add_argument("--study-dir", type=Path,
                         help="study directory the output joins: its clinical sample/patient files "
-                             "are copied to --output-dir with the WSI count columns appended, and "
-                             "it is checked for files the output would duplicate")
+                             "are copied to --output-dir with the WSI count columns appended")
     return parser.parse_args(args)
 
 
