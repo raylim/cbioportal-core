@@ -27,14 +27,8 @@ SAMPLE_RESOURCE_ID = "WSI_SAMPLE"
 PATIENT_RESOURCE_ID = "WSI_PATIENT"
 WSI_RESOURCE_IDS = (SAMPLE_RESOURCE_ID, PATIENT_RESOURCE_ID)
 
-# Slide-timing columns that some files still carry before SLIDE_KEY.
-# They are accepted but ignored: neither validated nor written to the metadata.
-IGNORED_TIMING_COLUMNS = (
-    "TIMELINE_START_DAYS", "TIMELINE_DATE_STATUS", "TIMELINE_DATE_KIND",
-    "TIMELINE_DATE_SOURCE", "TIMELINE_DATE_REASON", "TIMELINE_COORDINATE_SYSTEM",
-    "TIMEPOINT_SOURCE",
-)
-# Format version 4 (30 columns).
+# Format version 4 (30 columns). Slide timing is not part of it: it belongs in
+# the study's pathology timeline file.
 COLUMNS = [
     "PATIENT_ID", "REFERENCE_SAMPLE_ID", "SAMPLE_ID",
     "PART_KEY", "PART_NUMBER", "PART_DESIGNATOR", "PART_TYPE",
@@ -46,8 +40,6 @@ COLUMNS = [
     "THUMBNAIL_HEIGHT", "THUMBNAIL_CONTENT_TYPE",
     "SLIDE_KEY", "SEALED_SOURCE",
 ]
-# The same with the ignored timing columns before SLIDE_KEY (37 columns).
-COLUMNS_WITH_IGNORED_TIMING = COLUMNS[:-2] + list(IGNORED_TIMING_COLUMNS) + COLUMNS[-2:]
 # Format-v3 columns that carry the image ID or an object URI embedding it. A header
 # with any of them is rejected outright.
 REMOVED_COLUMNS = ("IMAGE_ID", "SOURCE_URL", "THUMBNAIL_URL")
@@ -250,11 +242,9 @@ def _iter_lines(path, what):
 def iter_rows(data_path):
     """Stream the legacy data file: leading '#' rows, the exact header, then slide rows.
 
-    The header must be ``COLUMNS`` or ``COLUMNS_WITH_IGNORED_TIMING``. Yields
-    (line number, row dict with stripped values) and raises if the file has no
-    slide rows. Ignored timing columns stay in the row dict; nothing reads them.
+    The header must be exactly ``COLUMNS``. Yields (line number, row dict with
+    stripped values) and raises if the file has no slide rows.
     """
-    accepted = [COLUMNS, COLUMNS_WITH_IGNORED_TIMING]
     lines = _iter_lines(data_path, "WSI data file")
     header = None
     for line_number, line in lines:
@@ -267,8 +257,10 @@ def iter_rows(data_path):
         raise ConversionError(
             f"{data_path}: WSI data has {', '.join(removed)} column(s) of format v3 or older; "
             f"format v4 replaces them with SEALED_SOURCE: re-export data_wsi.txt")
-    if header is None or header.split("\t") not in accepted:
-        raise ConversionError(f"{data_path}: WSI data has an invalid header or column order")
+    if header is None or header.split("\t") != COLUMNS:
+        raise ConversionError(
+            f"{data_path}: WSI data has an invalid header or column order; "
+            f"expected the {len(COLUMNS)}-column format v4 header")
     columns = header.split("\t")
     width = len(columns)
     found = False
