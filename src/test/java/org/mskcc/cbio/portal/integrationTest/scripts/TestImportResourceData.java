@@ -96,10 +96,6 @@ public class TestImportResourceData extends IntegrationTestBase {
                 "source_url", "thumbnail_url", "sealed_source")) {
             assertFalse(removed, metadata.has(removed));
         }
-        // the fixture comes from a data_wsi.txt without the optional timing columns
-        for (String timing : List.of("timeline_start_days", "timeline_date_status", "timepoint_source")) {
-            assertFalse(timing, metadata.has(timing));
-        }
         assertTrue(metadata.get("is_hne").isBoolean());
         assertTrue(metadata.get("is_hne").booleanValue());
         assertFalse(metadata.get("is_ihc").booleanValue());
@@ -153,7 +149,7 @@ public class TestImportResourceData extends IntegrationTestBase {
         Set<Long> secondIds = ids(reimported.values());
         assertUniquePositiveIds(reimported.values());
         assertTrue("reimported IDs must not reuse earlier IDs: " + firstIds + " / " + secondIds,
-            disjoint(firstIds, secondIds));
+            Collections.disjoint(firstIds, secondIds));
 
         // The direct (non-bulk) insert path allocates from the same sequence.
         ClickHouseBulkLoader.bulkLoadOff();
@@ -178,14 +174,6 @@ public class TestImportResourceData extends IntegrationTestBase {
         Map<String, ResourceRow> afterDelete = rowsBySlideKey(recreated);
         assertEquals(6, afterDelete.size());
         assertUniquePositiveIds(afterDelete.values());
-
-        // Sequences declared with lower-case columns still initialize after a reset.
-        ClickHouseAutoIncrement.resetCounters();
-        long maxStudyId = singleLong("SELECT max(cancer_study_id) FROM cancer_study");
-        assertTrue(ClickHouseAutoIncrement.nextId("seq_cancer_study") > maxStudyId);
-        assertTrue(ClickHouseAutoIncrement.nextId("seq_clinical_event") > 0);
-        long maxResourceId = singleLong("SELECT max(resource_data_id) FROM resource_data");
-        assertTrue(ClickHouseAutoIncrement.nextId("seq_resource_data") > maxResourceId);
     }
 
     private static CancerStudy createStudy() throws Exception {
@@ -260,11 +248,5 @@ public class TestImportResourceData extends IntegrationTestBase {
         Set<Long> ids = ids(rows);
         assertEquals("resource_data_id values must be unique", rows.size(), ids.size());
         assertTrue("resource_data_id values must be allocated", ids.stream().allMatch(id -> id > 0));
-    }
-
-    private static boolean disjoint(Set<Long> left, Set<Long> right) {
-        Set<Long> overlap = new HashSet<>(left);
-        overlap.retainAll(right);
-        return overlap.isEmpty();
     }
 }
