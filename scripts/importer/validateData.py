@@ -48,10 +48,6 @@ import math
 from abc import ABCMeta, abstractmethod
 from urllib.parse import urlparse
 
-WSI_TILE_METADATA_SCHEMA_VERSION = 2
-WSI_DECODE_POLICY_VERSION = 'geometry-v2;tile-max=16777216;thumbnail-max=16777216'
-WSI_MAX_DECODE_PIXELS = 16777216
-
 # Configure relative imports if running as a script; see PEP 366
 # it might passed as empty string by certain tooling to mark a top level module.
 if __name__ == "__main__" and (__package__ is None or __package__ == ''):
@@ -65,7 +61,7 @@ if __name__ == "__main__" and (__package__ is None or __package__ == ''):
     importlib.import_module(__package__)
 
 from . import cbioportal_common
-# The WSI row contract (columns, slide key, sealed source, stain rule) lives with the converter.
+# The WSI row contract lives with the converter.
 from . import convertWsiToResources as wsi_contract
 
 
@@ -88,9 +84,8 @@ RESOURCE_DEFINITION_DICTIONARY = {}
 # importing unchanged. Populated from the definition file before any resource data file is read.
 RESOURCE_CONTRACT_KEYS = {}
 RESOURCE_PATIENTS_WITH_SAMPLES = None
-# study-wide cross-row state for WSI resource rows (see WsiRowChecks);
-# shared by the sample and patient resource files so SLIDE_KEY stays unique per study
-WSI_RESOURCE_STATE = None
+# study-wide WSI rules, shared by the sample and patient resource files (reset per study)
+WSI_RESOURCE_STATE = wsi_contract.SlideRegistry()
 
 # globals required for gene set scoring validation
 prior_validated_sample_ids = None
@@ -3937,288 +3932,22 @@ class ResourceDefinitionValidator(Validator):
         # add resource_id into dictionary
         self.resource_definition_dictionary.setdefault(resource_id, []).append(resource_type)
 
-def new_wsi_row_state():
-    """Return empty cross-row state for WsiRowChecks._check_wsi_row."""
-    return {'slide_keys': set(), 'parts': {}, 'blocks': {}, 'references': {},
-            'reference_conflicts': set()}
-
-
 def reset_wsi_resource_state():
-    """Forget WSI resource rows seen so far (called once per study)."""
+    """Forget the WSI resource rows seen so far (called once per study)."""
     global WSI_RESOURCE_STATE
-    WSI_RESOURCE_STATE = new_wsi_row_state()
+    WSI_RESOURCE_STATE = wsi_contract.SlideRegistry()
 
 
-def wsi_resource_state():
-    if WSI_RESOURCE_STATE is None:
-        reset_wsi_resource_state()
-    return WSI_RESOURCE_STATE
+def wsi_field_label(field):
+    """Name a WSI contract field by its column or METADATA path."""
+    if field in ('PATIENT_ID', 'SAMPLE_ID', 'METADATA'):
+        return field
+    if field in wsi_contract.SERVING_FIELDS:
+        return 'METADATA.%s.%s' % (wsi_contract.SERVING_KEY, field.lower())
+    return 'METADATA.' + field.lower()
 
 
-class WsiRowChecks(object):
-    """Whole-slide-image row contract for WSI_SAMPLE/WSI_PATIENT rows in sample/patient
-    resource files.
-
-    Rows are dicts keyed by the format-v4 column names with stripped string
-    values ('' for missing).
-    """
-
-    # format-v4 column names; rows are keyed by them
-    EXPECTED_HEADERS = wsi_contract.COLUMNS
-    REQUIRED_VALUES = {
-        'PATIENT_ID', 'PART_KEY', 'BLOCK_KEY', 'MATCH_LEVEL',
-        'SPECIMEN_KEY', 'IS_HNE', 'IS_IHC', 'CAN_SERVE_TILES', 'SLIDE_KEY',
-    }
-    @staticmethod
-    def _is_valid_tile_metadata(metadata):
-        """Return whether metadata contains the browser tile contract."""
-        if not isinstance(metadata, dict):
-            return False
-        dimensions = metadata.get('dimensions')
-        if not isinstance(dimensions, dict):
-            return False
-        if not all(type(dimensions.get(name)) is int and dimensions[name] > 0
-                   for name in ('width', 'height')):
-            return False
-
-        levels = metadata.get('levels')
-        level_dimensions = metadata.get('level_dimensions')
-        if type(levels) is not int or levels <= 0:
-            return False
-        if not isinstance(level_dimensions, list) or len(level_dimensions) != levels:
-            return False
-        for level in level_dimensions:
-            if not isinstance(level, dict):
-                return False
-            if not all(type(level.get(name)) is int and level[name] > 0
-                       for name in ('width', 'height')):
-                return False
-
-        max_zoom = metadata.get('max_zoom')
-        tile_size = metadata.get('tile_size')
-        if not (
-            type(max_zoom) is int and max_zoom >= 0
-            and type(tile_size) is int and tile_size > 0
-        ):
-            return False
-
-        if 'tile_metadata_schema_version' not in metadata:
-            return True
-        schema = metadata['tile_metadata_schema_version']
-        if type(schema) is not int or schema != WSI_TILE_METADATA_SCHEMA_VERSION:
-            return False
-        safe_min_level = metadata.get('safe_min_level')
-        downsamples = metadata.get('level_downsamples')
-        return (
-            type(safe_min_level) is int
-            and 0 <= safe_min_level <= max_zoom
-            and isinstance(downsamples, list)
-            and len(downsamples) == levels
-            and all(
-                type(value) in (int, float)
-                and math.isfinite(value)
-                and value > 0
-                for value in downsamples
-            )
-            and metadata.get('decode_policy_version') == WSI_DECODE_POLICY_VERSION
-            and type(metadata.get('max_decode_pixels')) is int
-            and metadata['max_decode_pixels'] == WSI_MAX_DECODE_PIXELS
-            and type(metadata.get('thumbnail_max_decode_pixels')) is int
-            and metadata['thumbnail_max_decode_pixels'] == WSI_MAX_DECODE_PIXELS
-        )
-
-    def _error(self, message, line_number, column=None, cause=None):
-        extra = {'line_number': line_number}
-        if column is not None:
-            extra['column_number'] = column + 1
-        if cause is not None:
-            extra['cause'] = cause
-        self.logger.error(message, extra=extra)
-
-    @staticmethod
-    def _is_media_type_token(value):
-        return bool(value) and all(
-            ('a' <= character <= 'z' or 'A' <= character <= 'Z'
-             or '0' <= character <= '9'
-             or character in "!#$%&'*+-.^_`|~")
-            for character in value
-        )
-
-    @staticmethod
-    def _is_image_content_type(value):
-        media_type = value.strip().lower()
-        if not media_type.startswith('image/'):
-            return False
-        return WsiRowChecks._is_media_type_token(media_type[len('image/'):])
-
-    def _check_reference_sample(self, row, line_number, column, state, label):
-        """Require one reference sample per patient across all WSI rows of the study.
-
-        Mirrors convertWsiToResources.SlideParser: a blank or UNMATCHED
-        REFERENCE_SAMPLE_ID means "no reference sample" (the converter omits it
-        from the resource metadata), and every row of a patient must carry the
-        same reference sample or all must omit it. The portal takes the
-        reference sample from the patient's first row, so a mix would be
-        order-dependent. Reported once per patient, at the first disagreeing row.
-        """
-        patient_id = row['PATIENT_ID']
-        if not patient_id:
-            return
-        reference = row['REFERENCE_SAMPLE_ID']
-        if reference.upper() == 'UNMATCHED':
-            reference = ''
-        first = state['references'].setdefault(
-            patient_id, (reference, '%s line %d' % (self.filenameShort, line_number)))
-        if first[0] == reference or patient_id in state['reference_conflicts']:
-            return
-        state['reference_conflicts'].add(patient_id)
-        self._error('All WSI rows of a patient must have the same %s, or all omit it'
-                    % label('REFERENCE_SAMPLE_ID'), line_number, column('REFERENCE_SAMPLE_ID'),
-                    'patient %s: %s (%s) vs %s' % (
-                        patient_id, first[0] or '<none>', first[1], reference or '<none>'))
-
-    def _check_wsi_row(self, row, line_number, column, state, label=None):
-        """Check one normalized WSI row.
-
-        `column(name)` returns the 0-based column to report for a field (or
-        None), `state` carries study-wide uniqueness/consistency data and
-        `label(name)` names a field in messages.
-        """
-        if label is None:
-            label = lambda name: name
-
-        for name in self.REQUIRED_VALUES:
-            if not row[name]:
-                self._error('Required WSI value is blank', line_number,
-                            column(name), label(name))
-        for name in ('IS_HNE', 'IS_IHC', 'CAN_SERVE_TILES'):
-            if row[name] not in ('TRUE', 'FALSE'):
-                self._error('WSI boolean must be TRUE or FALSE', line_number,
-                            column(name), row[name])
-        for name in ('FILE_SIZE_BYTES', 'THUMBNAIL_WIDTH', 'THUMBNAIL_HEIGHT'):
-            if row[name]:
-                try:
-                    value = int(row[name])
-                    if name == 'FILE_SIZE_BYTES' and value < 0:
-                        raise ValueError
-                    if name in ('THUMBNAIL_WIDTH', 'THUMBNAIL_HEIGHT') and not (0 <= value <= 4294967295):
-                        raise ValueError
-                except ValueError:
-                    self._error('WSI numeric value is invalid', line_number,
-                                column(name), row[name])
-
-        slide_type = row['SLIDE_TYPE']
-        if slide_type not in wsi_contract.SLIDE_TYPES:
-            self._error('WSI SLIDE_TYPE must be H&E, IHC, Other, or Unknown', line_number,
-                        column('SLIDE_TYPE'), slide_type)
-        elif row['IS_HNE'] in ('TRUE', 'FALSE') and row['IS_IHC'] in ('TRUE', 'FALSE'):
-            if not wsi_contract.stain_flags_valid(
-                    slide_type, row['IS_HNE'] == 'TRUE', row['IS_IHC'] == 'TRUE'):
-                self._error('WSI IS_HNE/IS_IHC are inconsistent with SLIDE_TYPE', line_number,
-                            column('SLIDE_TYPE'),
-                            '%s: IS_HNE=%s, IS_IHC=%s' % (slide_type, row['IS_HNE'], row['IS_IHC']))
-
-        slide_key = row['SLIDE_KEY']
-        if slide_key and not wsi_contract.SLIDE_KEY_PATTERN.fullmatch(slide_key):
-            self._error('SLIDE_KEY must be 32 lowercase hex characters', line_number,
-                        column('SLIDE_KEY'), label('SLIDE_KEY'))
-        elif slide_key and slide_key in state['slide_keys']:
-            self._error('SLIDE_KEY must be unique within a study', line_number,
-                        column('SLIDE_KEY'), label('SLIDE_KEY'))
-        if slide_key:
-            state['slide_keys'].add(slide_key)
-
-        if '?' in row['PART_KEY'] or '?' in row['BLOCK_KEY']:
-            self._error('WSI part and block keys must not contain ?', line_number,
-                        column('PART_KEY'))
-        part_key = (row['PATIENT_ID'], row['PART_KEY'])
-        part_value = tuple(row[name] for name in (
-            'PART_NUMBER', 'PART_DESIGNATOR', 'PART_TYPE',
-            'PART_DESCRIPTION', 'SUBSPECIALTY', 'PATH_DX_TITLE'))
-        if part_key in state['parts'] and state['parts'][part_key] != part_value:
-            self._error('WSI part metadata conflicts for the same patient and part', line_number,
-                        column('PART_KEY'), row['PART_KEY'])
-        state['parts'][part_key] = part_value
-        block_key = (row['PATIENT_ID'], row['PART_KEY'], row['BLOCK_KEY'])
-        block_value = (row['BLOCK_NUMBER'], row['BLOCK_LABEL'])
-        if block_key in state['blocks'] and state['blocks'][block_key] != block_value:
-            self._error('WSI block metadata conflicts for the same patient and block', line_number,
-                        column('BLOCK_KEY'), row['BLOCK_KEY'])
-        state['blocks'][block_key] = block_value
-
-        match_level = row['MATCH_LEVEL']
-        if match_level not in wsi_contract.MATCH_LEVELS:
-            self._error('WSI MATCH_LEVEL must be BLOCK, PART, or UNMATCHED', line_number,
-                        column('MATCH_LEVEL'), match_level)
-        if match_level == 'UNMATCHED' and row['SAMPLE_ID']:
-            self._error('UNMATCHED WSI rows must have a blank SAMPLE_ID', line_number,
-                        column('SAMPLE_ID'))
-        if match_level in ('BLOCK', 'PART') and not row['SAMPLE_ID']:
-            self._error('Matched WSI rows require SAMPLE_ID', line_number,
-                        column('SAMPLE_ID'))
-
-        if DEFINED_SAMPLE_IDS is not None and row['SAMPLE_ID'] and row['SAMPLE_ID'] not in DEFINED_SAMPLE_IDS:
-            self._error('Sample ID not defined in clinical file', line_number,
-                        column('SAMPLE_ID'), row['SAMPLE_ID'])
-        if PATIENTS_WITH_SAMPLES is not None and row['PATIENT_ID'] not in PATIENTS_WITH_SAMPLES:
-            self._error('Patient ID not defined in clinical file', line_number,
-                        column('PATIENT_ID'), row['PATIENT_ID'])
-        if SAMPLE_TO_PATIENT is not None:
-            for name in ('SAMPLE_ID', 'REFERENCE_SAMPLE_ID'):
-                value = row[name]
-                if value and value.upper() != 'UNMATCHED' and SAMPLE_TO_PATIENT.get(value) != row['PATIENT_ID']:
-                    self._error('%s belongs to a different patient' % name, line_number,
-                                column(name), value)
-
-        self._check_reference_sample(row, line_number, column, state, label)
-
-        # SEALED_SOURCE is opaque and only the tile server can open it; report the field only.
-        sealed_source = row['SEALED_SOURCE']
-        if sealed_source and not wsi_contract.sealed_source_valid(sealed_source):
-            self._error('WSI SEALED_SOURCE must be unpadded base64url of at least %d bytes and '
-                        'at most %d characters'
-                        % (wsi_contract.SEALED_SOURCE_MIN_BYTES, wsi_contract.SEALED_SOURCE_MAX_LENGTH),
-                        line_number, column('SEALED_SOURCE'), label('SEALED_SOURCE'))
-        if sealed_source and row['CAN_SERVE_TILES'] == 'FALSE':
-            self._error('WSI SEALED_SOURCE must be empty when CAN_SERVE_TILES is FALSE',
-                        line_number, column('SEALED_SOURCE'), label('SEALED_SOURCE'))
-        if row['THUMBNAIL_CONTENT_TYPE'] and not self._is_image_content_type(
-                row['THUMBNAIL_CONTENT_TYPE']):
-            self._error('WSI thumbnail content type must be an image media type',
-                        line_number,
-                        column('THUMBNAIL_CONTENT_TYPE'),
-                        row['THUMBNAIL_CONTENT_TYPE'])
-        metadata_valid = False
-        if row['TILE_METADATA_JSON']:
-            try:
-                metadata = json.loads(row['TILE_METADATA_JSON'])
-                if not isinstance(metadata, dict):
-                    raise ValueError
-                metadata_valid = self._is_valid_tile_metadata(metadata)
-            except (ValueError, json.JSONDecodeError):
-                self._error('TILE_METADATA_JSON must be a JSON object', line_number,
-                            column('TILE_METADATA_JSON'))
-
-        if row['CAN_SERVE_TILES'] == 'TRUE':
-            for name in ('SEALED_SOURCE', 'TILE_METADATA_JSON',
-                         'THUMBNAIL_WIDTH', 'THUMBNAIL_HEIGHT',
-                         'THUMBNAIL_CONTENT_TYPE'):
-                if not row[name]:
-                    self._error('Servable WSI rows require complete pixel artifacts', line_number,
-                                column(name), label(name))
-            if not metadata_valid:
-                self._error('Servable WSI rows require valid tile metadata', line_number,
-                            column('TILE_METADATA_JSON'))
-            for name in ('THUMBNAIL_WIDTH', 'THUMBNAIL_HEIGHT'):
-                if row[name]:
-                    try:
-                        if not (1 <= int(row[name]) <= 8192):
-                            raise ValueError
-                    except ValueError:
-                        self._error('Servable WSI thumbnail dimensions must be between 1 and 8192', line_number,
-                                    column(name), row[name])
-
-class ResourceValidator(WsiRowChecks, Validator):
+class ResourceValidator(Validator):
 
     """Abstract Validator class for resource data files.
 
@@ -4230,29 +3959,6 @@ class ResourceValidator(WsiRowChecks, Validator):
     REQUIRE_COLUMN_ORDER = False
     NULL_VALUES = ["[not applicable]", "[not available]", "[pending]", "[discrepancy]", "[completed]", "[null]", "", "na"]
     ALLOW_BLANKS = True
-
-    # resource definition ID required for WSI rows in each resource file type
-    WSI_RESOURCE_IDS = {'SAMPLE': wsi_contract.SAMPLE_RESOURCE_ID,
-                        'PATIENT': wsi_contract.PATIENT_RESOURCE_ID}
-    # metadata keys (the lower-cased format-v4 column names) and their JSON types
-    WSI_STRING_KEYS = (
-        'SLIDE_KEY', 'REFERENCE_SAMPLE_ID', 'PART_KEY', 'PART_NUMBER',
-        'PART_TYPE', 'PART_DESCRIPTION', 'SUBSPECIALTY', 'BLOCK_KEY',
-        'BLOCK_NUMBER', 'BLOCK_LABEL', 'MATCH_LEVEL', 'SPECIMEN_KEY', 'STAIN_NAME',
-        'STAIN_GROUP', 'MAGNIFICATION', 'SLIDE_TYPE')
-    WSI_BOOLEAN_KEYS = ('IS_HNE', 'IS_IHC', 'CAN_SERVE_TILES')
-    WSI_INTEGER_KEYS = ('FILE_SIZE_BYTES',)
-    # Keys that would carry the pathology image ID or an object URI embedding it.
-    # They are rejected both in the public metadata and inside wsi_serving: those
-    # values exist only inside the sealed source.
-    WSI_UNSEALED_SOURCE_KEYS = ('image_id', 'source_url', 'thumbnail_url')
-    # Top-level (public) metadata keys that would expose a real slide identifier,
-    # a free-text specimen label, a raw artifact location or the sealed source.
-    WSI_FORBIDDEN_PUBLIC_KEYS = WSI_UNSEALED_SOURCE_KEYS + (
-        'barcode', 'part_designator', 'path_dx_title', 'sealed_source')
-    WSI_SERVING_KEY = wsi_contract.SERVING_KEY
-    WSI_SERVING_STRING_KEYS = ('SEALED_SOURCE', 'THUMBNAIL_CONTENT_TYPE')
-    WSI_SERVING_INTEGER_KEYS = ('THUMBNAIL_WIDTH', 'THUMBNAIL_HEIGHT')
 
     def __init__(self, *args, **kwargs):
         """Initialize the instance attributes of the data file validator."""
@@ -4287,7 +3993,7 @@ class ResourceValidator(WsiRowChecks, Validator):
         seen = self.observed_metadata_keys.setdefault(resource_id, {})
         for key in parsed:
             # A WSI row's private wsi_serving object is never a column, so it is not declared.
-            if key == self.WSI_SERVING_KEY and resource_id in self.WSI_RESOURCE_IDS.values():
+            if key == wsi_contract.SERVING_KEY and resource_id in wsi_contract.WSI_RESOURCE_IDS:
                 continue
             seen.setdefault(key, self.line_number)
 
@@ -4323,125 +4029,59 @@ class ResourceValidator(WsiRowChecks, Validator):
                     extra={'line_number': self.line_number,
                            'cause': ', '.join(unused)})
 
-    def _wsi_value(self, value, expected, key, metadata_column):
-        """Render a typed metadata value as the format-v4 string, logging type errors."""
-        if value is None:
-            return ''
-        if expected == 'string':
-            valid = isinstance(value, str)
-        elif expected == 'boolean':
-            valid = isinstance(value, bool)
-            if valid:
-                return 'TRUE' if value else 'FALSE'
-        else:
-            valid = isinstance(value, int) and not isinstance(value, bool)
-        if not valid:
-            self._error('WSI metadata value must be a JSON %s' % expected,
-                        self.line_number, metadata_column, key)
-        return value.strip() if isinstance(value, str) else str(value)
+    def checkWsiResource(self, data):
+        """Check a WSI_SAMPLE/WSI_PATIENT row against the WSI contract in convertWsiToResources.
 
-    def _wsi_row_from_metadata(self, metadata, metadata_column):
-        """Map WSI resource metadata onto a format-v4 WSI row dict."""
-        row = {name: '' for name in self.EXPECTED_HEADERS}
-        for keys, expected in ((self.WSI_STRING_KEYS, 'string'),
-                               (self.WSI_BOOLEAN_KEYS, 'boolean'),
-                               (self.WSI_INTEGER_KEYS, 'integer')):
-            for name in keys:
-                row[name] = self._wsi_value(metadata.get(name.lower()), expected,
-                                            name.lower(), metadata_column)
-        serving = metadata.get(self.WSI_SERVING_KEY)
-        if serving is None:
-            return row
-        if not isinstance(serving, dict):
-            self._error('WSI metadata wsi_serving must be a JSON object',
-                        self.line_number, metadata_column, type(serving).__name__)
-            return row
-        for keys, expected in ((self.WSI_SERVING_STRING_KEYS, 'string'),
-                               (self.WSI_SERVING_INTEGER_KEYS, 'integer')):
-            for name in keys:
-                row[name] = self._wsi_value(serving.get(name.lower()), expected,
-                                            'wsi_serving.' + name.lower(), metadata_column)
-        tile_metadata = serving.get('tile_metadata_json')
-        if tile_metadata is not None:
-            if isinstance(tile_metadata, dict):
-                row['TILE_METADATA_JSON'] = json.dumps(tile_metadata)
-            else:
-                self._error('WSI metadata wsi_serving.tile_metadata_json must be a '
-                            'JSON object', self.line_number, metadata_column,
-                            type(tile_metadata).__name__)
-        for key in self.WSI_UNSEALED_SOURCE_KEYS:
-            if key in serving:
-                self._error('WSI metadata must not contain %s; the image ID and '
-                            'object URIs are only carried inside sealed_source' % key,
-                            self.line_number, metadata_column,
-                            'METADATA.%s.%s' % (self.WSI_SERVING_KEY, key))
-        known = {name.lower() for name in self.WSI_SERVING_STRING_KEYS + self.WSI_SERVING_INTEGER_KEYS}
-        known.add('tile_metadata_json')
-        known.update(self.WSI_UNSEALED_SOURCE_KEYS)
-        unknown = sorted(set(serving) - known)
-        if unknown:
-            self.logger.warning(
-                'WSI metadata wsi_serving has keys the portal does not read',
-                extra={'line_number': self.line_number, 'column_number': metadata_column + 1,
-                       'cause': ', '.join(unknown)})
-        return row
-
-    def checkWsiResource(self, data, resource_level):
-        """Validate a WSI_SAMPLE/WSI_PATIENT row against the WSI contract.
-
-        `resource_level` is 'SAMPLE' or 'PATIENT'. Uniqueness and part/block
-        consistency are tracked across all resource files of the study.
+        The study-wide rules (unique slide keys, consistent parts, blocks and reference
+        samples) span all resource files of the study. Errors name the column or METADATA
+        path, never the value.
         """
         values = self._line_values(data)
-        column_index = {col_name: col_index for col_index, col_name in enumerate(self.cols)}
-        resource_id = values.get('RESOURCE_ID', '')
-        wsi_resource_ids = set(self.WSI_RESOURCE_IDS.values())
-        if resource_id not in wsi_resource_ids:
+        if values.get('RESOURCE_ID') not in wsi_contract.WSI_RESOURCE_IDS:
             return
-        expected_resource_id = self.WSI_RESOURCE_IDS[resource_level]
-        if resource_id != expected_resource_id:
-            self._error('WSI resources in a %s resource file must use RESOURCE_ID %s'
-                        % (resource_level.lower(), expected_resource_id),
-                        self.line_number, column_index.get('RESOURCE_ID'), resource_id)
-        metadata_column = column_index.get('METADATA')
+        column_index = {col_name: col_index for col_index, col_name in enumerate(self.cols)}
+
+        def error(message, field):
+            column = column_index.get(field if field in ('PATIENT_ID', 'SAMPLE_ID') else 'METADATA')
+            extra = {'line_number': self.line_number, 'cause': wsi_field_label(field)}
+            if column is not None:
+                extra['column_number'] = column + 1
+            self.logger.error('WSI: ' + message, extra=extra)
+
         try:
             metadata = json.loads(values.get('METADATA', ''))
         except ValueError:
             metadata = None
         if not isinstance(metadata, dict):
             # a present but malformed value was already reported by checkLine
-            self._error('WSI resources require a METADATA JSON object',
-                        self.line_number, metadata_column)
+            error('resources require a METADATA JSON object', 'METADATA')
             return
-        for key in self.WSI_FORBIDDEN_PUBLIC_KEYS:
-            if key in metadata:
-                self._error('WSI public metadata must not contain %s' % key,
-                            self.line_number, metadata_column, 'METADATA.' + key)
-        row = self._wsi_row_from_metadata(metadata, metadata_column)
-        row['PATIENT_ID'] = values.get('PATIENT_ID', '')
-        row['SAMPLE_ID'] = values.get('SAMPLE_ID', '') if resource_level == 'SAMPLE' else ''
+        patient_id = values.get('PATIENT_ID', '')
+        sample_id = values.get('SAMPLE_ID', '')
+        for field, message in (wsi_contract.slide_problems(metadata, sample_id)
+                               + WSI_RESOURCE_STATE.problems(patient_id, metadata)):
+            error(message, field)
 
-        def column(name):
-            if name in ('PATIENT_ID', 'SAMPLE_ID'):
-                return column_index.get(name)
-            return metadata_column
+        if DEFINED_SAMPLE_IDS is not None and sample_id and sample_id not in DEFINED_SAMPLE_IDS:
+            error('SAMPLE_ID is not defined in the clinical file', 'SAMPLE_ID')
+        if PATIENTS_WITH_SAMPLES is not None and patient_id not in PATIENTS_WITH_SAMPLES:
+            error('PATIENT_ID is not defined in the clinical file', 'PATIENT_ID')
+        if SAMPLE_TO_PATIENT is not None:
+            for field, value in (('SAMPLE_ID', sample_id),
+                                 ('REFERENCE_SAMPLE_ID', metadata.get('reference_sample_id'))):
+                if value and isinstance(value, str) and SAMPLE_TO_PATIENT.get(value) != patient_id:
+                    error('%s belongs to a different patient' % field, field)
 
-        serving_fields = set(self.WSI_SERVING_STRING_KEYS + self.WSI_SERVING_INTEGER_KEYS)
-        serving_fields.add('TILE_METADATA_JSON')
-
-        def label(name):
-            if name in ('PATIENT_ID', 'SAMPLE_ID'):
-                return name
-            if name in serving_fields:
-                return 'METADATA.%s.%s' % (self.WSI_SERVING_KEY, name.lower())
-            return 'METADATA.' + name.lower()
-
-        if row['REFERENCE_SAMPLE_ID'].upper() == 'UNMATCHED':
-            # the portal reads this value verbatim as a sample ID; the converter omits it instead
-            self._error('WSI metadata reference_sample_id must be omitted, not UNMATCHED, '
-                        'when a patient has no reference sample', self.line_number, metadata_column,
-                        row['REFERENCE_SAMPLE_ID'])
-        self._check_wsi_row(row, self.line_number, column, wsi_resource_state(), label)
+        serving = metadata.get(wsi_contract.SERVING_KEY)
+        if isinstance(serving, dict):
+            known = {field.lower() for field in wsi_contract.SERVING_FIELDS}
+            unknown = sorted(set(serving) - known - set(wsi_contract.UNSEALED_SOURCE_KEYS))
+            if unknown:
+                self.logger.warning(
+                    'WSI metadata wsi_serving has keys the portal does not read',
+                    extra={'line_number': self.line_number,
+                           'column_number': column_index['METADATA'] + 1,
+                           'cause': ', '.join(unknown)})
 
     def url_validator(self, url):
         try:
@@ -4457,7 +4097,7 @@ class ResourceValidator(WsiRowChecks, Validator):
 
     def _is_wsi_line(self, data):
         """Whether a line is a WSI row (RESOURCE_ID WSI_SAMPLE or WSI_PATIENT)."""
-        return self._line_values(data).get('RESOURCE_ID') in self.WSI_RESOURCE_IDS.values()
+        return self._line_values(data).get('RESOURCE_ID') in wsi_contract.WSI_RESOURCE_IDS
 
     def checkLine(self, data):
         """Check the values in a line of data."""
@@ -4560,7 +4200,7 @@ class SampleResourceValidator(ResourceValidator):
     def checkLine(self, data):
         """Check the values in a line of data."""
         super(SampleResourceValidator, self).checkLine(data)
-        self.checkWsiResource(data, 'SAMPLE')
+        self.checkWsiResource(data)
         resource_id = ''
         sample_id = ''
         resource_url = ''
@@ -4623,7 +4263,7 @@ class PatientResourceValidator(ResourceValidator):
     def checkLine(self, data):
         """Check the values in a line of data."""
         super(PatientResourceValidator, self).checkLine(data)
-        self.checkWsiResource(data, 'PATIENT')
+        self.checkWsiResource(data)
         resource_id = ''
         patient_id = ''
         resource_url = ''
