@@ -130,7 +130,7 @@ public class TestImportResourceData extends IntegrationTestBase {
         assertUniquePositiveIds(rows.values());
         assertStudySlideTableMatches(study);
 
-        // The study slide table keeps only the public keys, with values intact: part and block as
+        // The study slide table keeps only its public keys, with values intact: part and block as
         // numbers, not the hierarchy's labels.
         String[] derivedRow = single(
             "SELECT metadata, display_name FROM wsi_slide_table_derived WHERE cancer_study_id = ? AND url LIKE ?",
@@ -140,8 +140,6 @@ public class TestImportResourceData extends IntegrationTestBase {
         JsonNode derived = JSON.readTree(derivedRow[0]);
         assertEquals("1", derived.get("part_number").textValue());
         assertEquals("1", derived.get("block_number").textValue());
-        assertFalse(derived.has("part_description"));
-        assertFalse(derived.has("block_label"));
         derived.fieldNames().forEachRemaining(key -> assertTrue(key,
             DaoResourceData.STUDY_SLIDE_TABLE_METADATA_KEYS.contains(key)));
     }

@@ -2,6 +2,7 @@ package org.mskcc.cbio.portal.dao;
 
 import java.sql.*;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -241,12 +242,12 @@ public final class DaoResourceData {
     public static final String UNMATCHED_SLIDE_RESOURCE_ID = "WSI_PATIENT";
 
     /**
-     * The study slide table's public metadata keys. Must match WsiDeidentification.STUDY_TABLE_SCHEMA
-     * in cBioPortal/cbioportal and the wsi_slide_table_derived INSERT in its
-     * populate_derived_tables.sql; the portal's tests check that the SQL matches its contract, and
-     * DaoResourceDataSlideTableKeysTest that each key is a filterable field of the WSI contract.
+     * The study slide table's public metadata keys. Kept in step by hand with
+     * WsiDeidentification.STUDY_TABLE_SCHEMA in cBioPortal/cbioportal and the wsi_slide_table_derived
+     * INSERT in its populate_derived_tables.sql; DaoResourceDataSlideTableKeysTest checks that each key
+     * is a filterable field of the WSI contract.
      */
-    public static final java.util.List<String> STUDY_SLIDE_TABLE_METADATA_KEYS = java.util.List.of(
+    public static final List<String> STUDY_SLIDE_TABLE_METADATA_KEYS = List.of(
         "stain_name", "stain_group", "magnification", "part_number", "block_number",
         "match_level");
 
