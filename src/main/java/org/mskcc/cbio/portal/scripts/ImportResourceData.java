@@ -112,15 +112,14 @@ public class ImportResourceData extends ConsoleRunnable {
         // file) replaces stale rows instead of accumulating duplicates. Safe to do here because
         // ClickHouseBulkLoader only buffers inserts in memory until flushAll() is called next.
         DaoResourceData.deleteResourceData(cancerStudy.getInternalId(), resourceIdsInFile);
-        // The deleter has to be flushed here, not left to a later stage: importing a resource
-        // file is the whole job when it is run on its own, so nothing afterwards would execute
-        // the queued deletions and the re-imported rows would be added to the stale ones
-        // rather than replacing them. ClickHouseBulkLoader.flushAll() below flushes inserts
-        // only; it is a different queue. Flushed outside the bulk-load branch so the queued
-        // deletions also run when rows are inserted one at a time.
-        ClickHouseBulkDeleter.flushAll();
 
         if (ClickHouseBulkLoader.isBulkLoad()) {
+            // The deleter has to be flushed here, not left to a later stage: importing a resource
+            // file is the whole job when it is run on its own, so nothing afterwards would execute
+            // the queued deletions and the re-imported rows would be added to the stale ones
+            // rather than replacing them. ClickHouseBulkLoader.flushAll() below flushes inserts
+            // only; it is a different queue.
+            ClickHouseBulkDeleter.flushAll();
             ClickHouseBulkLoader.flushAll();
             ClickHouseBulkLoader.relaxedModeOff();
         }
