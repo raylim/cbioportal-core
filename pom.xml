@@ -19,7 +19,7 @@
 		     info.db_schema_version IN cbioportal/src/main/resources/db-scripts/clickhouse/init/schema.sql -->
 		<db.version>3.7.0</db.version>
 		<!-- Pin this to the backend commit containing the matching schema before merging. -->
-		<cbioportal.version>74a86512a6f988544a3edd71a375a5f41851b326</cbioportal.version>
+		<cbioportal.version>d8478d128ddbdbada9b77752fead291132f2dd31</cbioportal.version>
 		<maf.version>1.0.0</maf.version>
 
 		<commons_lang3.version>3.13.0</commons_lang3.version>
