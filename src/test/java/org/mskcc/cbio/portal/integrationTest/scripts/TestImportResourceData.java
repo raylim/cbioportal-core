@@ -128,6 +128,20 @@ public class TestImportResourceData extends IntegrationTestBase {
         assertNull(rows.get(SLIDE_4).sampleId());
 
         assertUniquePositiveIds(rows.values());
+        assertStudySlideTableMatches(study);
+
+        // The study slide table keeps only its public keys, with values intact: part and block as
+        // numbers, not the hierarchy's labels.
+        String[] derivedRow = single(
+            "SELECT metadata, display_name FROM wsi_slide_table_derived WHERE cancer_study_id = ? AND url LIKE ?",
+            result -> new String[] {result.getString(1), result.getString(2)},
+            study.getInternalId(), "%slideKey=" + SLIDE_1);
+        assertNull(derivedRow[1]);
+        JsonNode derived = JSON.readTree(derivedRow[0]);
+        assertEquals("1", derived.get("part_number").textValue());
+        assertEquals("1", derived.get("block_number").textValue());
+        derived.fieldNames().forEachRemaining(key -> assertTrue(key,
+            DaoResourceData.STUDY_SLIDE_TABLE_METADATA_KEYS.contains(key)));
     }
 
     @Test
@@ -146,6 +160,7 @@ public class TestImportResourceData extends IntegrationTestBase {
             "SELECT count() FROM resource WHERE cancer_study_id = ? "
                 + "AND resource_id IN ('WSI_SAMPLE', 'WSI_PATIENT')",
             study.getInternalId()));
+        assertStudySlideTableMatches(study);
         Set<Long> secondIds = ids(reimported.values());
         assertUniquePositiveIds(reimported.values());
         assertTrue("reimported IDs must not reuse earlier IDs: " + firstIds + " / " + secondIds,
@@ -165,6 +180,8 @@ public class TestImportResourceData extends IntegrationTestBase {
         assertEquals(0L, singleLong("SELECT count() FROM resource WHERE cancer_study_id = ?",
             study.getInternalId()));
         assertEquals(0L, singleLong("SELECT count() FROM resource_definition WHERE cancer_study_id = ?",
+            study.getInternalId()));
+        assertEquals(0L, singleLong("SELECT count() FROM wsi_slide_table_derived WHERE cancer_study_id = ?",
             study.getInternalId()));
         assertNull(DaoCancerStudy.getCancerStudyByStableId(STUDY_ID));
 
@@ -218,6 +235,36 @@ public class TestImportResourceData extends IntegrationTestBase {
         return rows;
     }
 
+    /**
+     * The study slide table holds exactly the study's WSI_SAMPLE rows, by id, and none of the
+     * private or non-allowlisted slide fields.
+     */
+    private static void assertStudySlideTableMatches(CancerStudy study) throws Exception {
+        // Every slide the viewer can open, matched (WSI_SAMPLE) or not (WSI_PATIENT); the fixtures
+        // include slides it cannot open.
+        String slides = "FROM resource WHERE cancer_study_id = ? "
+            + "AND resource_id IN ('WSI_SAMPLE', 'WSI_PATIENT')";
+        long slideRows = singleLong(
+            "SELECT count() " + slides + " AND JSONExtractBool(ifNull(metadata, '{}'), 'can_serve_tiles')",
+            study.getInternalId());
+        assertTrue(slideRows > 0);
+        assertTrue(slideRows < singleLong("SELECT count() " + slides, study.getInternalId()));
+        assertEquals(slideRows, singleLong(
+            "SELECT count() FROM wsi_slide_table_derived d INNER JOIN resource r "
+                + "ON r.internal_id = d.internal_id WHERE d.cancer_study_id = ? "
+                + "AND r.resource_id IN ('WSI_SAMPLE', 'WSI_PATIENT')",
+            study.getInternalId()));
+        // All of the study's rows, the viewable unmatched slide listed with no sample, and none
+        // carrying a private field or a resource id other than WSI_SAMPLE.
+        assertEquals(List.of(slideRows, 1L, 0L), single(
+            "SELECT count(), countIf(sample_id IS NULL), "
+                + "countIf(position(metadata, 'wsi_serving') > 0 OR position(metadata, 'slide_key') > 0 "
+                + "OR position(metadata, 'file_size_bytes') > 0 OR resource_id != 'WSI_SAMPLE') "
+                + "FROM wsi_slide_table_derived WHERE cancer_study_id = ?",
+            result -> List.of(result.getLong(1), result.getLong(2), result.getLong(3)),
+            study.getInternalId()));
+    }
+
     private static List<String> fieldNames(JsonNode node) {
         List<String> names = new ArrayList<>();
         node.fieldNames().forEachRemaining(names::add);
@@ -225,7 +272,15 @@ public class TestImportResourceData extends IntegrationTestBase {
         return names;
     }
 
+    private interface RowReader<T> {
+        T read(ResultSet result) throws Exception;
+    }
+
     private static long singleLong(String sql, Object... parameters) throws Exception {
+        return single(sql, result -> result.getLong(1), parameters);
+    }
+
+    private static <T> T single(String sql, RowReader<T> reader, Object... parameters) throws Exception {
         try (Connection connection = JdbcUtil.getDbConnection(TestImportResourceData.class);
              PreparedStatement statement = connection.prepareStatement(sql)) {
             for (int i = 0; i < parameters.length; i++) {
@@ -233,7 +288,7 @@ public class TestImportResourceData extends IntegrationTestBase {
             }
             try (ResultSet result = statement.executeQuery()) {
                 assertTrue(result.next());
-                return result.getLong(1);
+                return reader.read(result);
             }
         }
     }
