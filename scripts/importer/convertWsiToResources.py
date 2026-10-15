@@ -896,11 +896,11 @@ def _convert_into(staging, data_path, study_id, base_url, study_dir):
 
     definitions = []
     if sample_writer.rows:
-        definitions.append([SAMPLE_RESOURCE_ID, "Pathology slides",
+        definitions.append([SAMPLE_RESOURCE_ID, "Pathology Slides",
                             "Whole-slide images matched to a sample", "SAMPLE", "FALSE", "1",
                             CUSTOM_METADATA])
     if patient_writer.rows:
-        definitions.append([PATIENT_RESOURCE_ID, "Pathology slides",
+        definitions.append([PATIENT_RESOURCE_ID, "Pathology Slides",
                             "Whole-slide images not matched to a sample", "PATIENT", "FALSE", "1",
                             CUSTOM_METADATA])
     write_text("meta_resource_definition.txt",
