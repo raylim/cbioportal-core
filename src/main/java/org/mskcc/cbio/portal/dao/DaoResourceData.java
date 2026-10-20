@@ -343,7 +343,7 @@ public final class DaoResourceData {
                     + "WHERE resource_id IN ('" + STUDY_SLIDE_TABLE_RESOURCE_ID + "', '"
                     + UNMATCHED_SLIDE_RESOURCE_ID + "') AND cancer_study_id = ? "
                     + "AND patient_id IS NOT NULL "
-                    + "AND match(JSONExtractString(ifNull(metadata, '{}'), 'slide_key'), '^[0-9a-f]{32}$') "
+                    + "AND match(JSONExtractString(ifNull(metadata, '{}'), 'slide_key'), '^[0-9a-f]{12}$') "
                     + "AND JSONExtractBool(ifNull(metadata, '{}'), 'can_serve_tiles')")) {
                 insert.setInt(1, cancerStudyId);
                 insert.executeUpdate();
