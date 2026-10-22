@@ -2,6 +2,7 @@ package org.mskcc.cbio.portal.dao;
 
 import java.sql.*;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -292,6 +293,66 @@ public final class DaoResourceData {
             JdbcUtil.closeAll(DaoResourceData.class, con, pstmt, rs);
         }
         return ids;
+    }
+
+    /** The resource the portal serves as the study slide table. */
+    public static final String STUDY_SLIDE_TABLE_RESOURCE_ID = "WSI_SAMPLE";
+
+    /** Slides with no matched sample; the slide table lists them too, with no sample. */
+    public static final String UNMATCHED_SLIDE_RESOURCE_ID = "WSI_PATIENT";
+
+    /**
+     * The study slide table's public metadata keys. Kept in step by hand with
+     * WsiDeidentification.STUDY_TABLE_SCHEMA in cBioPortal/cbioportal and the wsi_slide_table_derived
+     * INSERT in its populate_derived_tables.sql; DaoResourceDataSlideTableKeysTest checks that each key
+     * is a field of the WSI contract, filterable except for slide_key (shown as Slide ID).
+     */
+    public static final List<String> STUDY_SLIDE_TABLE_METADATA_KEYS = List.of(
+        "slide_key", "stain_name", "stain_group", "magnification", "part_number", "block_number",
+        "match_level");
+
+    /**
+     * Rebuilds one study's rows of wsi_slide_table_derived: every slide the viewer can open
+     * (can_serve_tiles), from WSI_SAMPLE and, with no sample, WSI_PATIENT's unmatched slides, all filed
+     * under WSI_SAMPLE. Metadata is reduced to the slide table's public keys, and display_name is left
+     * empty (the caption repeats the stain, part and block columns). Run after either resource is
+     * imported so the portal's study slide table matches the import without a full derived-table
+     * rebuild.
+     */
+    public static void refreshStudySlideTable(int cancerStudyId) throws DaoException {
+        String keys = STUDY_SLIDE_TABLE_METADATA_KEYS.stream()
+            .map(key -> "'" + key + "'")
+            .collect(Collectors.joining(", "));
+        Connection con = null;
+        try {
+            con = JdbcUtil.getDbConnection(DaoResourceData.class);
+            try (PreparedStatement delete = con.prepareStatement(
+                    "DELETE FROM wsi_slide_table_derived WHERE cancer_study_id = ?")) {
+                delete.setInt(1, cancerStudyId);
+                delete.executeUpdate();
+            }
+            try (PreparedStatement insert = con.prepareStatement(
+                    "INSERT INTO wsi_slide_table_derived "
+                    + "SELECT internal_id, '" + STUDY_SLIDE_TABLE_RESOURCE_ID + "', cancer_study_id, "
+                    + "resource_scope, patient_id, "
+                    + "sample_id, url, CAST(NULL, 'Nullable(String)') AS display_name, "
+                    + "concat('{', arrayStringConcat(arrayMap(kv -> concat(toJSONString(kv.1), ':', kv.2), "
+                    + "arrayFilter(kv -> has([" + keys + "], kv.1), "
+                    + "JSONExtractKeysAndValuesRaw(ifNull(metadata, '{}')))), ','), '}') "
+                    + "FROM " + RESOURCE_TABLE + " "
+                    + "WHERE resource_id IN ('" + STUDY_SLIDE_TABLE_RESOURCE_ID + "', '"
+                    + UNMATCHED_SLIDE_RESOURCE_ID + "') AND cancer_study_id = ? "
+                    + "AND patient_id IS NOT NULL "
+                    + "AND match(JSONExtractString(ifNull(metadata, '{}'), 'slide_key'), '^[0-9a-f]{12}$') "
+                    + "AND JSONExtractBool(ifNull(metadata, '{}'), 'can_serve_tiles')")) {
+                insert.setInt(1, cancerStudyId);
+                insert.executeUpdate();
+            }
+        } catch (SQLException e) {
+            throw new DaoException(e);
+        } finally {
+            JdbcUtil.closeAll(DaoResourceData.class, con, null, null);
+        }
     }
 }
 
