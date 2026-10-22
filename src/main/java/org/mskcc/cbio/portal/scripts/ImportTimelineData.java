@@ -1,34 +1,8 @@
 /*
  * Copyright (c) 2015 Memorial Sloan-Kettering Cancer Center.
  *
- * This library is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY, WITHOUT EVEN THE IMPLIED WARRANTY OF MERCHANTABILITY OR FITNESS
- * FOR A PARTICULAR PURPOSE. The software and documentation provided hereunder
- * is on an "as is" basis, and Memorial Sloan-Kettering Cancer Center has no
- * obligations to provide maintenance, support, updates, enhancements or
- * modifications. In no event shall Memorial Sloan-Kettering Cancer Center be
- * liable to any party for direct, indirect, special, incidental or
- * consequential damages, including lost profits, arising out of the use of this
- * software and its documentation, even if Memorial Sloan-Kettering Cancer
- * Center has been advised of the possibility of such damage.
+ * SPDX-License-Identifier: Apache-2.0
  */
-
-/*
- * This file is part of cBioPortal.
- *
- * cBioPortal is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
 
 package org.mskcc.cbio.portal.scripts;
 
@@ -50,6 +24,26 @@ import org.mskcc.cbio.portal.util.ProgressMonitor;
  * @author jgao, inodb
  */
 public class ImportTimelineData extends ConsoleRunnable {
+
+	private static final String PATHOLOGY_SLIDES_EVENT = "PATHOLOGY SLIDES";
+	private static final Set<String> FORBIDDEN_PATHOLOGY_ATTRIBUTES = Set.of("IMAGE_ID", "IMAGE_IDS");
+
+	/**
+	 * Pathology slide events reach the browser through the clinical-events API, so they must not
+	 * carry real slide identifiers; slides are addressed by their opaque slide key. Values are
+	 * never echoed.
+	 */
+	static void validatePathologySlidesEvent(String[] headers, String[] fields, String eventType, int line) {
+		if (!PATHOLOGY_SLIDES_EVENT.equals(eventType)) {
+			return;
+		}
+		for (int i = 0; i < fields.length && i < headers.length; i++) {
+			if (FORBIDDEN_PATHOLOGY_ATTRIBUTES.contains(headers[i]) && !fields[i].isEmpty()) {
+				throw new IllegalArgumentException(
+					"Line " + line + ": PATHOLOGY SLIDES events cannot carry " + headers[i]);
+			}
+		}
+	}
 
 	private static void importData(String dataFile, int cancerStudyId, boolean overwriteExisting) throws IOException, DaoException {
 		ClickHouseBulkLoader.bulkLoadOn();
@@ -77,16 +71,20 @@ public class ImportTimelineData extends ConsoleRunnable {
 
 			long clinicalEventId = DaoClinicalEvent.getLargestClinicalEventId();
 			Set<Integer> processedPatientIds = new HashSet<>();
+			int lineNumber = 1;
 
 			while ((line = buff.readLine()) != null) {
+				lineNumber++;
 				line = line.trim();
 	
 				String[] fields = line.split("\t");
 				if (fields.length > headers.length) {
 					//TODO - should better throw an exception here...
-					ProgressMonitor.logWarning("more attributes than header: " + line + ". Skipping entry.");
+					// Report the position only: the line may carry identifiers.
+					ProgressMonitor.logWarning("Line " + lineNumber + ": more attributes than header. Skipping entry.");
 					continue;
 				}
+				validatePathologySlidesEvent(headers, fields, fields[indexCategorySpecificField - 1], lineNumber);
 				String patientId = fields[0];
 				Patient patient = DaoPatient.getPatientByCancerStudyAndPatientId(cancerStudyId, patientId);
 				if (patient == null) {

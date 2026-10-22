@@ -1,34 +1,8 @@
 /*
  * Copyright (c) 2015 Memorial Sloan-Kettering Cancer Center.
  *
- * This library is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY, WITHOUT EVEN THE IMPLIED WARRANTY OF MERCHANTABILITY OR FITNESS
- * FOR A PARTICULAR PURPOSE. The software and documentation provided hereunder
- * is on an "as is" basis, and Memorial Sloan-Kettering Cancer Center has no
- * obligations to provide maintenance, support, updates, enhancements or
- * modifications. In no event shall Memorial Sloan-Kettering Cancer Center be
- * liable to any party for direct, indirect, special, incidental or
- * consequential damages, including lost profits, arising out of the use of this
- * software and its documentation, even if Memorial Sloan-Kettering Cancer
- * Center has been advised of the possibility of such damage.
+ * SPDX-License-Identifier: Apache-2.0
  */
-
-/*
- * This file is part of cBioPortal.
- *
- * cBioPortal is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
 
 package org.mskcc.cbio.portal.dao;
 
@@ -43,7 +17,6 @@ import org.mskcc.cbio.portal.model.CopyNumberSegment;
  */
 public final class DaoCopyNumberSegment {
 
-    private static final double FRACTION_GENOME_ALTERED_CUTOFF = 0.2;
     private static final String FRACTION_GENOME_ALTERED_ATTR_ID = "FRACTION_GENOME_ALTERED";
 
     private DaoCopyNumberSegment() {}
@@ -69,75 +42,38 @@ public final class DaoCopyNumberSegment {
     /**
      * Ensures FRACTION_GENOME_ALTERED clinical sample attribute is created and up to date.
      * @param cancerStudyId - id of the study to create the clinical attribute for
-     * @param sampleIds - specifies for which samples to calculate this attribute.
-     *                  if sampleIds=null, the calculation is done for all samples in the study
+     * @param fractionGenomeAltereds - values by sample id, computed by the importer from the
+     *                  segments it read (see FractionGenomeAlteredCalculator) rather than
+     *                  read back from copy_number_seg, which may not yet be visible on
+     *                  every ClickHouse replica
      * @param updateMode -  if true, updates the attribute if it exists
      * @throws DaoException
      */
 
-    public static void createFractionGenomeAlteredClinicalData(int cancerStudyId, Set<Integer> sampleIds, boolean updateMode) throws DaoException {
+    public static void createFractionGenomeAlteredClinicalData(int cancerStudyId, Map<Integer, String> fractionGenomeAltereds, boolean updateMode) throws DaoException {
         if (!ClickHouseBulkLoader.isBulkLoad()) {
             throw new DaoException("You have to turn on ClickHouseBulkLoader in order to insert Fraction Genome Altered");
         }
 
-        // Make sure we are seeing the latest data that has been inserted into the segment table
-        // for computing FRACTION_GENOME_ALTERED
+        // Flush pending segment inserts before writing clinical data
         ClickHouseBulkLoader.flushAll();
 
-        Connection con = null;
-        try {
-            con = JdbcUtil.getDbConnection(DaoCopyNumberSegment.class);
-            final Connection queryCon = con;
-
-            final String selectSql =
-                    "SELECT c1.`sample_id`, " +
-                    "CASE WHEN SUM(c1.`end` - c1.`start`) > 0 THEN " +
-                    "ROUND(SUM(CASE WHEN ABS(c1.`segment_mean`) >= ? THEN (c1.`end` - c1.`start`) ELSE 0 END) * 1.0 / " +
-                    "SUM(c1.`end` - c1.`start`), 4) " +
-                    "ELSE 0 END AS `value` " +
-                    "FROM `copy_number_seg` AS c1 " +
-                    "INNER JOIN `cancer_study` ON c1.`cancer_study_id` = cancer_study.`cancer_study_id` " +
-                    "WHERE cancer_study.`cancer_study_id`=? ";
-            final String groupSql =
-                    "GROUP BY cancer_study.`cancer_study_id`, c1.`sample_id` " +
-                    "HAVING SUM(c1.`end` - c1.`start`) > 0";
-
-            Map<Integer, String> fractionGenomeAltereds = ClickHouseBulkUploader.upload(sampleIds, stagingTable -> {
-                String inClause = stagingTable == null ? "" : "AND c1.`sample_id` IN (SELECT id FROM " + stagingTable + ") ";
-                Map<Integer, String> result = new HashMap<>();
-                try (PreparedStatement stmt = queryCon.prepareStatement(selectSql + inClause + groupSql)) {
-                    stmt.setDouble(1, FRACTION_GENOME_ALTERED_CUTOFF);
-                    stmt.setInt(2, cancerStudyId);
-                    try (ResultSet resultSet = stmt.executeQuery()) {
-                        while (resultSet.next()) {
-                            result.put(resultSet.getInt(1), resultSet.getString(2));
-                        }
-                    }
-                }
-                return result;
-            });
-
-            ClinicalAttribute clinicalAttribute = DaoClinicalAttributeMeta.getDatum(FRACTION_GENOME_ALTERED_ATTR_ID, cancerStudyId);
-            if (clinicalAttribute == null) {
-                ClinicalAttribute attr = new ClinicalAttribute(FRACTION_GENOME_ALTERED_ATTR_ID, "Fraction Genome Altered", "Fraction Genome Altered", "NUMBER",
-                    false, "20", cancerStudyId);
-                DaoClinicalAttributeMeta.addDatum(attr);
-            }
-
-            if (updateMode) {
-                DaoClinicalData.removeSampleAttributesData(fractionGenomeAltereds.keySet(), FRACTION_GENOME_ALTERED_ATTR_ID);
-            }
-            for (Map.Entry<Integer, String> fractionGenomeAltered : fractionGenomeAltereds.entrySet()) {
-                DaoClinicalData.addSampleDatum(fractionGenomeAltered.getKey(), FRACTION_GENOME_ALTERED_ATTR_ID, fractionGenomeAltered.getValue());
-            }
-
-            // Necessary for deduplication
-            ClickHouseOptimizer.optimizeTables("clinical_sample");
-        } catch (SQLException e) {
-            throw new DaoException(e);
-        } finally {
-            JdbcUtil.closeAll(DaoCopyNumberSegment.class, con, null, null);
+        ClinicalAttribute clinicalAttribute = DaoClinicalAttributeMeta.getDatum(FRACTION_GENOME_ALTERED_ATTR_ID, cancerStudyId);
+        if (clinicalAttribute == null) {
+            ClinicalAttribute attr = new ClinicalAttribute(FRACTION_GENOME_ALTERED_ATTR_ID, "Fraction Genome Altered", "Fraction Genome Altered", "NUMBER",
+                false, "20", cancerStudyId);
+            DaoClinicalAttributeMeta.addDatum(attr);
         }
+
+        if (updateMode) {
+            DaoClinicalData.removeSampleAttributesData(fractionGenomeAltereds.keySet(), FRACTION_GENOME_ALTERED_ATTR_ID);
+        }
+        for (Map.Entry<Integer, String> fractionGenomeAltered : fractionGenomeAltereds.entrySet()) {
+            DaoClinicalData.addSampleDatum(fractionGenomeAltered.getKey(), FRACTION_GENOME_ALTERED_ATTR_ID, fractionGenomeAltered.getValue());
+        }
+
+        // Necessary for deduplication
+        ClickHouseOptimizer.optimizeTables("clinical_sample");
     }
     
     public static long getLargestId() throws DaoException {
