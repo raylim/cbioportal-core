@@ -138,6 +138,7 @@ public class TestImportResourceData extends IntegrationTestBase {
             study.getInternalId(), "%slideKey=" + SLIDE_1);
         assertNull(derivedRow[1]);
         JsonNode derived = JSON.readTree(derivedRow[0]);
+        assertEquals(SLIDE_1, derived.get("slide_key").textValue());
         assertEquals("1", derived.get("part_number").textValue());
         assertEquals("1", derived.get("block_number").textValue());
         derived.fieldNames().forEachRemaining(key -> assertTrue(key,
@@ -255,10 +256,12 @@ public class TestImportResourceData extends IntegrationTestBase {
                 + "AND r.resource_id IN ('WSI_SAMPLE', 'WSI_PATIENT')",
             study.getInternalId()));
         // All of the study's rows, the viewable unmatched slide listed with no sample, and none
-        // carrying a private field or a resource id other than WSI_SAMPLE.
+        // carrying a private or non-allowlisted field (slide_key is allowlisted, as Slide ID) or a
+        // resource id other than WSI_SAMPLE.
         assertEquals(List.of(slideRows, 1L, 0L), single(
             "SELECT count(), countIf(sample_id IS NULL), "
-                + "countIf(position(metadata, 'wsi_serving') > 0 OR position(metadata, 'slide_key') > 0 "
+                + "countIf(position(metadata, 'wsi_serving') > 0 OR position(metadata, 'block_key') > 0 "
+                + "OR position(metadata, 'specimen_key') > 0 OR position(metadata, 'reference_sample_id') > 0 "
                 + "OR position(metadata, 'file_size_bytes') > 0 OR resource_id != 'WSI_SAMPLE') "
                 + "FROM wsi_slide_table_derived WHERE cancer_study_id = ?",
             result -> List.of(result.getLong(1), result.getLong(2), result.getLong(3)),

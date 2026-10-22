@@ -305,10 +305,10 @@ public final class DaoResourceData {
      * The study slide table's public metadata keys. Kept in step by hand with
      * WsiDeidentification.STUDY_TABLE_SCHEMA in cBioPortal/cbioportal and the wsi_slide_table_derived
      * INSERT in its populate_derived_tables.sql; DaoResourceDataSlideTableKeysTest checks that each key
-     * is a filterable field of the WSI contract.
+     * is a field of the WSI contract, filterable except for slide_key (shown as Slide ID).
      */
     public static final List<String> STUDY_SLIDE_TABLE_METADATA_KEYS = List.of(
-        "stain_name", "stain_group", "magnification", "part_number", "block_number",
+        "slide_key", "stain_name", "stain_group", "magnification", "part_number", "block_number",
         "match_level");
 
     /**

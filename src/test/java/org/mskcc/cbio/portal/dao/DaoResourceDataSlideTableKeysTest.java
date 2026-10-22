@@ -20,10 +20,12 @@ import static org.junit.Assert.*;
  */
 public class DaoResourceDataSlideTableKeysTest {
 
+    private static final String SLIDE_ID_KEY = "slide_key";
+
     private static final String DEFINITIONS = "src/test/resources/wsi_resources/data_resource_definition.txt";
 
     @Test
-    public void slideTableKeysAreDeclaredFilterableContractFields() throws Exception {
+    public void slideTableKeysAreDeclaredContractFields() throws Exception {
         List<String> lines = Files.readAllLines(Paths.get(DEFINITIONS));
         List<String> header = List.of(lines.get(0).split("\t", -1));
         int resourceIdColumn = header.indexOf("RESOURCE_ID");
@@ -40,8 +42,13 @@ public class DaoResourceDataSlideTableKeysTest {
             Map<String, JsonNode> fields = new HashMap<>();
             contracts.get(resourceId).get("fields").forEach(field -> fields.put(field.get("key").asText(), field));
             for (String key : DaoResourceData.STUDY_SLIDE_TABLE_METADATA_KEYS) {
-                // Filterable is the contract's mark for a non-identifying, non-free-text key.
                 assertTrue(resourceId + " declares " + key, fields.containsKey(key));
+                if (SLIDE_ID_KEY.equals(key)) {
+                    // The slide table shows the opaque slide key as Slide ID. The contract leaves it
+                    // unfilterable because nearly every slide has its own value.
+                    continue;
+                }
+                // Filterable is the contract's mark for a non-identifying, non-free-text key.
                 assertTrue(resourceId + " " + key + " is filterable", fields.get(key).get("filterable").asBoolean());
             }
         }
