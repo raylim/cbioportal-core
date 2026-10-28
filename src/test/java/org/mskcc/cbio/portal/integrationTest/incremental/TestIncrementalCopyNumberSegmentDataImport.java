@@ -1,19 +1,6 @@
 /*
- * This file is part of cBioPortal.
- *
- * cBioPortal is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
 package org.mskcc.cbio.portal.integrationTest.incremental;
 
@@ -101,7 +88,7 @@ public class TestIncrementalCopyNumberSegmentDataImport extends IntegrationTestB
         List<ClinicalData> clinicalData = DaoClinicalData.getSampleData(cancerStudy.getInternalId(), Set.of(segSampleId));
         ClinicalData fractionGenomeAltered = clinicalData.stream()
                 .filter(cd -> "FRACTION_GENOME_ALTERED".equals(cd.getAttrId())).findFirst().get();
-        assertEquals("0.0", fractionGenomeAltered.getAttrVal());
+        assertEquals("0.0000", fractionGenomeAltered.getAttrVal());
     }
 
     public static final String STUDY_ID = "study_tcga_pub";
